@@ -55,7 +55,15 @@ func (s *sqliteStore) decryptField(value string) string {
 // NewSQLiteStore opens (or creates) a SQLite database at path and returns a
 // Store. Call Migrate() after opening to ensure the schema is up to date.
 func NewSQLiteStore(path string) (Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// For in-memory databases, use shared cache so all connections from the
+	// pool see the same data. Without this, each pooled connection gets its
+	// own empty database.
+	dsn := path
+	if path == ":memory:" {
+		dsn = "file::memory:?cache=shared"
+	}
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
