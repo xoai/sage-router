@@ -1,0 +1,11 @@
+{
+  "model": "gemini-2.5-flash",
+  "system": [{"text": "You are helpful."}],
+  "messages": [
+    {
+      "role": "user",
+      "content": [{"type": "text", "text": "Hello"}]
+    }
+  ],
+  "stream": false
+}

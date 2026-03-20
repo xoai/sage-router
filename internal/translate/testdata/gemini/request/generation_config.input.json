@@ -1,0 +1,14 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [{"text": "Tell me a joke."}]
+    }
+  ],
+  "generationConfig": {
+    "temperature": 0.9,
+    "topP": 0.95,
+    "maxOutputTokens": 256,
+    "stopSequences": ["END"]
+  }
+}

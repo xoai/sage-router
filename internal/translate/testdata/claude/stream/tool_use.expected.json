@@ -1,0 +1,48 @@
+[
+  {
+    "id": "msg_02ABC",
+    "model": "claude-sonnet-4-6",
+    "role": "assistant"
+  },
+  {
+    "id": "msg_02ABC",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "tool_call_id": "toolu_01ABC",
+      "tool_name": "get_weather"
+    }
+  },
+  {
+    "id": "msg_02ABC",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "arguments": "{\"lo"
+    }
+  },
+  {
+    "id": "msg_02ABC",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "arguments": "cation\": \"Tok"
+    }
+  },
+  {
+    "id": "msg_02ABC",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "arguments": "yo\"}"
+    }
+  },
+  {
+    "id": "msg_02ABC",
+    "model": "claude-sonnet-4-6",
+    "finish_reason": "tool_calls",
+    "usage": {
+      "prompt_tokens": 50,
+      "completion_tokens": 30,
+      "total_tokens": 80,
+      "input_tokens": 50,
+      "output_tokens": 30
+    }
+  }
+]

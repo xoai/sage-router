@@ -1,0 +1,53 @@
+:root {
+  /* Background layers */
+  --bg-0: #0a0a0b;
+  --bg-1: #111113;
+  --bg-2: #1a1a1e;
+  --bg-3: #232328;
+
+  /* Text */
+  --text-primary: #ededef;
+  --text-secondary: #8b8b8e;
+  --text-tertiary: #5c5c60;
+
+  /* Accent */
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-muted: rgba(59, 130, 246, 0.15);
+
+  /* Status */
+  --status-green: #22c55e;
+  --status-yellow: #eab308;
+  --status-red: #ef4444;
+
+  /* Borders */
+  --border: rgba(255, 255, 255, 0.04);
+  --border-hover: rgba(255, 255, 255, 0.08);
+  --border-active: rgba(255, 255, 255, 0.12);
+
+  /* Fonts */
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  /* Spacing */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-2xl: 32px;
+  --space-3xl: 48px;
+
+  /* Radii */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* Transitions */
+  --transition-fast: 120ms ease;
+  --transition-normal: 200ms ease;
+
+  /* Sidebar */
+  --sidebar-width: 220px;
+}

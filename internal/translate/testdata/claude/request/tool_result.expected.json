@@ -1,0 +1,37 @@
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What's the weather?"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_call",
+          "tool_call_id": "toolu_01ABC",
+          "tool_name": "get_weather",
+          "arguments": "{\"location\":\"Tokyo\"}"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "text": "Sunny, 25°C",
+          "tool_call_id": "toolu_01ABC"
+        }
+      ]
+    }
+  ],
+  "stream": false,
+  "max_tokens": 4096
+}

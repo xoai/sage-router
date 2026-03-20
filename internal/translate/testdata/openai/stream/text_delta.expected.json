@@ -1,0 +1,42 @@
+[
+  {
+    "id": "chatcmpl-abc",
+    "model": "gpt-4.1",
+    "role": "assistant"
+  },
+  {
+    "id": "chatcmpl-abc",
+    "model": "gpt-4.1",
+    "delta": {
+      "text": "Hello"
+    }
+  },
+  {
+    "id": "chatcmpl-abc",
+    "model": "gpt-4.1",
+    "delta": {
+      "text": "! How"
+    }
+  },
+  {
+    "id": "chatcmpl-abc",
+    "model": "gpt-4.1",
+    "delta": {
+      "text": " can I help?"
+    }
+  },
+  {
+    "id": "chatcmpl-abc",
+    "model": "gpt-4.1",
+    "finish_reason": "stop"
+  },
+  {
+    "id": "chatcmpl-abc",
+    "model": "gpt-4.1",
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 8,
+      "total_tokens": 18
+    }
+  }
+]

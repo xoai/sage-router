@@ -1,0 +1,20 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [{"text": "What's the weather?"}]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {"functionCall": {"name": "get_weather", "args": {"location": "Tokyo"}}}
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {"functionResponse": {"name": "get_weather", "response": {"temperature": 25, "condition": "sunny"}}}
+      ]
+    }
+  ]
+}

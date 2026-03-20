@@ -1,0 +1,33 @@
+[
+  {
+    "id": "chatcmpl-ghi",
+    "model": "o3",
+    "role": "assistant"
+  },
+  {
+    "id": "chatcmpl-ghi",
+    "model": "o3",
+    "delta": {
+      "thinking": "Let me think"
+    }
+  },
+  {
+    "id": "chatcmpl-ghi",
+    "model": "o3",
+    "delta": {
+      "thinking": " about this..."
+    }
+  },
+  {
+    "id": "chatcmpl-ghi",
+    "model": "o3",
+    "delta": {
+      "text": "The answer is 42."
+    }
+  },
+  {
+    "id": "chatcmpl-ghi",
+    "model": "o3",
+    "finish_reason": "stop"
+  }
+]

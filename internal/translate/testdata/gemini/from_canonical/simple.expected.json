@@ -1,0 +1,20 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Hello"
+        }
+      ]
+    }
+  ],
+  "system_instruction": {
+    "parts": [
+      {
+        "text": "You are helpful."
+      }
+    ]
+  },
+  "model": "gemini-2.5-flash"
+}

@@ -1,0 +1,15 @@
+{
+  "system_instruction": {
+    "parts": [
+      {"text": "You are a helpful assistant."}
+    ]
+  },
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {"text": "What is 2+2?"}
+      ]
+    }
+  ]
+}

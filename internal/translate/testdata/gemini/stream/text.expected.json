@@ -1,0 +1,30 @@
+[
+  {
+    "id": "gemini-msg",
+    "role": "assistant"
+  },
+  {
+    "id": "gemini-msg",
+    "delta": {
+      "text": "Hello"
+    }
+  },
+  {
+    "id": "gemini-msg",
+    "delta": {
+      "text": "! How can I help?"
+    }
+  },
+  {
+    "id": "gemini-msg",
+    "finish_reason": "stop"
+  },
+  {
+    "id": "gemini-msg",
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 8,
+      "total_tokens": 18
+    }
+  }
+]

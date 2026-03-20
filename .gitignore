@@ -1,0 +1,45 @@
+# Binaries
+bin/
+dist/
+*.exe
+
+# Dependencies
+web/dashboard/node_modules/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Data directory (runtime)
+.sage-router/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+web/dashboard/dist/
+!web/dashboard/dist/index.html
+
+# Sage folder
+.sage/
+.sage-memory/
+sage/
+
+# Claude Code (user-specific)
+.claude/
+CLAUDE.md
+
+# MCP config (user-specific)
+.mcp.json
+
+# Environment
+.env
+.env.*

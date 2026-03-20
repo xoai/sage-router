@@ -1,0 +1,34 @@
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 4096,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get the current weather for a location.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string", "description": "City name"}
+        },
+        "required": ["location"]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "What's the weather in Tokyo?"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01ABC",
+          "name": "get_weather",
+          "input": {"location": "Tokyo"}
+        }
+      ]
+    }
+  ]
+}

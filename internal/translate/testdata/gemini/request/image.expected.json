@@ -1,0 +1,22 @@
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What is in this image?"
+        },
+        {
+          "type": "image",
+          "image_source": {
+            "media_type": "image/png",
+            "data": "iVBORw0KGgoAAAANSUhEUg=="
+          }
+        }
+      ]
+    }
+  ],
+  "stream": false
+}

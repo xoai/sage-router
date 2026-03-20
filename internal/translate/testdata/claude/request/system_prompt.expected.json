@@ -1,0 +1,27 @@
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Write a hello world in Python."
+        }
+      ]
+    }
+  ],
+  "system": [
+    {
+      "text": "You are a helpful coding assistant.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    },
+    {
+      "text": "Always respond in markdown."
+    }
+  ],
+  "stream": false,
+  "max_tokens": 1024
+}

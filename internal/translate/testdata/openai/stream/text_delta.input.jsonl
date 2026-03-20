@@ -1,0 +1,5 @@
+{"id":"chatcmpl-abc","object":"chat.completion.chunk","model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+{"id":"chatcmpl-abc","object":"chat.completion.chunk","model":"gpt-4.1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+{"id":"chatcmpl-abc","object":"chat.completion.chunk","model":"gpt-4.1","choices":[{"index":0,"delta":{"content":"! How"},"finish_reason":null}]}
+{"id":"chatcmpl-abc","object":"chat.completion.chunk","model":"gpt-4.1","choices":[{"index":0,"delta":{"content":" can I help?"},"finish_reason":null}]}
+{"id":"chatcmpl-abc","object":"chat.completion.chunk","model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18}}

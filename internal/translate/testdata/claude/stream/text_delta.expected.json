@@ -1,0 +1,40 @@
+[
+  {
+    "id": "msg_01XYZ",
+    "model": "claude-sonnet-4-6",
+    "role": "assistant"
+  },
+  {
+    "id": "msg_01XYZ",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "text": "Hello"
+    }
+  },
+  {
+    "id": "msg_01XYZ",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "text": "! How"
+    }
+  },
+  {
+    "id": "msg_01XYZ",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "text": " can I help?"
+    }
+  },
+  {
+    "id": "msg_01XYZ",
+    "model": "claude-sonnet-4-6",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 25,
+      "completion_tokens": 12,
+      "total_tokens": 37,
+      "input_tokens": 25,
+      "output_tokens": 12
+    }
+  }
+]

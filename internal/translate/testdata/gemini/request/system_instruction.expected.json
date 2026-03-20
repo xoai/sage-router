@@ -1,0 +1,20 @@
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What is 2+2?"
+        }
+      ]
+    }
+  ],
+  "system": [
+    {
+      "text": "You are a helpful assistant."
+    }
+  ],
+  "stream": false
+}

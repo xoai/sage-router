@@ -1,0 +1,10 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {"text": "Hello, how are you?"}
+      ]
+    }
+  ]
+}

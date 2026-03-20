@@ -1,0 +1,42 @@
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Solve this step by step: what is 127 * 389?"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "text": "Let me calculate 127 * 389 step by step..."
+        },
+        {
+          "type": "text",
+          "text": "127 × 389 = 49,403"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Now divide that by 7."
+        }
+      ]
+    }
+  ],
+  "stream": false,
+  "max_tokens": 16000,
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 10000
+  }
+}

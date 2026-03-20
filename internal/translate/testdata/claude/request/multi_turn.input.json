@@ -1,0 +1,18 @@
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 2048,
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the capital of France?"
+    },
+    {
+      "role": "assistant",
+      "content": "The capital of France is Paris."
+    },
+    {
+      "role": "user",
+      "content": "And what about Germany?"
+    }
+  ]
+}

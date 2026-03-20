@@ -1,0 +1,36 @@
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What's the weather?"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_call",
+          "tool_call_id": "call_get_weather",
+          "tool_name": "get_weather",
+          "arguments": "{\"location\":\"Tokyo\"}"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "text": "{\"condition\":\"sunny\",\"temperature\":25}",
+          "tool_call_id": "call_get_weather"
+        }
+      ]
+    }
+  ],
+  "stream": false
+}

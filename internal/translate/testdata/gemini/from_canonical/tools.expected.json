@@ -1,0 +1,44 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Weather?"
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "name": "get_weather",
+            "args": {
+              "location": "Tokyo"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "function_declarations": [
+        {
+          "name": "get_weather",
+          "description": "Get weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "model": "gemini-2.5-flash"
+}

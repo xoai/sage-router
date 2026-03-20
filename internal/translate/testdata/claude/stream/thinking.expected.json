@@ -1,0 +1,40 @@
+[
+  {
+    "id": "msg_03DEF",
+    "model": "claude-sonnet-4-6",
+    "role": "assistant"
+  },
+  {
+    "id": "msg_03DEF",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "thinking": "Let me think"
+    }
+  },
+  {
+    "id": "msg_03DEF",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "thinking": " about this..."
+    }
+  },
+  {
+    "id": "msg_03DEF",
+    "model": "claude-sonnet-4-6",
+    "delta": {
+      "text": "The answer is 42."
+    }
+  },
+  {
+    "id": "msg_03DEF",
+    "model": "claude-sonnet-4-6",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 30,
+      "completion_tokens": 25,
+      "total_tokens": 55,
+      "input_tokens": 30,
+      "output_tokens": 25
+    }
+  }
+]

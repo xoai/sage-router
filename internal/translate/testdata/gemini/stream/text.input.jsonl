@@ -1,0 +1,3 @@
+{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"index":0}]}
+{"candidates":[{"content":{"role":"model","parts":[{"text":"! How can I help?"}]},"index":0}]}
+{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":8,"totalTokenCount":18}}
