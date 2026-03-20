@@ -135,6 +135,8 @@ On first run, Sage Router prints a one-click setup URL:
 
 Click the link → create a password → you're in.
 
+![Sage Router Dashboard](sage-router-dashboard-screenshot.png)
+
 **Auto-detect:** If you already use Claude Code, Sage Router finds your credentials automatically. No copy-pasting API keys.
 
 ## How It Works
