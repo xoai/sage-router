@@ -16,6 +16,7 @@ import (
 	"sage-router/internal/config"
 	"sage-router/internal/executor"
 	"sage-router/internal/provider"
+	"sage-router/internal/ratelimit"
 	"sage-router/internal/routing"
 	"sage-router/internal/store"
 	"sage-router/internal/translate"
@@ -125,8 +126,8 @@ func setupTestServer(t *testing.T, executors map[string]executor.Executor) (*Ser
 	}
 	t.Cleanup(func() { db.Close() })
 
-	// Set up auth (no password required for tests)
-	authMgr := auth.NewManager("", []byte("test-jwt-secret"), []byte("test-hmac-secret"))
+	// Set up auth (use dummy password hash so NeedsSetup() returns false)
+	authMgr := auth.NewManager("test-password-hash", []byte("test-jwt-secret"), []byte("test-hmac-secret"))
 
 	// Translate registry
 	translateReg := translate.NewRegistry()
@@ -168,6 +169,7 @@ func setupTestServer(t *testing.T, executors map[string]executor.Executor) (*Ser
 		SmartRouter:       routing.NewSmartRouter(),
 		ConversationStore: routing.NewConversationStore(),
 		BypassFilter:      bypass.NewFilter(),
+		RateLimiter:       ratelimit.New(),
 	})
 
 	return srv, db
@@ -360,14 +362,22 @@ func TestE2E_APIKeyAuth_Required(t *testing.T) {
 	// Delete the key
 	db.DeleteAPIKey("k1")
 
-	// Request with deleted key → 401
+	// Request with deleted key → 401 (key is invalid even though no keys remain)
 	w3 := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", map[string]any{
 		"model":    "openai/gpt-4o",
 		"messages": []map[string]any{{"role": "user", "content": "Hello"}},
 	}, plainKey)
-	// No keys left, so auth is not required
-	if w3.Code == 401 {
-		t.Fatalf("expected no auth required when no keys exist, got 401")
+	if w3.Code != 401 {
+		t.Fatalf("expected 401 with deleted key, got %d", w3.Code)
+	}
+
+	// Request with NO key when no keys exist → should pass (open access)
+	w4 := doRequest(t, srv, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []map[string]any{{"role": "user", "content": "Hello"}},
+	})
+	if w4.Code == 401 {
+		t.Fatalf("expected open access when no keys exist and no key provided, got 401")
 	}
 }
 
@@ -720,5 +730,211 @@ func TestE2E_RootRedirect(t *testing.T) {
 	loc := w.Header().Get("Location")
 	if loc != "/dashboard/" {
 		t.Errorf("expected redirect to /dashboard/, got %s", loc)
+	}
+}
+
+// --- §34 Keys-as-Groups Enforcement Tests ---
+
+func createKeyWithAttributes(t *testing.T, srv *Server, db store.Store, name string, attrs map[string]any) string {
+	t.Helper()
+	plainKey, keyHash, prefix, err := srv.deps.Auth.GenerateAPIKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := &store.APIKey{
+		ID:      "key-" + name,
+		Name:    name,
+		KeyHash: keyHash,
+		Prefix:  prefix,
+	}
+	if v, ok := attrs["budget_monthly"].(float64); ok {
+		key.BudgetMonthly = v
+	}
+	if v, ok := attrs["budget_hard_limit"].(bool); ok {
+		key.BudgetHardLimit = v
+	}
+	if v, ok := attrs["allowed_models"].(string); ok {
+		key.AllowedModels = v
+	} else {
+		key.AllowedModels = "*"
+	}
+	if v, ok := attrs["rate_limit_rpm"].(int); ok {
+		key.RateLimitRPM = v
+	}
+	if v, ok := attrs["routing_strategy"].(string); ok {
+		key.RoutingStrategy = v
+	}
+	if err := db.CreateAPIKey(key); err != nil {
+		t.Fatal(err)
+	}
+	return plainKey
+}
+
+func TestE2E_RateLimitEnforcement(t *testing.T) {
+	srv, db := setupTestServer(t, nil)
+	addConnection(t, srv, db, "openai", "primary", "apikey")
+
+	plainKey := createKeyWithAttributes(t, srv, db, "limited", map[string]any{
+		"rate_limit_rpm": 3,
+	})
+
+	body := map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []map[string]any{{"role": "user", "content": "Hi"}},
+	}
+
+	for i := 0; i < 3; i++ {
+		w := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", body, plainKey)
+		if w.Code == 429 {
+			t.Fatalf("request %d should be allowed, got 429", i)
+		}
+	}
+
+	w := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", body, plainKey)
+	if w.Code != 429 {
+		t.Fatalf("expected 429 rate limit, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestE2E_ACLEnforcement(t *testing.T) {
+	srv, db := setupTestServer(t, nil)
+	addConnection(t, srv, db, "openai", "primary", "apikey")
+	addConnection(t, srv, db, "anthropic", "primary", "apikey")
+
+	plainKey := createKeyWithAttributes(t, srv, db, "anthropic-only", map[string]any{
+		"allowed_models": "anthropic/*",
+	})
+
+	w1 := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "anthropic/claude-sonnet-4-20250514",
+		"messages": []map[string]any{{"role": "user", "content": "Hi"}},
+	}, plainKey)
+	if w1.Code == 403 {
+		t.Fatalf("anthropic model should be allowed, got 403")
+	}
+
+	w2 := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []map[string]any{{"role": "user", "content": "Hi"}},
+	}, plainKey)
+	if w2.Code != 403 {
+		t.Fatalf("expected 403 for disallowed model, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestE2E_BudgetHardLimit(t *testing.T) {
+	srv, db := setupTestServer(t, nil)
+	addConnection(t, srv, db, "openai", "primary", "apikey")
+
+	plainKey := createKeyWithAttributes(t, srv, db, "budgeted", map[string]any{
+		"budget_monthly":    0.01,
+		"budget_hard_limit": true,
+	})
+
+	db.RecordUsage(&store.UsageEntry{
+		ID:        "u1",
+		RequestID: "r1",
+		Provider:  "openai",
+		Model:     "gpt-4o",
+		APIKeyID:  "key-budgeted",
+		Cost:      0.02,
+		Status:    "success",
+	})
+
+	w := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []map[string]any{{"role": "user", "content": "Hi"}},
+	}, plainKey)
+	if w.Code != 402 {
+		t.Fatalf("expected 402 budget exceeded, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestE2E_UnlimitedKeyPassesAll(t *testing.T) {
+	srv, db := setupTestServer(t, nil)
+	addConnection(t, srv, db, "openai", "primary", "apikey")
+
+	plainKey := createKeyWithAttributes(t, srv, db, "unlimited", map[string]any{})
+
+	w := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []map[string]any{{"role": "user", "content": "Hi"}},
+	}, plainKey)
+	if w.Code != 200 {
+		t.Fatalf("unlimited key should pass, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestE2E_MatchModelPattern(t *testing.T) {
+	tests := []struct {
+		model, pattern string
+		want           bool
+	}{
+		{"anthropic/claude-sonnet-4-20250514", "anthropic/*", true},
+		{"openai/gpt-4o", "anthropic/*", false},
+		{"openai/gpt-4o", "openai/*,anthropic/*", true},
+		{"openai/gpt-4o", "openai/gpt-4o", true},
+		{"openai/gpt-4o", "openai/gpt-4.1", false},
+		{"openai/gpt-4o", "*", true},
+		{"anything", "*", true},
+	}
+	for _, tt := range tests {
+		got := matchModelPattern(tt.model, tt.pattern)
+		if got != tt.want {
+			t.Errorf("matchModelPattern(%q, %q) = %v, want %v", tt.model, tt.pattern, got, tt.want)
+		}
+	}
+}
+
+func TestE2E_ACL_ComboBypass(t *testing.T) {
+	srv, db := setupTestServer(t, nil)
+	addConnection(t, srv, db, "openai", "primary", "apikey")
+	addConnection(t, srv, db, "anthropic", "primary", "apikey")
+
+	// Create combo with openai first, anthropic second
+	db.CreateCombo(&store.Combo{
+		ID: "c1", Name: "mixed-combo",
+		Models: []string{"openai/gpt-4o", "anthropic/claude-sonnet-4-20250514"},
+	})
+
+	// Key restricted to anthropic only
+	plainKey := createKeyWithAttributes(t, srv, db, "anthropic-only", map[string]any{
+		"allowed_models": "anthropic/*",
+	})
+
+	// Use the combo — should NOT execute openai/gpt-4o even though it's first
+	w := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "mixed-combo",
+		"messages": []map[string]any{{"role": "user", "content": "Hi"}},
+	}, plainKey)
+
+	// Should succeed (anthropic model is allowed and should be the only one tried)
+	if w.Code != 200 {
+		t.Fatalf("expected 200 (anthropic model from filtered combo), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestE2E_ACL_ComboAllBlocked(t *testing.T) {
+	srv, db := setupTestServer(t, nil)
+	addConnection(t, srv, db, "openai", "primary", "apikey")
+
+	// Combo with only openai models
+	db.CreateCombo(&store.Combo{
+		ID: "c2", Name: "openai-only-combo",
+		Models: []string{"openai/gpt-4o", "openai/gpt-4o-mini"},
+	})
+
+	// Key restricted to anthropic only
+	plainKey := createKeyWithAttributes(t, srv, db, "anthropic-restricted", map[string]any{
+		"allowed_models": "anthropic/*",
+	})
+
+	w := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "openai-only-combo",
+		"messages": []map[string]any{{"role": "user", "content": "Hi"}},
+	}, plainKey)
+
+	if w.Code != 403 {
+		t.Fatalf("expected 403 (no permitted models in combo), got %d: %s", w.Code, w.Body.String())
 	}
 }

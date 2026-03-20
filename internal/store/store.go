@@ -29,10 +29,13 @@ type Store interface {
 
 	// API Keys
 	ListAPIKeys() ([]APIKey, error)
+	GetAPIKeyByHash(keyHash string) (*APIKey, error)
 	CreateAPIKey(k *APIKey) error
+	UpdateAPIKey(id string, updates map[string]any) error
 	ValidateAPIKey(keyHash string) (bool, error)
 	HasAPIKeys() (bool, error)
 	DeleteAPIKey(id string) error
+	GetMonthlySpend(keyID string) (float64, error)
 
 	// Settings (key-value configuration)
 	GetSetting(key string) (string, error)
@@ -91,11 +94,16 @@ type Combo struct {
 
 // APIKey represents a hashed API key for authenticating requests to sage-router.
 type APIKey struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	KeyHash   string    `json:"-"`
-	Prefix    string    `json:"prefix"`
-	CreatedAt time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	KeyHash         string    `json:"-"`
+	Prefix          string    `json:"prefix"`
+	BudgetMonthly   float64   `json:"budget_monthly"`
+	BudgetHardLimit bool      `json:"budget_hard_limit"`
+	AllowedModels   string    `json:"allowed_models"`
+	RateLimitRPM    int       `json:"rate_limit_rpm"`
+	RoutingStrategy string    `json:"routing_strategy"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // UsageEntry records a single proxied request for billing and analytics.
@@ -105,6 +113,7 @@ type UsageEntry struct {
 	Provider     string        `json:"provider"`
 	Model        string        `json:"model"`
 	ConnectionID string        `json:"connection_id"`
+	APIKeyID     string        `json:"api_key_id"`
 	InputTokens  int           `json:"input_tokens"`
 	OutputTokens int           `json:"output_tokens"`
 	TotalTokens  int           `json:"total_tokens"`
@@ -118,6 +127,7 @@ type UsageEntry struct {
 type UsageFilter struct {
 	Provider string    `json:"provider,omitempty"`
 	Model    string    `json:"model,omitempty"`
+	APIKeyID string    `json:"api_key_id,omitempty"`
 	From     time.Time `json:"from,omitempty"`
 	To       time.Time `json:"to,omitempty"`
 	Limit    int       `json:"limit,omitempty"`

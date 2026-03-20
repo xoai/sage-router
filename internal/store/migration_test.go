@@ -43,7 +43,7 @@ func TestMigrations_AllTablesCreated(t *testing.T) {
 	// Verify all 3 migrations were recorded
 	var migrationCount int
 	s.db.QueryRow("SELECT COUNT(*) FROM _migrations").Scan(&migrationCount)
-	if migrationCount != 3 {
-		t.Errorf("expected 3 migrations recorded, got %d", migrationCount)
+	if migrationCount != 4 {
+		t.Errorf("expected 4 migrations recorded, got %d", migrationCount)
 	}
 }

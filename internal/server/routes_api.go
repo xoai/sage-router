@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"sage-router/internal/auth"
@@ -255,17 +258,95 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Simple test: try a models list or a simple completion
-	exec, ok := s.deps.Executors[conn.Provider]
-	if !ok {
-		exec = s.deps.Executors["default"]
-	}
-	if exec == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "no executor"})
+	// Determine provider base URL and probe endpoint
+	provDef, hasDef := config.KnownProviders[conn.Provider]
+	if !hasDef {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "unknown provider"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "provider": conn.Provider})
+	// Build probe request based on provider type
+	var probeURL, method string
+	var probeBody io.Reader
+	probeHeaders := map[string]string{}
+
+	switch conn.Provider {
+	case "anthropic":
+		// Anthropic: POST /v1/messages with max_tokens=1
+		probeURL = provDef.BaseURL + "/v1/messages"
+		method = "POST"
+		probeBody = strings.NewReader(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
+		probeHeaders["Content-Type"] = "application/json"
+		probeHeaders["anthropic-version"] = "2023-06-01"
+		if conn.AuthType == "auto_detect" {
+			_, creds := detect.DetectClaude()
+			if creds != nil && creds.AccessToken != "" {
+				probeHeaders["Authorization"] = "Bearer " + creds.AccessToken
+			}
+		} else if conn.APIKey != "" {
+			probeHeaders["x-api-key"] = conn.APIKey
+		}
+	case "gemini":
+		// Gemini: GET /models
+		probeURL = provDef.BaseURL + "/models"
+		method = "GET"
+		if conn.APIKey != "" {
+			probeURL += "?key=" + conn.APIKey
+		}
+	default:
+		// OpenAI-compatible: GET /models
+		probeURL = provDef.BaseURL + "/models"
+		method = "GET"
+		if conn.APIKey != "" {
+			probeHeaders["Authorization"] = "Bearer " + conn.APIKey
+		} else if conn.AccessToken != "" {
+			probeHeaders["Authorization"] = "Bearer " + conn.AccessToken
+		}
+	}
+
+	// Execute probe with 10s timeout
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, method, probeURL, probeBody)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	for k, v := range probeHeaders {
+		req.Header.Set(k, v)
+	}
+
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	latency := time.Since(start)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "latency_ms": latency.Milliseconds()})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read first 512 bytes of response for diagnostics
+	bodyBytes := make([]byte, 512)
+	n, _ := resp.Body.Read(bodyBytes)
+	bodySnippet := string(bodyBytes[:n])
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"provider":   conn.Provider,
+			"status":     resp.StatusCode,
+			"latency_ms": latency.Milliseconds(),
+		})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         false,
+			"provider":   conn.Provider,
+			"status":     resp.StatusCode,
+			"error":      bodySnippet,
+			"latency_ms": latency.Milliseconds(),
+		})
+	}
 }
 
 // ── Combo Routes ──
@@ -367,7 +448,12 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"name"`
+		Name            string  `json:"name"`
+		BudgetMonthly   float64 `json:"budget_monthly"`
+		BudgetHardLimit bool    `json:"budget_hard_limit"`
+		AllowedModels   string  `json:"allowed_models"`
+		RateLimitRPM    int     `json:"rate_limit_rpm"`
+		RoutingStrategy string  `json:"routing_strategy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -380,12 +466,21 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.AllowedModels == "" {
+		req.AllowedModels = "*"
+	}
+
 	key := &store.APIKey{
-		ID:        generateRequestID(),
-		Name:      req.Name,
-		KeyHash:   keyHash,
-		Prefix:    prefix,
-		CreatedAt: time.Now(),
+		ID:              generateRequestID(),
+		Name:            req.Name,
+		KeyHash:         keyHash,
+		Prefix:          prefix,
+		BudgetMonthly:   req.BudgetMonthly,
+		BudgetHardLimit: req.BudgetHardLimit,
+		AllowedModels:   req.AllowedModels,
+		RateLimitRPM:    req.RateLimitRPM,
+		RoutingStrategy: req.RoutingStrategy,
+		CreatedAt:       time.Now(),
 	}
 
 	if err := s.deps.Store.CreateAPIKey(key); err != nil {
@@ -398,6 +493,20 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		"key":  plainKey,
 		"name": key.Name,
 	})
+}
+
+func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.deps.Store.UpdateAPIKey(id, req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
@@ -445,10 +554,17 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 // ── Usage Routes ──
 
 func (s *Server) handleGetUsage(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
 	filter := store.UsageFilter{
 		Provider: r.URL.Query().Get("provider"),
 		Model:    r.URL.Query().Get("model"),
-		Limit:    100,
+		APIKeyID: r.URL.Query().Get("api_key_id"),
+		Limit:    limit,
 	}
 
 	entries, err := s.deps.Store.QueryUsage(filter)

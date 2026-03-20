@@ -19,6 +19,7 @@ import (
 	"sage-router/internal/routing"
 	"sage-router/internal/executor"
 	"sage-router/internal/provider"
+	"sage-router/internal/ratelimit"
 	"sage-router/internal/server"
 	"sage-router/internal/store"
 	"sage-router/internal/translate"
@@ -170,6 +171,7 @@ func main() {
 		ConversationStore: routing.NewConversationStore(),
 		BypassFilter:      bypass.NewFilter(),
 		HealthChecker:     provider.NewHealthChecker(providerSel, 60*time.Second),
+		RateLimiter:       ratelimit.New(),
 	})
 
 	if err := srv.ListenAndServe(); err != nil {

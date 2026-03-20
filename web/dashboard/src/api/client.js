@@ -110,6 +110,10 @@ export function createKey(data) {
   return request('/keys', { method: 'POST', body: data });
 }
 
+export function updateKey(id, data) {
+  return request(`/keys/${id}`, { method: 'PATCH', body: data });
+}
+
 export function deleteKey(id) {
   return request(`/keys/${id}`, { method: 'DELETE' });
 }

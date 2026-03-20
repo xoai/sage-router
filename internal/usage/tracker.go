@@ -14,6 +14,7 @@ type Entry struct {
 	Provider     string
 	Model        string
 	ConnectionID string
+	APIKeyID     string
 	InputTokens  int
 	OutputTokens int
 	TotalTokens  int
@@ -125,6 +126,7 @@ func (t *Tracker) writeEntry(entry *Entry) {
 		Provider:     entry.Provider,
 		Model:        entry.Model,
 		ConnectionID: entry.ConnectionID,
+		APIKeyID:     entry.APIKeyID,
 		InputTokens:  entry.InputTokens,
 		OutputTokens: entry.OutputTokens,
 		TotalTokens:  entry.TotalTokens,

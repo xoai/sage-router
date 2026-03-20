@@ -1,7 +1,7 @@
 import { signal, computed } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
 import { CopyButton } from '../components/copy-button';
-import { getKeys, createKey, deleteKey, getModels, getCombos } from '../api/client';
+import { getKeys, createKey, updateKey, deleteKey, getModels, getCombos } from '../api/client';
 import { addToast } from '../components/toast';
 
 const endpointUrl = signal(window.location.origin);
@@ -10,6 +10,10 @@ const activeTool = signal('claude-code');
 // ── Delete confirmation state ──
 const deleteConfirmKey = signal(null);   // key object being confirmed
 const deleteConfirmInput = signal('');
+
+// ── Edit key state ──
+const editingKey = signal(null);
+const editForm = signal({});
 
 // ── API Keys state ──
 const allKeys = signal([]);
@@ -148,6 +152,34 @@ function confirmDeleteKey() {
 function cancelDeleteKey() {
   deleteConfirmKey.value = null;
   deleteConfirmInput.value = '';
+}
+
+function openEditKey(key) {
+  editingKey.value = key;
+  editForm.value = {
+    name: key.name || '',
+    budget_monthly: key.budget_monthly || 0,
+    budget_hard_limit: key.budget_hard_limit || false,
+    allowed_models: key.allowed_models || '*',
+    rate_limit_rpm: key.rate_limit_rpm || 0,
+    routing_strategy: key.routing_strategy || '',
+  };
+}
+
+function saveEditKey() {
+  const key = editingKey.value;
+  if (!key) return;
+  updateKey(key.id, editForm.value).then(() => {
+    addToast('Key updated', 'success');
+    editingKey.value = null;
+    loadKeys();
+  }).catch(err => {
+    addToast('Failed: ' + err.message, 'error');
+  });
+}
+
+function cancelEditKey() {
+  editingKey.value = null;
 }
 
 // ── Components ──
@@ -350,13 +382,36 @@ export function ConnectPage() {
                   <code style={{ fontSize: 11, color: 'var(--text-tertiary)', background: 'var(--bg-2)', padding: '2px 6px', borderRadius: 'var(--radius-sm)' }}>
                     {k.prefix}
                   </code>
+                  {k.budget_monthly > 0 && (
+                    <span style={{ fontSize: 9, background: 'var(--accent-muted)', color: 'var(--accent)', padding: '1px 5px', borderRadius: 8 }}>
+                      ${k.budget_monthly}/mo{k.budget_hard_limit ? ' hard' : ''}
+                    </span>
+                  )}
+                  {k.rate_limit_rpm > 0 && (
+                    <span style={{ fontSize: 9, background: 'var(--accent-muted)', color: 'var(--accent)', padding: '1px 5px', borderRadius: 8 }}>
+                      {k.rate_limit_rpm} rpm
+                    </span>
+                  )}
+                  {k.allowed_models && k.allowed_models !== '*' && (
+                    <span style={{ fontSize: 9, background: 'var(--accent-muted)', color: 'var(--accent)', padding: '1px 5px', borderRadius: 8 }}>
+                      ACL
+                    </span>
+                  )}
                 </label>
-                <button
-                  onClick={() => requestDeleteKey(k)}
-                  style={{ fontSize: 10, color: 'var(--status-red)', padding: '2px 6px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
-                >
-                  Delete
-                </button>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button
+                    onClick={() => openEditKey(k)}
+                    style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 6px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => requestDeleteKey(k)}
+                    style={{ fontSize: 10, color: 'var(--status-red)', padding: '2px 6px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
+                  >
+                    Delete
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -551,6 +606,92 @@ export function ConnectPage() {
           ))}
         </div>
       </section>
+
+      {/* Edit key modal */}
+      {editingKey.value && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+        }} onClick={cancelEditKey}>
+          <div style={{
+            background: 'var(--bg-1)', border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-lg)', padding: 'var(--space-xl)',
+            width: 440, maxWidth: '90vw',
+          }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 'var(--space-md)' }}>
+              Edit Key: {editingKey.value.name}
+            </h3>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
+              <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                Name
+                <input type="text" value={editForm.value.name}
+                  onInput={e => { editForm.value = { ...editForm.value, name: e.target.value }; }}
+                  style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
+                />
+              </label>
+
+              <div style={{ display: 'flex', gap: 12 }}>
+                <label style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1 }}>
+                  Monthly Budget ($)
+                  <input type="number" step="0.01" min="0" value={editForm.value.budget_monthly}
+                    onInput={e => { editForm.value = { ...editForm.value, budget_monthly: parseFloat(e.target.value) || 0 }; }}
+                    style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
+                  />
+                </label>
+                <label style={{ fontSize: 12, color: 'var(--text-secondary)', display: 'flex', alignItems: 'flex-end', gap: 6, paddingBottom: 8 }}>
+                  <input type="checkbox" checked={editForm.value.budget_hard_limit}
+                    onChange={e => { editForm.value = { ...editForm.value, budget_hard_limit: e.target.checked }; }}
+                  />
+                  Hard limit
+                </label>
+              </div>
+
+              <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                Allowed Models
+                <span style={{ fontSize: 10, color: 'var(--text-tertiary)', marginLeft: 4 }}>* = all, or comma-separated: anthropic/*,openai/gpt-4o</span>
+                <input type="text" value={editForm.value.allowed_models}
+                  onInput={e => { editForm.value = { ...editForm.value, allowed_models: e.target.value }; }}
+                  style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, fontFamily: 'var(--font-mono)', boxSizing: 'border-box' }}
+                />
+              </label>
+
+              <div style={{ display: 'flex', gap: 12 }}>
+                <label style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1 }}>
+                  Rate Limit (rpm)
+                  <input type="number" min="0" value={editForm.value.rate_limit_rpm}
+                    onInput={e => { editForm.value = { ...editForm.value, rate_limit_rpm: parseInt(e.target.value) || 0 }; }}
+                    placeholder="0 = unlimited"
+                    style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
+                  />
+                </label>
+                <label style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1 }}>
+                  Routing Strategy
+                  <select value={editForm.value.routing_strategy}
+                    onChange={e => { editForm.value = { ...editForm.value, routing_strategy: e.target.value }; }}
+                    style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
+                  >
+                    <option value="">Default</option>
+                    <option value="fast">Fast</option>
+                    <option value="cheap">Cheap</option>
+                    <option value="best">Best</option>
+                    <option value="balanced">Balanced</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 'var(--space-lg)' }}>
+              <button onClick={cancelEditKey}
+                style={{ padding: '7px 14px', fontSize: 12, color: 'var(--text-secondary)', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', cursor: 'pointer' }}
+              >Cancel</button>
+              <button onClick={saveEditKey}
+                style={{ padding: '7px 14px', fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', background: 'var(--accent)', borderRadius: 'var(--radius-md)', cursor: 'pointer' }}
+              >Save</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Delete confirmation modal */}
       {deleteConfirmKey.value && (

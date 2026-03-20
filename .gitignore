@@ -32,6 +32,7 @@ web/dashboard/dist/
 .sage/
 .sage-memory/
 sage/
+docs/
 
 # Claude Code (user-specific)
 .claude/

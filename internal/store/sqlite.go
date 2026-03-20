@@ -60,7 +60,9 @@ func NewSQLiteStore(path string) (Store, error) {
 	// own empty database.
 	dsn := path
 	if path == ":memory:" {
-		dsn = "file::memory:?cache=shared"
+		// Use a unique name per instance so parallel tests don't collide,
+		// but share cache within a single connection pool.
+		dsn = fmt.Sprintf("file:memdb_%d?mode=memory&cache=shared", time.Now().UnixNano())
 	}
 
 	db, err := sql.Open("sqlite", dsn)
@@ -444,8 +446,22 @@ func (s *sqliteStore) ListAliases() (map[string]string, error) {
 // API Keys
 // ---------------------------------------------------------------------------
 
+const apiKeyCols = `id, name, key_hash, prefix, budget_monthly, budget_hard_limit, allowed_models, rate_limit_rpm, routing_strategy, created_at`
+
+func scanAPIKey(row interface{ Scan(dest ...any) error }) (*APIKey, error) {
+	var k APIKey
+	var createdAt string
+	if err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix,
+		&k.BudgetMonthly, &k.BudgetHardLimit, &k.AllowedModels,
+		&k.RateLimitRPM, &k.RoutingStrategy, &createdAt); err != nil {
+		return nil, err
+	}
+	k.CreatedAt = parseTime(createdAt)
+	return &k, nil
+}
+
 func (s *sqliteStore) ListAPIKeys() ([]APIKey, error) {
-	rows, err := s.db.Query("SELECT id, name, key_hash, prefix, created_at FROM api_keys ORDER BY created_at DESC")
+	rows, err := s.db.Query("SELECT " + apiKeyCols + " FROM api_keys ORDER BY created_at DESC")
 	if err != nil {
 		return nil, fmt.Errorf("list api keys: %w", err)
 	}
@@ -453,27 +469,71 @@ func (s *sqliteStore) ListAPIKeys() ([]APIKey, error) {
 
 	var out []APIKey
 	for rows.Next() {
-		var k APIKey
-		var createdAt string
-		if err := rows.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &createdAt); err != nil {
+		k, err := scanAPIKey(rows)
+		if err != nil {
 			return nil, err
 		}
-		k.CreatedAt = parseTime(createdAt)
-		out = append(out, k)
+		out = append(out, *k)
 	}
 	return out, rows.Err()
 }
 
+func (s *sqliteStore) GetAPIKeyByHash(keyHash string) (*APIKey, error) {
+	row := s.db.QueryRow("SELECT "+apiKeyCols+" FROM api_keys WHERE key_hash = ?", keyHash)
+	k, err := scanAPIKey(row)
+	if err != nil {
+		return nil, fmt.Errorf("get api key by hash: %w", err)
+	}
+	return k, nil
+}
+
 func (s *sqliteStore) CreateAPIKey(k *APIKey) error {
 	now := timeStr(time.Now().UTC())
+	if k.AllowedModels == "" {
+		k.AllowedModels = "*"
+	}
 	_, err := s.db.Exec(
-		"INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES (?,?,?,?,?)",
-		k.ID, k.Name, k.KeyHash, k.Prefix, now,
+		"INSERT INTO api_keys (id, name, key_hash, prefix, budget_monthly, budget_hard_limit, allowed_models, rate_limit_rpm, routing_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+		k.ID, k.Name, k.KeyHash, k.Prefix, k.BudgetMonthly, k.BudgetHardLimit,
+		k.AllowedModels, k.RateLimitRPM, k.RoutingStrategy, now,
 	)
 	if err != nil {
 		return fmt.Errorf("create api key: %w", err)
 	}
 	k.CreatedAt = parseTime(now)
+	return nil
+}
+
+func (s *sqliteStore) UpdateAPIKey(id string, updates map[string]any) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	allowed := map[string]bool{
+		"name": true, "budget_monthly": true, "budget_hard_limit": true,
+		"allowed_models": true, "rate_limit_rpm": true, "routing_strategy": true,
+	}
+	var setClauses []string
+	var params []any
+	for col, val := range updates {
+		if !allowed[col] {
+			continue
+		}
+		setClauses = append(setClauses, col+" = ?")
+		params = append(params, val)
+	}
+	if len(setClauses) == 0 {
+		return nil
+	}
+	params = append(params, id)
+	q := "UPDATE api_keys SET " + joinStrings(setClauses, ", ") + " WHERE id = ?"
+	res, err := s.db.Exec(q, params...)
+	if err != nil {
+		return fmt.Errorf("update api key: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("api key %q not found", id)
+	}
 	return nil
 }
 
@@ -505,6 +565,20 @@ func (s *sqliteStore) DeleteAPIKey(id string) error {
 		return fmt.Errorf("api key %q not found", id)
 	}
 	return nil
+}
+
+func (s *sqliteStore) GetMonthlySpend(keyID string) (float64, error) {
+	now := time.Now().UTC()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	var total float64
+	err := s.db.QueryRow(
+		"SELECT COALESCE(SUM(cost), 0) FROM usage_log WHERE api_key_id = ? AND created_at >= ?",
+		keyID, timeStr(monthStart),
+	).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("get monthly spend: %w", err)
+	}
+	return total, nil
 }
 
 // hashKey returns the hex-encoded SHA-256 of a raw API key string.
@@ -559,10 +633,10 @@ func (s *sqliteStore) AllSettings() (map[string]string, error) {
 func (s *sqliteStore) RecordUsage(entry *UsageEntry) error {
 	now := timeStr(time.Now().UTC())
 	_, err := s.db.Exec(
-		`INSERT INTO usage_log (id, request_id, provider, model, connection_id, input_tokens, output_tokens, total_tokens, cost, latency_ms, status, created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO usage_log (id, request_id, provider, model, connection_id, api_key_id, input_tokens, output_tokens, total_tokens, cost, latency_ms, status, created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		entry.ID, entry.RequestID, entry.Provider, entry.Model, entry.ConnectionID,
-		entry.InputTokens, entry.OutputTokens, entry.TotalTokens,
+		entry.APIKeyID, entry.InputTokens, entry.OutputTokens, entry.TotalTokens,
 		entry.Cost, entry.Latency.Milliseconds(), entry.Status, now,
 	)
 	if err != nil {
@@ -631,7 +705,7 @@ func scanUsageEntry(row interface{ Scan(dest ...any) error }) (*UsageEntry, erro
 
 	err := row.Scan(
 		&e.ID, &e.RequestID, &e.Provider, &e.Model, &e.ConnectionID,
-		&e.InputTokens, &e.OutputTokens, &e.TotalTokens,
+		&e.APIKeyID, &e.InputTokens, &e.OutputTokens, &e.TotalTokens,
 		&e.Cost, &latencyMs, &e.Status, &createdAt,
 	)
 	if err != nil {

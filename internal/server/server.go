@@ -18,6 +18,7 @@ import (
 	"sage-router/internal/bypass"
 	"sage-router/internal/executor"
 	"sage-router/internal/provider"
+	"sage-router/internal/ratelimit"
 	"sage-router/internal/routing"
 	"sage-router/internal/store"
 	"sage-router/internal/translate"
@@ -51,6 +52,7 @@ type Dependencies struct {
 	ConversationStore  *routing.ConversationStore
 	BypassFilter       *bypass.Filter
 	HealthChecker      *provider.HealthChecker
+	RateLimiter        *ratelimit.Limiter
 }
 
 // Server is the main HTTP server for sage-router.
@@ -114,6 +116,7 @@ func (s *Server) setupRoutes() {
 
 	s.mux.Handle("GET /api/keys", protect(s.handleListAPIKeys))
 	s.mux.Handle("POST /api/keys", protect(s.handleCreateAPIKey))
+	s.mux.Handle("PATCH /api/keys/{id}", protect(s.handleUpdateAPIKey))
 	s.mux.Handle("DELETE /api/keys/{id}", protect(s.handleDeleteAPIKey))
 
 	s.mux.Handle("GET /api/settings", protect(s.handleGetSettings))

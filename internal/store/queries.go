@@ -56,6 +56,9 @@ func buildUsageFilter(f UsageFilter) whereClause {
 	if !f.To.IsZero() {
 		w.add("created_at <= ?", f.To.UTC().Format("2006-01-02T15:04:05Z"))
 	}
+	if f.APIKeyID != "" {
+		w.add("api_key_id = ?", f.APIKeyID)
+	}
 	return w
 }
 
@@ -63,7 +66,7 @@ func buildUsageFilter(f UsageFilter) whereClause {
 // WHERE and LIMIT clauses applied from the filter.
 func buildUsageQuery(f UsageFilter) (string, []any) {
 	w := buildUsageFilter(f)
-	q := "SELECT id, request_id, provider, model, connection_id, input_tokens, output_tokens, total_tokens, cost, latency_ms, status, created_at FROM usage_log" + w.sql() + " ORDER BY created_at DESC"
+	q := "SELECT id, request_id, provider, model, connection_id, api_key_id, input_tokens, output_tokens, total_tokens, cost, latency_ms, status, created_at FROM usage_log" + w.sql() + " ORDER BY created_at DESC"
 	if f.Limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", f.Limit)
 	}

@@ -42,20 +42,54 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Detect source format
 	sourceFormat := translate.DetectSourceFormat(r.URL.Path, body)
 
-	// Validate API key — required when any keys exist in the store
+	// Block proxy requests until initial setup is complete (password created)
+	if s.deps.Auth.NeedsSetup() {
+		writeError(w, http.StatusServiceUnavailable, "sage-router setup required — open the dashboard to create a password")
+		return
+	}
+
+	// Validate API key
+	// If any keys have ever been created (password is set = setup complete),
+	// require a valid key. This prevents deleted keys from silently working
+	// when the last key is removed.
+	var authenticatedKey *store.APIKey
 	hasKeys, _ := s.deps.Store.HasAPIKeys()
+	apiKey := extractAPIKey(r)
+
 	if hasKeys {
-		apiKey := extractAPIKey(r)
+		// Keys exist — validate the provided key
 		if apiKey == "" {
 			writeError(w, http.StatusUnauthorized, "API key required")
 			return
 		}
 		keyHash := s.deps.Auth.HashAPIKey(apiKey)
-		valid, err := s.deps.Store.ValidateAPIKey(keyHash)
-		if err != nil || !valid {
+		key, err := s.deps.Store.GetAPIKeyByHash(keyHash)
+		if err != nil || key == nil {
 			writeError(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
+		authenticatedKey = key
+
+		// Rate limit check (§34)
+		if key.RateLimitRPM > 0 && s.deps.RateLimiter != nil {
+			if !s.deps.RateLimiter.Allow(key.ID, key.RateLimitRPM) {
+				writeError(w, http.StatusTooManyRequests, fmt.Sprintf("rate limit exceeded: %d requests/min for key %q", key.RateLimitRPM, key.Name))
+				return
+			}
+		}
+
+		// Budget check (§34)
+		if key.BudgetMonthly > 0 {
+			spent, err := s.deps.Store.GetMonthlySpend(key.ID)
+			if err == nil && key.BudgetHardLimit && spent >= key.BudgetMonthly {
+				writeError(w, http.StatusPaymentRequired, fmt.Sprintf("monthly budget exceeded for key %q: $%.2f / $%.2f", key.Name, spent, key.BudgetMonthly))
+				return
+			}
+		}
+	} else if apiKey != "" {
+		// No keys in DB but a key was provided — it's invalid (possibly deleted)
+		writeError(w, http.StatusUnauthorized, "invalid API key")
+		return
 	}
 
 	// Parse model from request
@@ -77,11 +111,47 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Per-key routing strategy override (§34)
+	if authenticatedKey != nil && authenticatedKey.RoutingStrategy != "" && model == "auto" {
+		model = "auto:" + authenticatedKey.RoutingStrategy
+	}
+
 	// Resolve provider and model
 	providerID, resolvedModel, isCombo, comboModels := s.resolveModel(model, body)
 
+	// ACL check — enforce allowed models (§34)
+	if authenticatedKey != nil && authenticatedKey.AllowedModels != "*" {
+		target := resolvedModel
+		if providerID != "" {
+			target = providerID + "/" + resolvedModel
+		}
+		if isCombo {
+			// Filter combo list to only ACL-permitted models.
+			// This prevents bypassing ACL by placing a disallowed model
+			// before an allowed one in the combo sequence.
+			var filtered []string
+			for _, m := range comboModels {
+				if matchModelPattern(m, authenticatedKey.AllowedModels) {
+					filtered = append(filtered, m)
+				}
+			}
+			if len(filtered) == 0 {
+				writeError(w, http.StatusForbidden, fmt.Sprintf("no permitted models in combo for key %q: allowed=%s", authenticatedKey.Name, authenticatedKey.AllowedModels))
+				return
+			}
+			comboModels = filtered
+		} else if !matchModelPattern(target, authenticatedKey.AllowedModels) {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("model %q not allowed for key %q: allowed=%s", target, authenticatedKey.Name, authenticatedKey.AllowedModels))
+			return
+		}
+	}
+
 	if isCombo {
-		s.handleComboRequest(w, r, body, sourceFormat, comboModels, stream, requestID, startTime)
+		var comboKeyID string
+		if authenticatedKey != nil {
+			comboKeyID = authenticatedKey.ID
+		}
+		s.handleComboRequest(w, r, body, sourceFormat, comboModels, stream, requestID, startTime, comboKeyID)
 		return
 	}
 
@@ -95,14 +165,21 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Derive key ID for usage tracking
+	var apiKeyID string
+	if authenticatedKey != nil {
+		apiKeyID = authenticatedKey.ID
+	}
+
 	// Execute with fallback
-	s.executeRequest(w, r, body, sourceFormat, providerID, resolvedModel, stream, conn, nil, requestID, startTime)
+	s.executeRequest(w, r, body, sourceFormat, providerID, resolvedModel, stream, conn, nil, requestID, startTime, apiKeyID)
 }
 
 // requestContext carries metadata through the request lifecycle for post-response hooks.
 type requestContext struct {
 	firstMsg    string // first user message (session key)
 	requestBody []byte // raw request body (for conversation store)
+	apiKeyID    string // authenticated API key ID (for usage tracking)
 }
 
 func (s *Server) executeRequest(
@@ -115,11 +192,13 @@ func (s *Server) executeRequest(
 	excludeIDs []string,
 	requestID string,
 	startTime time.Time,
+	apiKeyID string,
 ) {
 	// Build request context for post-response hooks
 	reqCtx := &requestContext{
 		firstMsg:    extractFirstUserMsg(body),
 		requestBody: body,
+		apiKeyID:    apiKeyID,
 	}
 	s.executeRequestWithCtx(w, r, body, sourceFormat, providerID, model, stream, conn, excludeIDs, requestID, startTime, reqCtx)
 }
@@ -261,7 +340,7 @@ func (s *Server) executeRequestWithCtx(
 					"status", statusCode,
 					"connection", nextConn.ID,
 				)
-				s.executeRequest(w, r, body, sourceFormat, providerID, model, stream, nextConn, excludeIDs, requestID, startTime)
+				s.executeRequest(w, r, body, sourceFormat, providerID, model, stream, nextConn, excludeIDs, requestID, startTime, reqCtx.apiKeyID)
 				return
 			}
 		}
@@ -392,7 +471,7 @@ func (s *Server) streamResponse(
 	}
 
 	// Track usage
-	s.trackUsage(requestID, providerID, model, connectionID, totalUsage, startTime, "success")
+	s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, totalUsage, startTime, "success")
 
 	// Post-response hooks: session affinity, conversation store, bridge lifecycle
 	s.postRequestHook(reqCtx, providerID, model, totalUsage)
@@ -425,7 +504,7 @@ func (s *Server) forwardResponse(
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(result.StatusCode)
 		w.Write(respBody)
-		s.trackUsage(requestID, providerID, model, connectionID, usageData, startTime, "success")
+		s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, usageData, startTime, "success")
 		s.postRequestHook(reqCtx, providerID, model, usageData)
 		return
 	}
@@ -442,7 +521,7 @@ func (s *Server) forwardResponse(
 	w.Header().Set("X-Request-ID", requestID)
 	w.WriteHeader(http.StatusOK)
 	w.Write(clientBody)
-	s.trackUsage(requestID, providerID, model, connectionID, usageData, startTime, "success")
+	s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, usageData, startTime, "success")
 	s.postRequestHook(reqCtx, providerID, model, usageData)
 }
 
@@ -502,6 +581,7 @@ func (s *Server) handleComboRequest(
 	stream bool,
 	requestID string,
 	startTime time.Time,
+	apiKeyID string,
 ) {
 	for _, modelStr := range comboModels {
 		providerID, model, _, _ := s.resolveModel(modelStr, body)
@@ -512,7 +592,7 @@ func (s *Server) handleComboRequest(
 		}
 
 		// Try this combo entry
-		s.executeRequest(w, r, body, sourceFormat, providerID, model, stream, conn, nil, requestID, startTime)
+		s.executeRequest(w, r, body, sourceFormat, providerID, model, stream, conn, nil, requestID, startTime, apiKeyID)
 		return
 	}
 
@@ -821,7 +901,7 @@ func (s *Server) markConnectionResult(connID, model string, statusCode int, err 
 	}
 }
 
-func (s *Server) trackUsage(requestID, provider, model, connectionID string, u *canonical.Usage, startTime time.Time, status string) {
+func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID string, u *canonical.Usage, startTime time.Time, status string) {
 	if s.deps.UsageTracker == nil {
 		return
 	}
@@ -841,6 +921,7 @@ func (s *Server) trackUsage(requestID, provider, model, connectionID string, u *
 		Provider:     provider,
 		Model:        model,
 		ConnectionID: connectionID,
+		APIKeyID:     apiKeyID,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		TotalTokens:  totalTokens,
@@ -1296,4 +1377,25 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
+}
+
+// matchModelPattern checks if a model string matches a comma-separated pattern list.
+// Patterns can be exact matches or use provider/* wildcards.
+// Examples: "anthropic/*", "openai/gpt-4.1,anthropic/*", "gemini/*,gpt-4o-mini"
+func matchModelPattern(model, patterns string) bool {
+	for _, p := range strings.Split(patterns, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" || p == "*" {
+			return true
+		}
+		if strings.HasSuffix(p, "/*") {
+			prefix := strings.TrimSuffix(p, "/*")
+			if strings.HasPrefix(model, prefix+"/") || model == prefix {
+				return true
+			}
+		} else if p == model {
+			return true
+		}
+	}
+	return false
 }
