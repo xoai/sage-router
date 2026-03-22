@@ -1,7 +1,10 @@
 <p align="center">
-  <h1 align="center">Sage Router</h1>
-  <p align="center">The AI gateway with a brain.</p>
+  <h1 align="center">Sage Router</h1> 
 </p>
+<p align="center">
+  <img src="sage-router-logo.svg" alt="Sage Router - The AI gateway with a brain." width="150" />
+</p>
+<p align="center">The AI gateway with a brain.</p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &bull;
