@@ -2,7 +2,7 @@
   <h1 align="center">Sage Router</h1> 
 </p>
 <p align="center">
-  <img src="sage-router-logo.svg" alt="Sage Router - The AI gateway with a brain." width="150" />
+  <img src="sage-router-logo.svg" alt="Sage Router - The AI gateway with a brain." width="300" />
 </p>
 <p align="center">The AI gateway with a brain.</p>
 
