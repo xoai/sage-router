@@ -83,6 +83,15 @@ type openAIFunction struct {
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
+type openAIToolChoiceFunction struct {
+	Type     string                     `json:"type"`
+	Function openAIToolChoiceFunctionName `json:"function"`
+}
+
+type openAIToolChoiceFunctionName struct {
+	Name string `json:"name"`
+}
+
 type responseFormat struct {
 	Type       string          `json:"type"`
 	JSONSchema json.RawMessage `json:"json_schema,omitempty"`
@@ -292,15 +301,15 @@ func (t *Translator) FromCanonical(req *canonical.Request, opts translate.Transl
 	for _, msg := range req.Messages {
 		oaiMsg := openAIMessage{Role: msg.Role}
 
-		var textParts []any
+		var textParts []openAIContentBlock
 		var toolCalls []openAIToolCall
 
 		for _, c := range msg.Content {
 			switch c.Type {
 			case canonical.TypeText:
-				textParts = append(textParts, map[string]any{
-					"type": "text",
-					"text": c.Text,
+				textParts = append(textParts, openAIContentBlock{
+					Type: "text",
+					Text: c.Text,
 				})
 			case canonical.TypeImage:
 				if c.ImageSource != nil {
@@ -310,11 +319,9 @@ func (t *Translator) FromCanonical(req *canonical.Request, opts translate.Transl
 					} else {
 						url = fmt.Sprintf("data:%s;base64,%s", c.ImageSource.MediaType, c.ImageSource.Data)
 					}
-					textParts = append(textParts, map[string]any{
-						"type": "image_url",
-						"image_url": map[string]any{
-							"url": url,
-						},
+					textParts = append(textParts, openAIContentBlock{
+						Type:     "image_url",
+						ImageURL: &openAIImageURL{URL: url},
 					})
 				}
 			case canonical.TypeToolCall:
@@ -341,15 +348,9 @@ func (t *Translator) FromCanonical(req *canonical.Request, opts translate.Transl
 		}
 
 		// Set content
-		if len(textParts) == 1 {
-			if m, ok := textParts[0].(map[string]any); ok {
-				if t, ok := m["type"].(string); ok && t == "text" {
-					oaiMsg.Content = m["text"]
-				} else {
-					oaiMsg.Content = textParts
-				}
-			}
-		} else if len(textParts) > 1 {
+		if len(textParts) == 1 && textParts[0].Type == "text" {
+			oaiMsg.Content = textParts[0].Text
+		} else if len(textParts) > 0 {
 			oaiMsg.Content = textParts
 		} else if len(toolCalls) > 0 {
 			oaiMsg.Content = ""
@@ -385,11 +386,9 @@ func (t *Translator) FromCanonical(req *canonical.Request, opts translate.Transl
 		case "auto", "none", "required":
 			oai.ToolChoice = req.ToolChoice.Type
 		case "tool":
-			oai.ToolChoice = map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name": req.ToolChoice.Name,
-				},
+			oai.ToolChoice = openAIToolChoiceFunction{
+				Type:     "function",
+				Function: openAIToolChoiceFunctionName{Name: req.ToolChoice.Name},
 			}
 		}
 	}

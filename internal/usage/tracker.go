@@ -23,6 +23,10 @@ type Entry struct {
 	Status       string
 	CreatedAt    time.Time
 
+	// Cache metrics (populated from provider response usage)
+	CacheReadTokens  int
+	CacheWriteTokens int
+
 	// Routing telemetry (populated for auto-routed requests)
 	Strategy      string // "fast", "cheap", "best", "balanced", "manual"
 	RoutingReason string // "session_affinity", "strategy_sort", "manual"
@@ -121,19 +125,21 @@ func (t *Tracker) flushBatch(batch []*Entry) {
 
 func (t *Tracker) writeEntry(entry *Entry) {
 	storeEntry := &store.UsageEntry{
-		ID:           entry.RequestID,
-		RequestID:    entry.RequestID,
-		Provider:     entry.Provider,
-		Model:        entry.Model,
-		ConnectionID: entry.ConnectionID,
-		APIKeyID:     entry.APIKeyID,
-		InputTokens:  entry.InputTokens,
-		OutputTokens: entry.OutputTokens,
-		TotalTokens:  entry.TotalTokens,
-		Cost:         entry.Cost,
-		Latency:      entry.Latency,
-		Status:       entry.Status,
-		CreatedAt:    entry.CreatedAt,
+		ID:               entry.RequestID,
+		RequestID:        entry.RequestID,
+		Provider:         entry.Provider,
+		Model:            entry.Model,
+		ConnectionID:     entry.ConnectionID,
+		APIKeyID:         entry.APIKeyID,
+		InputTokens:      entry.InputTokens,
+		OutputTokens:     entry.OutputTokens,
+		TotalTokens:      entry.TotalTokens,
+		CacheReadTokens:  entry.CacheReadTokens,
+		CacheWriteTokens: entry.CacheWriteTokens,
+		Cost:             entry.Cost,
+		Latency:          entry.Latency,
+		Status:           entry.Status,
+		CreatedAt:        entry.CreatedAt,
 	}
 	if err := t.store.RecordUsage(storeEntry); err != nil {
 		slog.Error("failed to record usage", "error", err)

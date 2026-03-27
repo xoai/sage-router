@@ -108,19 +108,21 @@ type APIKey struct {
 
 // UsageEntry records a single proxied request for billing and analytics.
 type UsageEntry struct {
-	ID           string        `json:"id"`
-	RequestID    string        `json:"request_id"`
-	Provider     string        `json:"provider"`
-	Model        string        `json:"model"`
-	ConnectionID string        `json:"connection_id"`
-	APIKeyID     string        `json:"api_key_id"`
-	InputTokens  int           `json:"input_tokens"`
-	OutputTokens int           `json:"output_tokens"`
-	TotalTokens  int           `json:"total_tokens"`
-	Cost         float64       `json:"cost"`
-	Latency      time.Duration `json:"latency"`
-	Status       string        `json:"status"`
-	CreatedAt    time.Time     `json:"created_at"`
+	ID              string        `json:"id"`
+	RequestID       string        `json:"request_id"`
+	Provider        string        `json:"provider"`
+	Model           string        `json:"model"`
+	ConnectionID    string        `json:"connection_id"`
+	APIKeyID        string        `json:"api_key_id"`
+	InputTokens     int           `json:"input_tokens"`
+	OutputTokens    int           `json:"output_tokens"`
+	TotalTokens     int           `json:"total_tokens"`
+	CacheReadTokens  int          `json:"cache_read_tokens"`
+	CacheWriteTokens int          `json:"cache_write_tokens"`
+	Cost            float64       `json:"cost"`
+	Latency         time.Duration `json:"latency"`
+	Status          string        `json:"status"`
+	CreatedAt       time.Time     `json:"created_at"`
 }
 
 // UsageFilter controls which usage entries are returned or summarised.

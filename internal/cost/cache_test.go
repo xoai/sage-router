@@ -127,6 +127,36 @@ func TestEstimateTokens(t *testing.T) {
 	}
 }
 
+func TestInjectCacheHints_SkipsWhenContentHasCacheControl(t *testing.T) {
+	largeText := strings.Repeat("Large system prompt. ", 200)
+	req := &canonical.Request{
+		System: []canonical.SystemBlock{
+			{Text: largeText},
+		},
+		Messages: []canonical.Message{
+			{
+				Role: "user",
+				Content: []canonical.Content{
+					{
+						Type:         "text",
+						Text:         "hello",
+						CacheControl: &canonical.CacheControl{Type: "ephemeral"},
+					},
+				},
+			},
+		},
+	}
+
+	injected := InjectCacheHints(req, "anthropic")
+	if injected {
+		t.Error("should not inject when content blocks have cache_control")
+	}
+	// Verify system block was NOT modified
+	if req.System[0].CacheControl != nil {
+		t.Error("system block should not have cache_control when skipping")
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

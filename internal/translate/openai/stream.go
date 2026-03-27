@@ -42,9 +42,14 @@ type streamFunctionCall struct {
 }
 
 type streamUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	PromptTokensDetails *promptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+type promptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 func (t *Translator) StreamChunkToCanonical(data []byte, state *translate.StreamState) ([]canonical.Chunk, error) {
@@ -124,6 +129,9 @@ func (t *Translator) StreamChunkToCanonical(data []byte, state *translate.Stream
 			PromptTokens:     chunk.Usage.PromptTokens,
 			CompletionTokens: chunk.Usage.CompletionTokens,
 			TotalTokens:      chunk.Usage.TotalTokens,
+		}
+		if chunk.Usage.PromptTokensDetails != nil {
+			usage.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
 		}
 		state.Usage = usage
 		results = append(results, canonical.Chunk{

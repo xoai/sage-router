@@ -160,6 +160,43 @@ func goldenStreamTest(t *testing.T, tr translate.Translator, dir, name string) {
 	}
 }
 
+// goldenFromCanonicalDeterminismTest loads a canonical JSON, runs FromCanonical
+// multiple times, and asserts all outputs are byte-identical.
+func goldenFromCanonicalDeterminismTest(t *testing.T, tr translate.Translator, dir string, names []string, opts translate.TranslateOpts) {
+	t.Helper()
+
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			inputPath := filepath.Join("testdata", dir, "from_canonical", name+".input.json")
+			inputData, err := os.ReadFile(inputPath)
+			if err != nil {
+				t.Fatalf("read input %s: %v", inputPath, err)
+			}
+
+			var req canonical.Request
+			if err := json.Unmarshal(inputData, &req); err != nil {
+				t.Fatalf("unmarshal canonical request: %v", err)
+			}
+
+			first, err := tr.FromCanonical(&req, opts)
+			if err != nil {
+				t.Fatalf("FromCanonical: %v", err)
+			}
+
+			for i := 1; i < 100; i++ {
+				got, err := tr.FromCanonical(&req, opts)
+				if err != nil {
+					t.Fatalf("FromCanonical iteration %d: %v", i, err)
+				}
+				if string(got) != string(first) {
+					t.Fatalf("non-deterministic output at iteration %d\n--- first ---\n%s\n--- got ---\n%s",
+						i, string(first), string(got))
+				}
+			}
+		})
+	}
+}
+
 // jsonEqual compares two JSON byte slices for semantic equality,
 // ignoring whitespace differences.
 func jsonEqual(a, b []byte) bool {

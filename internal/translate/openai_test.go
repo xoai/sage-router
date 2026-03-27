@@ -58,3 +58,9 @@ func TestOpenAI_FromCanonical(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAI_FromCanonical_Deterministic(t *testing.T) {
+	tr := openaiTranslate.New()
+	opts := translate.TranslateOpts{Provider: "openai", Model: "gpt-4.1"}
+	goldenFromCanonicalDeterminismTest(t, tr, "openai", []string{"simple", "tools"}, opts)
+}

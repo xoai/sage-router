@@ -29,10 +29,10 @@ web/dashboard/dist/
 !web/dashboard/dist/index.html
 
 # Sage folder
+docs/
 .sage/
 .sage-memory/
 sage/
-docs/
 
 # Claude Code (user-specific)
 .claude/

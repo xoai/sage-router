@@ -57,3 +57,9 @@ func TestGemini_FromCanonical(t *testing.T) {
 		})
 	}
 }
+
+func TestGemini_FromCanonical_Deterministic(t *testing.T) {
+	tr := geminiTranslate.New()
+	opts := translate.TranslateOpts{Provider: "gemini", Model: "gemini-2.5-flash"}
+	goldenFromCanonicalDeterminismTest(t, tr, "gemini", []string{"simple", "tools"}, opts)
+}

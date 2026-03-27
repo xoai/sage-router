@@ -58,3 +58,9 @@ func TestClaude_FromCanonical(t *testing.T) {
 		})
 	}
 }
+
+func TestClaude_FromCanonical_Deterministic(t *testing.T) {
+	tr := claudeTranslate.New()
+	opts := translate.TranslateOpts{Provider: "anthropic", Model: "claude-sonnet-4-6"}
+	goldenFromCanonicalDeterminismTest(t, tr, "claude", []string{"simple", "tools"}, opts)
+}

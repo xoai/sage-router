@@ -177,6 +177,10 @@ func (t *Translator) ToCanonical(body []byte, opts translate.TranslateOpts) (*ca
 					))
 				}
 			}
+			// Propagate cache_control from Claude to canonical
+			if block.CacheControl != nil && len(cm.Content) > 0 {
+				cm.Content[len(cm.Content)-1].CacheControl = block.CacheControl
+			}
 		}
 
 		if len(cm.Content) == 0 {
@@ -371,30 +375,32 @@ func (t *Translator) FromCanonical(req *canonical.Request, opts translate.Transl
 		var blocks []claudeContentBlock
 
 		for _, c := range msg.Content {
+			var block claudeContentBlock
 			switch c.Type {
 			case canonical.TypeText:
-				blocks = append(blocks, claudeContentBlock{
+				block = claudeContentBlock{
 					Type: "text",
 					Text: c.Text,
-				})
+				}
 
 			case canonical.TypeThinking:
-				blocks = append(blocks, claudeContentBlock{
+				block = claudeContentBlock{
 					Type:     "thinking",
 					Thinking: c.Text,
-					// Signature must be added by the caller or omitted for new generation
-				})
+				}
 
 			case canonical.TypeImage:
 				if c.ImageSource != nil {
-					blocks = append(blocks, claudeContentBlock{
+					block = claudeContentBlock{
 						Type: "image",
 						Source: &claudeImgSource{
 							Type:      "base64",
 							MediaType: c.ImageSource.MediaType,
 							Data:      c.ImageSource.Data,
 						},
-					})
+					}
+				} else {
+					continue
 				}
 
 			case canonical.TypeToolCall:
@@ -403,15 +409,15 @@ func (t *Translator) FromCanonical(req *canonical.Request, opts translate.Transl
 				if err := json.Unmarshal([]byte(c.Arguments), &input); err != nil {
 					input = map[string]any{}
 				}
-				blocks = append(blocks, claudeContentBlock{
+				block = claudeContentBlock{
 					Type:  "tool_use",
 					ID:    c.ToolCallID,
 					Name:  c.ToolName,
 					Input: input,
-				})
+				}
 
 			case canonical.TypeToolResult:
-				block := claudeContentBlock{
+				block = claudeContentBlock{
 					Type:      "tool_result",
 					ToolUseID: c.ToolCallID,
 					IsError:   c.IsError,
@@ -419,11 +425,18 @@ func (t *Translator) FromCanonical(req *canonical.Request, opts translate.Transl
 				if c.Text != "" {
 					block.Content = c.Text
 				}
-				blocks = append(blocks, block)
+
+			default:
+				continue
 			}
+			// Propagate cache_control from canonical to Claude
+			if c.CacheControl != nil {
+				block.CacheControl = c.CacheControl
+			}
+			blocks = append(blocks, block)
 		}
 
-		if len(blocks) == 1 && blocks[0].Type == "text" {
+		if len(blocks) == 1 && blocks[0].Type == "text" && blocks[0].CacheControl == nil {
 			cm.Content = blocks[0].Text
 		} else {
 			cm.Content = blocks

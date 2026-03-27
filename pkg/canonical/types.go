@@ -110,6 +110,9 @@ type Content struct {
 
 	// Tool Result (tool → reports result back)
 	IsError bool `json:"is_error,omitempty"`
+
+	// Cache control (provider-specific, passed through for detection)
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // ImageSource represents an image in a message.

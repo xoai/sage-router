@@ -55,11 +55,9 @@ func injectClaudeCacheHints(req *canonical.Request) bool {
 		return false
 	}
 
-	// Don't inject if user already set cache_control on any block
-	for _, sb := range req.System {
-		if sb.CacheControl != nil {
-			return false
-		}
+	// Don't inject if client already uses caching on any block
+	if clientUsesCaching(req) {
+		return false
 	}
 
 	// Estimate total system prompt size
@@ -79,4 +77,23 @@ func injectClaudeCacheHints(req *canonical.Request) bool {
 	}
 
 	return true
+}
+
+// clientUsesCaching checks if the client already set cache_control on any
+// system block or message content block. If so, we skip injection entirely
+// to avoid exceeding Anthropic's 4-breakpoint limit.
+func clientUsesCaching(req *canonical.Request) bool {
+	for _, sb := range req.System {
+		if sb.CacheControl != nil {
+			return true
+		}
+	}
+	for _, msg := range req.Messages {
+		for _, c := range msg.Content {
+			if c.CacheControl != nil {
+				return true
+			}
+		}
+	}
+	return false
 }

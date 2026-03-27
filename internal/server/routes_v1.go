@@ -916,19 +916,27 @@ func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID s
 		}
 	}
 
+	var cacheReadTokens, cacheWriteTokens int
+	if u != nil {
+		cacheReadTokens = u.CacheReadTokens
+		cacheWriteTokens = u.CacheCreationTokens
+	}
+
 	entry := &usage.Entry{
-		RequestID:    requestID,
-		Provider:     provider,
-		Model:        model,
-		ConnectionID: connectionID,
-		APIKeyID:     apiKeyID,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  totalTokens,
-		Cost:         config.EstimateCost(provider, model, inputTokens, outputTokens),
-		Latency:      time.Since(startTime),
-		Status:       status,
-		CreatedAt:    time.Now(),
+		RequestID:        requestID,
+		Provider:         provider,
+		Model:            model,
+		ConnectionID:     connectionID,
+		APIKeyID:         apiKeyID,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		TotalTokens:      totalTokens,
+		CacheReadTokens:  cacheReadTokens,
+		CacheWriteTokens: cacheWriteTokens,
+		Cost:             config.EstimateCost(provider, model, inputTokens, outputTokens),
+		Latency:          time.Since(startTime),
+		Status:           status,
+		CreatedAt:        time.Now(),
 	}
 
 	s.deps.UsageTracker.Record(entry)

@@ -68,6 +68,8 @@ function loadUsage() {
         apiKeyId: r.api_key_id || '',
         inputTokens: r.input_tokens || 0,
         outputTokens: r.output_tokens || 0,
+        cacheReadTokens: r.cache_read_tokens || 0,
+        cacheWriteTokens: r.cache_write_tokens || 0,
         cost: r.cost || 0,
         latency: formatLatency(r.latency),
       }));
@@ -99,6 +101,9 @@ export function UsagePage() {
   const totalCost = usageData.value.reduce((s, r) => s + r.cost, 0);
   const totalInput = usageData.value.reduce((s, r) => s + r.inputTokens, 0);
   const totalOutput = usageData.value.reduce((s, r) => s + r.outputTokens, 0);
+  const totalCacheRead = usageData.value.reduce((s, r) => s + r.cacheReadTokens, 0);
+  const totalCacheWrite = usageData.value.reduce((s, r) => s + r.cacheWriteTokens, 0);
+  const cacheHitRate = totalInput > 0 ? (totalCacheRead / totalInput * 100) : 0;
 
   // Per-key breakdown (only when viewing all keys)
   const keyBreakdown = !selectedKeyFilter.value && allKeys.value.length > 1
@@ -165,6 +170,13 @@ export function UsagePage() {
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Requests</div>
           <div style={{ fontSize: 20, fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{usageData.value.length}</div>
         </div>
+        {totalCacheRead > 0 && (
+          <div>
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Cache Hit Rate</div>
+            <div style={{ fontSize: 20, fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--status-green)' }}>{cacheHitRate.toFixed(1)}%</div>
+            <div style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>{formatTokens(totalCacheRead)} read / {formatTokens(totalCacheWrite)} write</div>
+          </div>
+        )}
         {selectedKeyInfo && selectedKeyInfo.budget_monthly > 0 && (
           <div style={{ marginLeft: 'auto' }}>
             <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Budget</div>
@@ -261,6 +273,7 @@ export function UsagePage() {
               <SortHeader field="model">Model</SortHeader>
               <SortHeader field="inputTokens" align="right">Input</SortHeader>
               <SortHeader field="outputTokens" align="right">Output</SortHeader>
+              <SortHeader field="cacheReadTokens" align="right">Cached</SortHeader>
               <SortHeader field="cost" align="right">Cost</SortHeader>
               <SortHeader field="latency" align="right">Latency</SortHeader>
             </tr>
@@ -273,13 +286,16 @@ export function UsagePage() {
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{r.model}</td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right' }}>{r.inputTokens.toLocaleString()}</td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right' }}>{r.outputTokens.toLocaleString()}</td>
+                <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right', color: r.cacheReadTokens > 0 ? 'var(--status-green)' : 'var(--text-tertiary)' }}>
+                  {r.cacheReadTokens > 0 ? formatTokens(r.cacheReadTokens) : '—'}
+                </td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right', color: 'var(--accent)' }}>${r.cost.toFixed(4)}</td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right' }}>{r.latency}</td>
               </tr>
             ))}
             {sorted.length === 0 && (
               <tr>
-                <td colSpan={7} style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
+                <td colSpan={8} style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
                   No usage data yet. Connect a tool and make some requests.
                 </td>
               </tr>
