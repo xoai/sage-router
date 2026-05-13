@@ -1,0 +1,112 @@
+{
+  "anthropic": {
+    "auth_types": [
+      "x-api-key"
+    ],
+    "backoff_step": 0,
+    "base_url": "https://api.anthropic.com/v1",
+    "discovery_enabled": true,
+    "format": "claude",
+    "id": "anthropic",
+    "models": [
+      "claude-opus-4-6",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5-20251001",
+      "claude-sonnet-4-20250514",
+      "claude-opus-4-20250514"
+    ],
+    "name": "Anthropic",
+    "subscription_discoverable": true
+  },
+  "gemini": {
+    "auth_types": [
+      "bearer",
+      "api-key-param"
+    ],
+    "backoff_step": 0,
+    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "discovery_enabled": true,
+    "format": "gemini",
+    "id": "gemini",
+    "models": [
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash-lite",
+      "gemini-2.0-flash"
+    ],
+    "name": "Google Gemini",
+    "subscription_discoverable": false
+  },
+  "github-copilot": {
+    "auth_types": [
+      "bearer"
+    ],
+    "backoff_step": 0,
+    "base_url": "https://api.githubcopilot.com",
+    "discovery_enabled": false,
+    "format": "openai",
+    "id": "github-copilot",
+    "models": [
+      "gpt-4o",
+      "gpt-4.1",
+      "claude-sonnet-4-6"
+    ],
+    "name": "GitHub Copilot",
+    "subscription_discoverable": false
+  },
+  "ollama": {
+    "auth_types": [
+      "none"
+    ],
+    "backoff_step": 0,
+    "base_url": "http://127.0.0.1:11434/api",
+    "discovery_enabled": true,
+    "format": "ollama",
+    "id": "ollama",
+    "models": [],
+    "name": "Ollama",
+    "subscription_discoverable": false
+  },
+  "openai": {
+    "auth_types": [
+      "bearer"
+    ],
+    "backoff_step": 0,
+    "base_url": "https://api.openai.com/v1",
+    "discovery_enabled": true,
+    "format": "openai",
+    "id": "openai",
+    "models": [
+      "gpt-4.1",
+      "gpt-4.1-mini",
+      "gpt-4.1-nano",
+      "gpt-4o",
+      "gpt-4o-mini",
+      "o3",
+      "o3-mini",
+      "o4-mini"
+    ],
+    "name": "OpenAI",
+    "subscription_discoverable": true
+  },
+  "openrouter": {
+    "auth_types": [
+      "bearer"
+    ],
+    "backoff_step": 0,
+    "base_url": "https://openrouter.ai/api/v1",
+    "discovery_enabled": true,
+    "format": "openai",
+    "id": "openrouter",
+    "models": [
+      "openai/gpt-4.1",
+      "openai/gpt-4o",
+      "anthropic/claude-sonnet-4-6",
+      "anthropic/claude-haiku-4-5-20251001",
+      "google/gemini-2.5-flash",
+      "google/gemini-2.5-pro"
+    ],
+    "name": "OpenRouter",
+    "subscription_discoverable": false
+  }
+}

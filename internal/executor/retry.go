@@ -72,6 +72,21 @@ func (r *RetryExecutor) Provider() string {
 	return r.inner.Provider()
 }
 
+// OverrideCapabilities delegates to the inner executor when it implements
+// CapabilityOverrider, returning `base` unchanged otherwise. Without this
+// delegation, production wiring (which wraps every executor in RetryExecutor
+// per main.go) would mask the inner executor's override and `server.
+// buildSmartCandidates` would silently fall back to catalog flags. The
+// method always exists on RetryExecutor (so the type assertion at the
+// call site always succeeds when the wrap is present), but only flips
+// flags when the inner has opted in.
+func (r *RetryExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
+	if inner, ok := r.inner.(CapabilityOverrider); ok {
+		return inner.OverrideCapabilities(model, base)
+	}
+	return base
+}
+
 func (r *RetryExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Result, error) {
 	var lastResult *Result
 	var lastErr error

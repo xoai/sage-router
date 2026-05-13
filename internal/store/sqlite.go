@@ -1,14 +1,18 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
+
+	"sage-router/internal/auth"
 
 	_ "modernc.org/sqlite"
 )
@@ -85,6 +89,10 @@ func NewSQLiteStore(path string) (Store, error) {
 	return &sqliteStore{db: db}, nil
 }
 
+// DB returns the underlying *sql.DB. See Store.DB godoc for the
+// "cross-package wiring only" contract.
+func (s *sqliteStore) DB() *sql.DB { return s.db }
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -146,7 +154,7 @@ func (s *sqliteStore) Migrate() error {
 // Connections
 // ---------------------------------------------------------------------------
 
-const connCols = `id, provider, name, auth_type, access_token, refresh_token, api_key, priority, state, expires_at, provider_data, created_at, updated_at`
+const connCols = `id, provider, name, auth_type, access_token, refresh_token, api_key, priority, state, expires_at, provider_data, refresh_failures, created_at, updated_at`
 
 func scanConnection(row interface{ Scan(dest ...any) error }) (*Connection, error) {
 	var c Connection
@@ -158,10 +166,33 @@ func scanConnection(row interface{ Scan(dest ...any) error }) (*Connection, erro
 		&c.ID, &c.Provider, &c.Name, &c.AuthType,
 		&c.AccessToken, &c.RefreshToken, &c.APIKey,
 		&c.Priority, &c.State, &expiresAt, &providerData,
+		&c.RefreshFailures,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	// Normalize legacy AuthType vocabulary at the read boundary so downstream
+	// code only needs to switch on canonical values (AC1c). When the input
+	// is non-canonical and NormalizeAuthType passes it through unchanged
+	// (e.g., a typo or unknown future value), emit a WARN so the operator
+	// can see the bad row without crashing the read path.
+	if c.AuthType != "" {
+		normalized := auth.NormalizeAuthType(c.AuthType)
+		if normalized != c.AuthType && !auth.IsCanonicalAuthType(normalized) {
+			slog.Warn("unexpected auth_type",
+				"conn_id", c.ID,
+				"raw", c.AuthType,
+				"normalized", normalized,
+			)
+		} else if normalized == c.AuthType && !auth.IsCanonicalAuthType(c.AuthType) {
+			slog.Warn("unexpected auth_type",
+				"conn_id", c.ID,
+				"value", c.AuthType,
+			)
+		}
+		c.AuthType = normalized
 	}
 
 	if expiresAt.Valid && expiresAt.String != "" {
@@ -234,10 +265,16 @@ func (s *sqliteStore) CreateConnection(c *Connection) error {
 		providerData = &s
 	}
 
-	_, err := s.db.Exec(`INSERT INTO connections (`+connCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	// AC2b: defensive write-side normalization. The DB schema default
+	// (legacy 'api_key') is irrelevant because we always set auth_type
+	// explicitly through this canonical-form path.
+	c.AuthType = auth.NormalizeAuthType(c.AuthType)
+
+	_, err := s.db.Exec(`INSERT INTO connections (`+connCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		c.ID, c.Provider, c.Name, c.AuthType,
 		s.encryptField(c.AccessToken), s.encryptField(c.RefreshToken), s.encryptField(c.APIKey),
 		c.Priority, c.State, expiresAt, providerData,
+		c.RefreshFailures,
 		now, now,
 	)
 	if err != nil {
@@ -255,6 +292,14 @@ func (s *sqliteStore) UpdateConnection(id string, updates map[string]any) error 
 
 	// Always bump updated_at.
 	updates["updated_at"] = timeStr(time.Now().UTC())
+
+	// AC2b: normalize AuthType on write so legacy vocabulary inputs don't
+	// linger in the DB even when they don't go through CreateConnection.
+	if v, ok := updates["auth_type"]; ok {
+		if str, isStr := v.(string); isStr {
+			updates["auth_type"] = auth.NormalizeAuthType(str)
+		}
+	}
 
 	// Encrypt secret fields if present.
 	for _, secretCol := range []string{"access_token", "refresh_token", "api_key"} {
@@ -295,6 +340,40 @@ func (s *sqliteStore) DeleteConnection(id string) error {
 		return fmt.Errorf("connection %q not found", id)
 	}
 	return nil
+}
+
+// BumpConnectionRefreshFailures atomically increments and returns the new value.
+// Caller uses this to drive the auto-disable threshold (3 consecutive failures
+// → Disabled). DB is the canonical store; no in-memory shadow.
+func (s *sqliteStore) BumpConnectionRefreshFailures(id string) (int, error) {
+	var newVal int
+	err := s.db.QueryRow(
+		`UPDATE connections SET refresh_failures = refresh_failures + 1,
+		                        updated_at = ?
+		 WHERE id = ?
+		 RETURNING refresh_failures`,
+		timeStr(time.Now().UTC()), id,
+	).Scan(&newVal)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("connection %q not found", id)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("bump refresh_failures: %w", err)
+	}
+	return newVal, nil
+}
+
+// GetConnectionRefreshFailures reads the current counter value.
+func (s *sqliteStore) GetConnectionRefreshFailures(id string) (int, error) {
+	var n int
+	err := s.db.QueryRow("SELECT refresh_failures FROM connections WHERE id = ?", id).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("connection %q not found", id)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("get refresh_failures: %w", err)
+	}
+	return n, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -632,18 +711,25 @@ func (s *sqliteStore) AllSettings() (map[string]string, error) {
 
 func (s *sqliteStore) RecordUsage(entry *UsageEntry) error {
 	now := timeStr(time.Now().UTC())
+	// Default CostSource to "apikey" so older call sites that haven't
+	// been updated yet (M3.3 wiring is in progress) get the right value.
+	costSource := entry.CostSource
+	if costSource == "" {
+		costSource = "apikey"
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO usage_log (id, request_id, provider, model, connection_id, api_key_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, cost, latency_ms, status, created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO usage_log (id, request_id, provider, model, connection_id, api_key_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, cost, latency_ms, status, created_at, cost_source)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		entry.ID, entry.RequestID, entry.Provider, entry.Model, entry.ConnectionID,
 		entry.APIKeyID, entry.InputTokens, entry.OutputTokens, entry.TotalTokens,
 		entry.CacheReadTokens, entry.CacheWriteTokens,
-		entry.Cost, entry.Latency.Milliseconds(), entry.Status, now,
+		entry.Cost, entry.Latency.Milliseconds(), entry.Status, now, costSource,
 	)
 	if err != nil {
 		return fmt.Errorf("record usage: %w", err)
 	}
 	entry.CreatedAt = parseTime(now)
+	entry.CostSource = costSource
 	return nil
 }
 
@@ -695,8 +781,72 @@ func (s *sqliteStore) UsageSummary(filter UsageFilter) (*UsageSummary, error) {
 		}
 		summary.ByProvider[prov] = ps
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
-	return &summary, rows.Err()
+	// Per-cost-source breakdown. SubscriptionSavings is computed at the
+	// server layer because pricing is config, not store.
+	qCS := "SELECT cost_source, COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost),0) FROM usage_log" + w.sql() + " GROUP BY cost_source"
+	csRows, err := s.db.Query(qCS, w.params...)
+	if err != nil {
+		return nil, fmt.Errorf("usage summary by cost_source: %w", err)
+	}
+	defer csRows.Close()
+	summary.ByCostSource = make(map[string]CostSourceSummary)
+	for csRows.Next() {
+		var src string
+		var cs CostSourceSummary
+		if err := csRows.Scan(&src, &cs.Requests, &cs.Tokens, &cs.Cost); err != nil {
+			return nil, err
+		}
+		summary.ByCostSource[src] = cs
+	}
+	return &summary, csRows.Err()
+}
+
+// SubscriptionUsageGroups aggregates subscription-served usage by
+// (provider, model) — the inputs the server's pricing module needs to
+// compute "would-have-been API cost" → subscription_savings.
+//
+// Returns one row per distinct (provider, model) pair that has at least
+// one cost_source='subscription' row within the filter window.
+func (s *sqliteStore) SubscriptionUsageGroups(filter UsageFilter) ([]SubscriptionUsageGroup, error) {
+	w := buildUsageFilter(filter)
+	// Add cost_source filter inline — buildUsageFilter doesn't expose it
+	// today and adding a separate field for one method seems overkill.
+	clause := w.sql()
+	if clause == "" {
+		clause = " WHERE cost_source = 'subscription'"
+	} else {
+		clause += " AND cost_source = 'subscription'"
+	}
+	// SELECT extended with cache token SUMs (M1.8b — RC2). The
+	// aggregation is the input to catalog.Registry.EstimateCost
+	// (called at routes_api.go:636 after the M1.9b rewire) — without
+	// these sums, cache pricing multiplies by zero.
+	q := `SELECT provider, model,
+		COALESCE(SUM(input_tokens),0),
+		COALESCE(SUM(output_tokens),0),
+		COALESCE(SUM(cache_read_tokens),0),
+		COALESCE(SUM(cache_write_tokens),0)
+		FROM usage_log` + clause + ` GROUP BY provider, model`
+	rows, err := s.db.Query(q, w.params...)
+	if err != nil {
+		return nil, fmt.Errorf("subscription usage groups: %w", err)
+	}
+	defer rows.Close()
+	var out []SubscriptionUsageGroup
+	for rows.Next() {
+		var g SubscriptionUsageGroup
+		if err := rows.Scan(&g.Provider, &g.Model,
+			&g.InputTokens, &g.OutputTokens,
+			&g.CacheReadTokens, &g.CacheWriteTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }
 
 func scanUsageEntry(row interface{ Scan(dest ...any) error }) (*UsageEntry, error) {
@@ -708,7 +858,7 @@ func scanUsageEntry(row interface{ Scan(dest ...any) error }) (*UsageEntry, erro
 		&e.ID, &e.RequestID, &e.Provider, &e.Model, &e.ConnectionID,
 		&e.APIKeyID, &e.InputTokens, &e.OutputTokens, &e.TotalTokens,
 		&e.CacheReadTokens, &e.CacheWriteTokens,
-		&e.Cost, &latencyMs, &e.Status, &createdAt,
+		&e.Cost, &latencyMs, &e.Status, &createdAt, &e.CostSource,
 	)
 	if err != nil {
 		return nil, err
@@ -716,6 +866,99 @@ func scanUsageEntry(row interface{ Scan(dest ...any) error }) (*UsageEntry, erro
 	e.Latency = time.Duration(latencyMs) * time.Millisecond
 	e.CreatedAt = parseTime(createdAt)
 	return &e, nil
+}
+
+// ---------------------------------------------------------------------------
+// Catalog-driven usage methods (Models Discovery M1.8)
+// ---------------------------------------------------------------------------
+
+// GetCacheHitRate computes the cached-read share of input-side tokens
+// for the given connection within the lookback window. Used by
+// smart-routing's `cheap` strategy (ADR-3 §Part E). The query uses
+// the existing idx_usage_log_connection_id + idx_usage_log_created_at
+// indexes (migration 002) for a single bounded scan.
+//
+// NULLIF prevents div-by-zero when the connection has zero input
+// tokens in the window. The COALESCE wraps the result so SUM-of-
+// nothing (no matching rows) returns 0 rather than NULL.
+func (s *sqliteStore) GetCacheHitRate(ctx context.Context, connectionID string, lookback time.Duration) (float64, error) {
+	// timeStr matches RecordUsage's storage format. The earlier
+	// "2006-01-02 15:04:05" space-separated format never matched
+	// stored ISO-T values — see self-learning
+	// 82fa8ebabdbe4ea49ad3cdff7978e421.
+	cutoff := timeStr(time.Now().UTC().Add(-lookback))
+	var ratio float64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(
+		    SUM(cache_read_tokens) * 1.0 /
+		    NULLIF(SUM(input_tokens + cache_read_tokens), 0),
+		    0)
+		FROM usage_log
+		WHERE connection_id = ? AND created_at >= ?
+	`, connectionID, cutoff).Scan(&ratio)
+	if err != nil {
+		return 0, fmt.Errorf("get cache hit rate: %w", err)
+	}
+	return ratio, nil
+}
+
+// ListUsageInRange returns usage_log rows in the (from, to) date
+// range. costSource == "" matches all sources; otherwise the SQL
+// filter is `cost_source = ?`. Used by the M3 recompute admin
+// endpoint to re-apply pricing to apikey rows only.
+//
+// Rows are ordered by created_at ASC so callers see chronological
+// order; this is convenient for streamed-style processing of large
+// date ranges.
+func (s *sqliteStore) ListUsageInRange(ctx context.Context, from, to time.Time, costSource string) ([]UsageEntry, error) {
+	q := `SELECT id, request_id, provider, model, connection_id, api_key_id,
+		input_tokens, output_tokens, total_tokens,
+		cache_read_tokens, cache_write_tokens,
+		cost, latency_ms, status, created_at, cost_source
+		FROM usage_log
+		WHERE created_at >= ? AND created_at < ?`
+	// Use timeStr — the SAME format RecordUsage writes — so SQLite's
+	// lexicographic TEXT comparison lines up. Mixed space/T separators
+	// silently produce zero matches across the day boundary (the bug
+	// captured in self-learning 82fa8ebabdbe4ea49ad3cdff7978e421).
+	args := []any{
+		timeStr(from),
+		timeStr(to),
+	}
+	if costSource != "" {
+		q += " AND cost_source = ?"
+		args = append(args, costSource)
+	}
+	q += " ORDER BY created_at ASC"
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list usage in range: %w", err)
+	}
+	defer rows.Close()
+
+	var out []UsageEntry
+	for rows.Next() {
+		e, err := scanUsageEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+// UpdateUsageCost overwrites the cost column on one row. No effect
+// when id doesn't match any row (idempotent no-op via WHERE clause).
+// Never modifies cost_source — the apikey/subscription distinction
+// is the M1 Subscription Auth contract and must survive recompute.
+func (s *sqliteStore) UpdateUsageCost(ctx context.Context, id string, cost float64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE usage_log SET cost = ? WHERE id = ?`, cost, id)
+	if err != nil {
+		return fmt.Errorf("update usage cost: %w", err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

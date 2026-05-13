@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -14,12 +15,14 @@ import (
 
 	"sage-router/internal/auth"
 	"sage-router/internal/auth/oauth"
+	"sage-router/internal/auth/refresh"
 	"sage-router/internal/bypass"
+	"sage-router/internal/catalog"
 	"sage-router/internal/config"
-	"sage-router/internal/routing"
 	"sage-router/internal/executor"
 	"sage-router/internal/provider"
 	"sage-router/internal/ratelimit"
+	"sage-router/internal/routing"
 	"sage-router/internal/server"
 	"sage-router/internal/store"
 	"sage-router/internal/translate"
@@ -33,6 +36,13 @@ import (
 var version = "dev"
 
 func main() {
+	// Dispatch subcommands before the global flag parse. `auth` and its
+	// children own their own flag sets — letting the global parser at
+	// them would steal --provider as `host`.
+	if len(os.Args) > 1 && os.Args[1] == "auth" {
+		os.Exit(runAuthCommand(os.Args[2:]))
+	}
+
 	// Parse flags
 	host := flag.String("host", config.DefaultHost, "Listen host")
 	port := flag.Int("port", config.DefaultPort, "Listen port")
@@ -71,6 +81,17 @@ func main() {
 
 	if err := db.Migrate(); err != nil {
 		slog.Error("failed to run migrations", "error", err)
+		os.Exit(1)
+	}
+
+	// Models Discovery M1.11 + M2 — wire the runtime catalog (Registry,
+	// raw Store for writes, and DiscoveryRunner). Seeds catalog tables
+	// from the static config constants on first boot; idempotent on
+	// subsequent boots. Also ensures settings.openrouter_refresh_enabled
+	// exists for M2's OpenRouter refresher to read.
+	catalogW, err := wireCatalog(context.Background(), db.DB())
+	if err != nil {
+		slog.Error("failed to wire catalog", "error", err)
 		os.Exit(1)
 	}
 
@@ -151,6 +172,11 @@ func main() {
 		setupToken = authMgr.GenerateSetupToken()
 	}
 
+	// AuthStore — wraps the DB with the auth package's narrow Credential
+	// interface. The OAuth handlers and the refresh loop both go through
+	// this so the same encryption and provider_data shape is used end-to-end.
+	authStore := auth.NewAuthStore(newAuthStoreAdapter(db))
+
 	// Create and start server
 	srv := server.New(server.Config{
 		Host:          *host,
@@ -160,6 +186,9 @@ func main() {
 		SetupToken:    setupToken,
 	}, server.Dependencies{
 		Store:             db,
+		Catalog:           catalogW.Registry,
+		CatalogStore:      catalogW.Store,
+		Discovery:         catalogW.Discovery,
 		TranslateRegistry: translateReg,
 		ProviderSelector:  providerSel,
 		ProviderRegistry:  providerReg,
@@ -167,12 +196,91 @@ func main() {
 		UsageTracker:      usageTracker,
 		Auth:              authMgr,
 		OpenAIAuth:        oauth.NewOpenAIAuth(),
+		AuthStore:         authStore,
 		SmartRouter:       routing.NewSmartRouter(),
 		ConversationStore: routing.NewConversationStore(),
 		BypassFilter:      bypass.NewFilter(),
 		HealthChecker:     provider.NewHealthChecker(providerSel, 60*time.Second),
 		RateLimiter:       ratelimit.New(),
 	})
+
+	// OAuthBridge — needs the server back-reference to create Connection
+	// rows on PKCE flow completion, so wired post-server-construction.
+	// Bridge binds the spec-fixed ports 1455 (openai) and 53692
+	// (anthropic); if either is already held by Codex/Claude Code, the
+	// bridge enters degraded mode for that provider but the rest of the
+	// server runs normally (AC44b).
+	bridge := srv.InitOAuthBridge()
+	bridgeCtx, cancelBridge := context.WithCancel(context.Background())
+	defer cancelBridge()
+	if err := bridge.Start(bridgeCtx); err != nil {
+		slog.Warn("oauth bridge start failed", "error", err)
+		// Don't abort — the rest of the server is still usable.
+	}
+	defer bridge.Stop(context.Background())
+
+	// Refresh loop — proactively refreshes subscription tokens that
+	// are nearing expiry and retries refreshes for connections sitting
+	// in AuthExpired. Runs for the lifetime of the process.
+	refreshLoop := refresh.NewLoop(authStore, refresh.Refresh, providerSel.SnapshotAll)
+	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
+	defer cancelRefresh()
+	go refreshLoop.Run(refreshCtx)
+
+	// Models Discovery M2.8 — OpenRouter pricing refresher. Opt-in via
+	// `settings.openrouter_refresh_enabled` (seeded `true` by
+	// wireCatalog/M1.11; user can flip to `false` to disable).
+	// Initial refresh after a 30s settle so the listener is up first;
+	// every 24h thereafter. Failures are logged + non-fatal — the
+	// catalog falls back to whatever rows already exist (seed +
+	// per-provider discovery).
+	if v, err := db.GetSetting("openrouter_refresh_enabled"); err == nil && v == "true" {
+		(&catalog.OpenRouterRefresher{
+			Store:    catalogW.Store,
+			Registry: catalogW.Registry,
+		}).Start(refreshCtx, 30*time.Second, 24*time.Hour)
+	}
+
+	// Models Discovery M2.5 — 24h background discovery ticker (AC15).
+	// Sweeps every provider with DiscoveryEnabled=true and no active
+	// backoff, calls the matching ModelLister via DiscoveryRunner.
+	// The credsLookup adapter walks store-side connections per
+	// provider, picks the lowest-ID non-disabled connection, and
+	// builds ListerCredentials from its API key / access token + the
+	// provider's static BaseURL. (M2.13 close — wiring previously
+	// missing per Gate 3 review CRITICAL-1.)
+	credsLookup := func(providerID string) (catalog.ListerCredentials, bool) {
+		conns, err := db.ListConnections(store.ConnectionFilter{Provider: providerID})
+		if err != nil || len(conns) == 0 {
+			return catalog.ListerCredentials{}, false
+		}
+		// Filter to non-disabled and pick the lowest-ID one for
+		// deterministic credential selection (mirrors the sample-
+		// connection pattern in buildSmartCandidates).
+		var picked *store.Connection
+		for i := range conns {
+			c := &conns[i]
+			if c.State == "disabled" {
+				continue
+			}
+			if picked == nil || c.ID < picked.ID {
+				picked = c
+			}
+		}
+		if picked == nil {
+			return catalog.ListerCredentials{}, false
+		}
+		provDef, ok := config.KnownProviders[providerID]
+		if !ok {
+			return catalog.ListerCredentials{}, false
+		}
+		return catalog.ListerCredentials{
+			BaseURL:     provDef.BaseURL,
+			APIKey:      picked.APIKey,
+			AccessToken: picked.AccessToken,
+		}, true
+	}
+	catalog.StartBackgroundRefresh(refreshCtx, catalogW.Discovery, credsLookup)
 
 	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("server error", "error", err)
@@ -198,6 +306,13 @@ func bootstrap(db store.Store) (masterSecret []byte, passwordHash string) {
 		}
 	}
 
+	// Persist master secret to ~/.sage-router/master.key (mode 0600) so
+	// the CLI's offline path (AC34) has a source independent of the DB.
+	// The file mirrors the DB setting — DB remains authoritative for the
+	// server. Failures here are non-fatal because the server itself can
+	// continue using the DB-stored value.
+	persistMasterKeyFile(masterSecret)
+
 	// 2. Load password hash (may be empty on first run — setup happens via dashboard)
 	passwordHash, _ = db.GetSetting("password_hash")
 
@@ -214,4 +329,41 @@ func deriveSubkey(master []byte, domain string) []byte {
 	h.Write(master)
 	h.Write([]byte(domain))
 	return h.Sum(nil)
+}
+
+// persistMasterKeyFile writes the 32-byte master secret to
+// ~/.sage-router/master.key (mode 0600) so the CLI can resolve it
+// offline. The file content is the raw 32 bytes — base64 form is
+// recognised at read time but not written, to keep the file small and
+// to match the env-var convention (SAGE_MASTER_SECRET accepts base64
+// because env vars must be text). Failures are logged, not fatal.
+func persistMasterKeyFile(masterSecret []byte) {
+	path := filepath.Join(config.DefaultDataDir(), "master.key")
+	if existing, err := os.ReadFile(path); err == nil {
+		// Already present — overwrite only if mismatched, otherwise
+		// leave the file's mtime alone for human auditability.
+		if len(existing) == 32 || len(existing) == 44 /* base64 */ {
+			decoded, _ := base64.StdEncoding.DecodeString(string(existing))
+			if len(existing) == 32 && bytesEqual(existing, masterSecret) {
+				return
+			}
+			if len(decoded) == 32 && bytesEqual(decoded, masterSecret) {
+				return
+			}
+		}
+	}
+	if err := os.WriteFile(path, masterSecret, 0600); err != nil {
+		slog.Warn("could not persist master.key for CLI", "path", path, "error", err)
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := range a {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }

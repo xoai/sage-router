@@ -56,6 +56,58 @@ func TestRoute_StrategyCheap(t *testing.T) {
 	}
 }
 
+// AC24 / Task 3.4: subscription-served candidates win the cheap strategy
+// regardless of catalog price. A $3.00 model with a subscription
+// connection ranks above a $0.02 model that's apikey-only.
+func TestRoute_StrategyCheap_SubscriptionPreferred(t *testing.T) {
+	r := NewSmartRouter()
+
+	// Same candidate list as testCandidates, but flag the $3.00 anthropic
+	// model as subscription-served.
+	withSub := []ModelCandidate{
+		{Provider: "anthropic", Model: "claude-sonnet-4-6", Tier: 1, InputPrice: 3.00, HasSubscriptionConnection: true},
+		{Provider: "openai", Model: "gpt-4o-mini", Tier: 2, InputPrice: 0.15},
+		{Provider: "gemini", Model: "gemini-2.5-flash-lite", Tier: 3, InputPrice: 0.02},
+	}
+	result := r.Route(StrategyCheap, "", withSub)
+	if len(result) != 3 {
+		t.Fatalf("got %d, want 3", len(result))
+	}
+	if result[0].Model != "claude-sonnet-4-6" {
+		t.Errorf("subscription-served candidate should be first; got %q (price $%.2f)",
+			result[0].Model, result[0].InputPrice)
+	}
+}
+
+func TestRoute_StrategyCheap_AllSubscriptionFallsBackToPrice(t *testing.T) {
+	// When ALL candidates are subscription-served, the tiebreaker reverts
+	// to per-model catalog price (cheapest still wins).
+	r := NewSmartRouter()
+	allSub := []ModelCandidate{
+		{Provider: "anthropic", Model: "claude-opus-4", InputPrice: 15.00, HasSubscriptionConnection: true},
+		{Provider: "anthropic", Model: "claude-haiku-4", InputPrice: 1.00, HasSubscriptionConnection: true},
+	}
+	result := r.Route(StrategyCheap, "", allSub)
+	if result[0].Model != "claude-haiku-4" {
+		t.Errorf("with all-subscription, cheapest catalog price should win; got %q", result[0].Model)
+	}
+}
+
+func TestRoute_StrategyBest_IgnoresSubscriptionFlag(t *testing.T) {
+	// The HasSubscriptionConnection field only affects StrategyCheap;
+	// other strategies sort by tier/price as before.
+	r := NewSmartRouter()
+	candidates := []ModelCandidate{
+		{Provider: "openai", Model: "gpt-4o-mini", Tier: 2, InputPrice: 0.15, HasSubscriptionConnection: true},
+		{Provider: "openai", Model: "gpt-5", Tier: 1, InputPrice: 5.00, HasSubscriptionConnection: false},
+	}
+	result := r.Route(StrategyBest, "", candidates)
+	// Best should pick the higher-tier (lower Tier number) model.
+	if result[0].Model != "gpt-5" {
+		t.Errorf("StrategyBest should ignore subscription flag; got %q", result[0].Model)
+	}
+}
+
 func TestRoute_StrategyBest(t *testing.T) {
 	r := NewSmartRouter()
 	result := r.Route(StrategyBest, "", testCandidates)
@@ -147,6 +199,108 @@ func TestModelFamily(t *testing.T) {
 		got := sameModelFamily(tt.a, tt.b)
 		if got != tt.expect {
 			t.Errorf("sameModelFamily(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.expect)
+		}
+	}
+}
+
+// Models Discovery M3.3 — cache-aware cheap strategy (AC26 + AC26b).
+//
+// StrategyCheap now sorts by `effectivePrice` instead of InputPrice:
+//   effectivePrice = Input * (1 - CachedRatio) + CacheRead * CachedRatio
+//
+// CachedRatio ∈ [0, 1] is the per-connection cache-hit-rate over the
+// 24h lookback window (see Store.GetCacheHitRate, populated by
+// buildSmartCandidates in M3.4b). When CachedRatio=0 the formula
+// degenerates to Input, matching today's pure-InputPrice ranking
+// byte-for-byte. AC26b pins that behaviour.
+
+// TestSmartRoute_Cheap_UsesEffectivePrice — AC26. Two candidates
+// chosen so the ranking flips with CachedRatio:
+//
+//   A: Input=10.0, CacheRead=0.0   (expensive input, free cache reads)
+//   B: Input=3.0,  CacheRead=3.0   (cheap input, no cache discount)
+//
+// At CachedRatio=0.8 (heavy cache use):
+//   A's effective = 10.0*0.2 + 0.0*0.8 = 2.0
+//   B's effective = 3.0*0.2  + 3.0*0.8 = 3.0
+//   → A wins.
+//
+// At CachedRatio=0.0 (no cache benefit):
+//   A's effective = 10.0
+//   B's effective = 3.0
+//   → B wins.
+//
+// The flip is the AC26 contract — sort order must change with cache
+// ratio when cache pricing varies between candidates.
+func TestSmartRoute_Cheap_UsesEffectivePrice(t *testing.T) {
+	r := NewSmartRouter()
+
+	heavyCacheCandidates := []ModelCandidate{
+		// A: expensive input, free cache reads — wins under heavy cache use.
+		{Provider: "p1", Model: "high-input-free-cache",
+			Tier: 1, InputPrice: 10.0, CacheReadPrice: 0.0, CachedRatio: 0.8},
+		// B: cheap input, no cache discount — loses under heavy cache use.
+		{Provider: "p2", Model: "flat-price",
+			Tier: 1, InputPrice: 3.0, CacheReadPrice: 3.0, CachedRatio: 0.8},
+	}
+	result := r.Route(StrategyCheap, "", heavyCacheCandidates)
+	if len(result) != 2 {
+		t.Fatalf("got %d, want 2", len(result))
+	}
+	if result[0].Model != "high-input-free-cache" {
+		t.Errorf("under CachedRatio=0.8, free-cache-read candidate should rank first; got %q (effectivePrice=A:2.0 B:3.0)",
+			result[0].Model)
+	}
+
+	// Same candidates, but with CachedRatio=0 — cache benefit disappears,
+	// pure-InputPrice ranking should restore. Now B (cheaper input) wins.
+	noCacheCandidates := []ModelCandidate{
+		{Provider: "p1", Model: "high-input-free-cache",
+			Tier: 1, InputPrice: 10.0, CacheReadPrice: 0.0, CachedRatio: 0.0},
+		{Provider: "p2", Model: "flat-price",
+			Tier: 1, InputPrice: 3.0, CacheReadPrice: 3.0, CachedRatio: 0.0},
+	}
+	result = r.Route(StrategyCheap, "", noCacheCandidates)
+	if result[0].Model != "flat-price" {
+		t.Errorf("under CachedRatio=0, cheaper-input candidate should rank first; got %q (effectivePrice=A:10.0 B:3.0)",
+			result[0].Model)
+	}
+}
+
+// TestSmartRoute_Cheap_CachedRatioZero_MatchesTodaysBehavior — AC26b.
+// With all CachedRatio=0 (the default for connections without enough
+// usage history yet, or for tests that pre-date M3.4b's enrichment),
+// the cheap ranking must be byte-equal to the pre-M3.3 pure-InputPrice
+// sort. This locks the no-regression contract: existing routing tests
+// continue to pass without modification.
+func TestSmartRoute_Cheap_CachedRatioZero_MatchesTodaysBehavior(t *testing.T) {
+	r := NewSmartRouter()
+	// testCandidates (package-level) has CachedRatio=0 by default —
+	// route them through StrategyCheap and assert the order matches
+	// the pre-M3.3 InputPrice ascending sort.
+	result := r.Route(StrategyCheap, "", testCandidates)
+
+	// Expected order: gemini-2.5-flash-lite ($0.02), gpt-4.1-nano
+	// ($0.05), gpt-4o-mini and gemini-2.5-flash (tied at $0.15;
+	// stable sort preserves input order so gpt-4o-mini first per
+	// testCandidates declaration), claude-haiku ($1.00),
+	// gpt-4o ($2.50), claude-sonnet-4-6 ($3.00).
+	expected := []string{
+		"gemini-2.5-flash-lite",
+		"gpt-4.1-nano",
+		"gpt-4o-mini",
+		"gemini-2.5-flash",
+		"claude-haiku-4-5-20251001",
+		"gpt-4o",
+		"claude-sonnet-4-6",
+	}
+	if len(result) != len(expected) {
+		t.Fatalf("len = %d, want %d", len(result), len(expected))
+	}
+	for i, m := range expected {
+		if result[i].Model != m {
+			t.Errorf("position %d: got %q, want %q (AC26b: CachedRatio=0 ranking must match pre-M3.3)",
+				i, result[i].Model, m)
 		}
 	}
 }

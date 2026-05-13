@@ -1,8 +1,10 @@
 import { signal } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
-import { getUsage, getKeys } from '../api/client';
+import { getUsage, getUsageSummary, getKeys } from '../api/client';
+import { CostSummary } from '../components/cost-summary';
 
 const usageData = signal([]);
+const usageSummary = signal(null);
 const allKeys = signal([]);
 const selectedKeyFilter = signal('');
 
@@ -75,6 +77,11 @@ function loadUsage() {
       }));
     }
   }).catch(() => {});
+  // Summary is computed server-side from usage_log (includes
+  // subscription_savings via current pricing × historical tokens).
+  // We don't pass api_key_id here because the cost summary is a
+  // whole-system view (matches the rollup tooltip wording).
+  getUsageSummary().then(s => { usageSummary.value = s; }).catch(() => {});
 }
 
 export function UsagePage() {
@@ -154,10 +161,7 @@ export function UsagePage() {
         border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)',
         flexWrap: 'wrap',
       }}>
-        <div>
-          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Total Cost</div>
-          <div style={{ fontSize: 20, fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--accent)' }}>${totalCost.toFixed(4)}</div>
-        </div>
+        <CostSummary summary={usageSummary.value} />
         <div>
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Input Tokens</div>
           <div style={{ fontSize: 20, fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{formatTokens(totalInput)}</div>

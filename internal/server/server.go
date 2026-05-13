@@ -16,6 +16,7 @@ import (
 	"sage-router/internal/auth"
 	"sage-router/internal/auth/oauth"
 	"sage-router/internal/bypass"
+	"sage-router/internal/catalog"
 	"sage-router/internal/executor"
 	"sage-router/internal/provider"
 	"sage-router/internal/ratelimit"
@@ -41,13 +42,18 @@ type Config struct {
 // Dependencies holds all injected dependencies.
 type Dependencies struct {
 	Store              store.Store
+	Catalog            catalog.Registry         // runtime model + pricing catalog (Models Discovery M1)
+	CatalogStore       catalog.Store            // raw catalog Store, for SetProviderMeta + on-create discovery (Models Discovery M2)
+	Discovery          *catalog.DiscoveryRunner // model-discovery dispatcher (Models Discovery M2)
 	TranslateRegistry  *translate.Registry
 	ProviderSelector   *provider.Selector
 	ProviderRegistry   *provider.Registry
 	Executors          map[string]executor.Executor
 	UsageTracker       *usage.Tracker
 	Auth               *auth.Manager
-	OpenAIAuth         *oauth.OpenAIAuth
+	OpenAIAuth         *oauth.OpenAIAuth // legacy device-code; returns 410 after M2 deprecation
+	OAuthBridge        *oauth.Bridge     // new PKCE bridge for OpenAI + Anthropic subscription auth
+	AuthStore          *auth.AuthStore   // wraps store.Store with subscription-auth Get/Put + refresh-failure counter
 	SmartRouter        *routing.SmartRouter
 	ConversationStore  *routing.ConversationStore
 	BypassFilter       *bypass.Filter
@@ -74,6 +80,35 @@ func New(cfg Config, deps Dependencies) *Server {
 	return s
 }
 
+// InitOAuthBridge wires the subscription-auth bridge. The bridge holds a
+// handler that calls back into the server to create Connection rows on a
+// successful PKCE flow, so it can only be built once the server itself
+// exists. Idempotent: returns the same bridge if called twice.
+//
+// Production main.go should call this after server.New, then call
+// bridge.Start(ctx) to bind the ports and bridge.Stop(ctx) on shutdown.
+func (s *Server) InitOAuthBridge() *oauth.Bridge {
+	if s.deps.OAuthBridge != nil {
+		return s.deps.OAuthBridge
+	}
+	s.deps.OAuthBridge = oauth.NewBridge(&oauthBridgeHandler{srv: s})
+	return s.deps.OAuthBridge
+}
+
+// AuthStoreFromDeps returns the wired auth store, primarily for callers
+// (like main.go) that need to attach the refresh loop to the same store
+// the server uses for OAuth handlers. Returns nil if no AuthStore is
+// configured.
+func (s *Server) AuthStoreFromDeps() *auth.AuthStore {
+	return s.deps.AuthStore
+}
+
+// SelectorFromDeps returns the provider selector — exposed for the
+// refresh loop's connection snapshot.
+func (s *Server) SelectorFromDeps() *provider.Selector {
+	return s.deps.ProviderSelector
+}
+
 func (s *Server) setupRoutes() {
 	// v1 API routes (OpenAI-compatible)
 	s.mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
@@ -89,11 +124,21 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("POST /api/auth/setup", s.handleSetup)
 
 	// Dashboard management API — protected routes
+	// PublicPaths is exact-match — see middleware.go for the rationale.
+	// A prefix like "/api/auth/" would silently expose every endpoint
+	// under it (subscription OAuth start, import, TOS accept) as
+	// unauthenticated.
 	guard := &AuthGuardMiddleware{
 		ValidateToken: func(token string) (bool, error) {
 			return s.deps.Auth.ValidateToken(token)
 		},
-		PublicPaths: []string{"/api/auth/"},
+		PublicPaths: []string{
+			"/api/auth/login",
+			"/api/auth/logout",
+			"/api/auth/check",
+			"/api/auth/token-login",
+			"/api/auth/setup",
+		},
 	}
 	protect := func(h http.HandlerFunc) http.Handler {
 		return guard.Middleware(h)
@@ -128,15 +173,38 @@ func (s *Server) setupRoutes() {
 	s.mux.Handle("GET /api/providers", protect(s.handleListProviders))
 	s.mux.Handle("GET /api/models", protect(s.handleListModelCatalog))
 
+	// Models Discovery M2.10 — new /api/catalog/* endpoints. The
+	// {model_id...} catch-all matches qualified IDs that include a
+	// slash (e.g., openrouter's "anthropic/claude-sonnet-4").
+	s.mux.Handle("GET /api/catalog/models", protect(s.handleGetCatalogModels))
+	s.mux.Handle("GET /api/catalog/models/{provider}", protect(s.handleGetCatalogModels))
+	s.mux.Handle("PUT /api/catalog/pricing/{provider}/{model_id...}", protect(s.handlePutCatalogPricing))
+	s.mux.Handle("DELETE /api/catalog/pricing/{provider}/{model_id...}", protect(s.handleDeleteCatalogPricing))
+	s.mux.Handle("GET /api/catalog/providers", protect(s.handleGetCatalogProviders))
+
+	// Models Discovery M3.1 — recompute admin endpoint (AC23 + AC24).
+	s.mux.Handle("POST /api/catalog/recompute", protect(s.handleRecompute))
+
 	s.mux.Handle("GET /api/routing/summary", protect(s.handleGetRoutingSummary))
 	s.mux.Handle("GET /api/routing/log", protect(s.handleGetRoutingLog))
 
 	s.mux.Handle("GET /api/status", protect(s.handleStatus))
 	s.mux.Handle("GET /api/detect/claude", protect(s.handleDetectClaude))
 
-	// OpenAI OAuth device code flow
+	// Legacy OpenAI OAuth device-code flow — deprecated in M2.8 (returns
+	// 410 Gone with a pointer at the replacement). Final removal in M3.7
+	// once the audit confirms no in-flight clients are still polling.
 	s.mux.Handle("POST /api/oauth/openai/device", protect(s.handleOpenAIDeviceStart))
 	s.mux.Handle("POST /api/oauth/openai/poll", protect(s.handleOpenAIDevicePoll))
+
+	// New PKCE subscription-auth flow + import + TOS gate.
+	s.mux.Handle("POST /api/auth/oauth/start", protect(s.handleOAuthStart))
+	s.mux.Handle("POST /api/auth/oauth/cli-handoff", protect(s.handleOAuthCLIHandoff))
+	s.mux.Handle("GET /api/auth/oauth/status", protect(s.handleOAuthStatus))
+	s.mux.Handle("GET /api/auth/oauth/health", protect(s.handleOAuthHealth))
+	s.mux.Handle("POST /api/auth/oauth/health/rebind", protect(s.handleOAuthRebind))
+	s.mux.Handle("POST /api/auth/import", protect(s.handleImport))
+	s.mux.Handle("POST /api/auth/tos/accept", protect(s.handleTOSAccept))
 
 	// Dashboard SPA — serve static files with fallback to index.html
 	if s.config.DashboardFS != nil {

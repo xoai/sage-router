@@ -25,6 +25,25 @@ type ModelCandidate struct {
 	SupportsImages   bool
 	SupportsTools    bool
 	SupportsThinking bool
+
+	// HasSubscriptionConnection is true when at least one connection
+	// servicing this (Provider, Model) pair has AuthType="subscription"
+	// AND the subscription tier permits this model. Populated by the
+	// caller (server.buildSmartCandidates) at route time so the router
+	// doesn't depend on the connection layer.
+	//
+	// Used by StrategyCheap to rank zero-marginal-cost candidates first.
+	// Other strategies ignore this field.
+	HasSubscriptionConnection bool
+
+	// CacheReadPrice (USD/1M tokens) and CachedRatio (0..1) are
+	// additive fields added in M1 of Models Discovery. M1 itself
+	// leaves them at zero — the cheap-strategy rewrite that consumes
+	// them lands in M3.3 (effectivePrice = Input*(1-r) + CacheRead*r).
+	// Zero values produce identical sort keys to today's pure-Input
+	// sort, so existing routing tests pass unchanged (AC10).
+	CacheReadPrice float64
+	CachedRatio    float64
 }
 
 // SmartRouter selects models based on strategy and session affinity.
@@ -139,6 +158,43 @@ func modelFamily(model string) string {
 	}
 }
 
+// effectivePrice (Models Discovery M3.3) returns the cache-aware
+// per-1M-token cost for the cheap strategy:
+//
+//	effectivePrice = Input * (1 - CachedRatio) + CacheRead * CachedRatio
+//
+// CachedRatio is the per-connection 24h cache-hit-rate computed at
+// route time by `server.buildSmartCandidates` from
+// `Store.GetCacheHitRate`. Values outside [0, 1] are clamped — the
+// downstream sort would still terminate, but a negative ratio could
+// invert the cheap ordering relative to "lower wins", and a > 1 ratio
+// could produce nonsense like a CacheRead-dominated sort that ignores
+// non-cached tokens. NaN is also clamped to 0 (NaN-self-inequality
+// guard — `r != r` is true only for NaN). Clamping is defensive
+// against future enrichment bugs (e.g., a NULL-coalesce returning 1.5
+// or a divide-by-zero leaking NaN).
+//
+// When CachedRatio=0 (the default for connections with no cache
+// history yet, or for strategies that don't populate it), the formula
+// degenerates to InputPrice — locking AC26b's no-regression contract.
+//
+// Ties on effectivePrice fall back to `sort.SliceStable`'s preserved
+// declaration order (which itself comes from the caller's iteration —
+// for the smart router, that's `buildSmartCandidates`'s deterministic
+// connection sort in M3.4a).
+func effectivePrice(c ModelCandidate) float64 {
+	r := c.CachedRatio
+	switch {
+	case r != r: // NaN
+		r = 0
+	case r < 0:
+		r = 0
+	case r > 1:
+		r = 1
+	}
+	return c.InputPrice*(1-r) + c.CacheReadPrice*r
+}
+
 // sortByStrategy returns a sorted copy of candidates by the given strategy.
 func sortByStrategy(strategy Strategy, candidates []ModelCandidate) []ModelCandidate {
 	result := make([]ModelCandidate, len(candidates))
@@ -155,7 +211,21 @@ func sortByStrategy(strategy Strategy, candidates []ModelCandidate) []ModelCandi
 			}
 			return a.InputPrice < b.InputPrice
 		case StrategyCheap:
-			return a.InputPrice < b.InputPrice
+			// Subscription-served models cost the user $0 at the margin,
+			// so they win over any priced model regardless of catalog price.
+			// Among same-subscription-status models, fall through to
+			// per-model price.
+			if a.HasSubscriptionConnection != b.HasSubscriptionConnection {
+				return a.HasSubscriptionConnection // true sorts before false
+			}
+			// Models Discovery M3.3 (AC26): cache-aware effective price.
+			// effectivePrice = Input*(1-CachedRatio) + CacheRead*CachedRatio.
+			// When the per-connection 24h cache-hit-rate is high, models
+			// with cheap cache_read pricing win even if their InputPrice
+			// is nominally higher. When CachedRatio=0 (no cache history
+			// or cache disabled), the formula degenerates to InputPrice,
+			// preserving the pre-M3.3 ranking byte-for-byte (AC26b).
+			return effectivePrice(a) < effectivePrice(b)
 		case StrategyBest:
 			if a.Tier != b.Tier {
 				return a.Tier < b.Tier // lower tier = better

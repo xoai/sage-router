@@ -1,0 +1,121 @@
+[
+  {
+    "display_name": "Claude Haiku 4.5",
+    "id": "anthropic/claude-haiku-4-5-20251001",
+    "input_price": 1,
+    "output_price": 5,
+    "provider": "anthropic"
+  },
+  {
+    "display_name": "Claude Opus 4",
+    "id": "anthropic/claude-opus-4-20250514",
+    "input_price": 15,
+    "output_price": 75,
+    "provider": "anthropic"
+  },
+  {
+    "display_name": "Claude Opus 4.6",
+    "id": "anthropic/claude-opus-4-6",
+    "input_price": 5,
+    "output_price": 25,
+    "provider": "anthropic"
+  },
+  {
+    "display_name": "Claude Sonnet 4",
+    "id": "anthropic/claude-sonnet-4-20250514",
+    "input_price": 3,
+    "output_price": 15,
+    "provider": "anthropic"
+  },
+  {
+    "display_name": "Claude Sonnet 4.6",
+    "id": "anthropic/claude-sonnet-4-6",
+    "input_price": 3,
+    "output_price": 15,
+    "provider": "anthropic"
+  },
+  {
+    "display_name": "Gemini 2.0 Flash",
+    "id": "gemini/gemini-2.0-flash",
+    "input_price": 0.1,
+    "output_price": 0.4,
+    "provider": "gemini"
+  },
+  {
+    "display_name": "Gemini 2.5 Flash",
+    "id": "gemini/gemini-2.5-flash",
+    "input_price": 0.15,
+    "output_price": 0.6,
+    "provider": "gemini"
+  },
+  {
+    "display_name": "Gemini 2.5 Flash-Lite",
+    "id": "gemini/gemini-2.5-flash-lite",
+    "input_price": 0.02,
+    "output_price": 0.1,
+    "provider": "gemini"
+  },
+  {
+    "display_name": "Gemini 2.5 Pro",
+    "id": "gemini/gemini-2.5-pro",
+    "input_price": 1.25,
+    "output_price": 10,
+    "provider": "gemini"
+  },
+  {
+    "display_name": "GPT-4.1",
+    "id": "openai/gpt-4.1",
+    "input_price": 2,
+    "output_price": 8,
+    "provider": "openai"
+  },
+  {
+    "display_name": "GPT-4.1 Mini",
+    "id": "openai/gpt-4.1-mini",
+    "input_price": 0.2,
+    "output_price": 0.8,
+    "provider": "openai"
+  },
+  {
+    "display_name": "GPT-4.1 Nano",
+    "id": "openai/gpt-4.1-nano",
+    "input_price": 0.05,
+    "output_price": 0.2,
+    "provider": "openai"
+  },
+  {
+    "display_name": "GPT-4o",
+    "id": "openai/gpt-4o",
+    "input_price": 2.5,
+    "output_price": 10,
+    "provider": "openai"
+  },
+  {
+    "display_name": "GPT-4o Mini",
+    "id": "openai/gpt-4o-mini",
+    "input_price": 0.15,
+    "output_price": 0.6,
+    "provider": "openai"
+  },
+  {
+    "display_name": "o3",
+    "id": "openai/o3",
+    "input_price": 2,
+    "output_price": 8,
+    "provider": "openai"
+  },
+  {
+    "display_name": "o3 Mini",
+    "id": "openai/o3-mini",
+    "input_price": 0.55,
+    "output_price": 2.2,
+    "provider": "openai"
+  },
+  {
+    "display_name": "o4 Mini",
+    "id": "openai/o4-mini",
+    "input_price": 1.1,
+    "output_price": 4.4,
+    "provider": "openai"
+  }
+]

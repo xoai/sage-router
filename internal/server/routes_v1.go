@@ -9,11 +9,16 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
+	"sage-router/internal/auth"
 	"sage-router/internal/auth/detect"
+	"sage-router/internal/auth/providers"
 	"sage-router/internal/bypass"
+	"sage-router/internal/catalog"
 	"sage-router/internal/config"
 	"sage-router/internal/cost"
 	"sage-router/internal/executor"
@@ -117,7 +122,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve provider and model
-	providerID, resolvedModel, isCombo, comboModels := s.resolveModel(model, body)
+	providerID, resolvedModel, isCombo, comboModels := s.resolveModel(r.Context(), model, body)
 
 	// ACL check — enforce allowed models (§34)
 	if authenticatedKey != nil && authenticatedKey.AllowedModels != "*" {
@@ -234,8 +239,16 @@ func (s *Server) executeRequestWithCtx(
 		canonReq.Model = model
 	}
 
-	// Stage ⑤b: Inject cache hints (cost optimization)
-	if canonReq != nil && cost.InjectCacheHints(canonReq, providerID) {
+	// Stage ⑤b: Inject cache hints (cost optimization). Pass the chosen
+	// connection's AuthType so Gemini-subscription's caching-bypass issue
+	// (spec §M3.2) doesn't accidentally apply once Gemini caching ships.
+	authTypeForCache := ""
+	if conn != nil {
+		if c := s.deps.ProviderSelector.ConnectionByID(conn.ID); c != nil {
+			authTypeForCache = c.AuthType
+		}
+	}
+	if canonReq != nil && cost.InjectCacheHints(canonReq, providerID, authTypeForCache) {
 		// Re-serialize with cache hints applied
 		if tgt, ok := s.deps.TranslateRegistry.Get(targetFormat); ok {
 			if rewritten, err := tgt.FromCanonical(canonReq, translate.TranslateOpts{
@@ -302,7 +315,7 @@ func (s *Server) executeRequestWithCtx(
 	})
 	if err != nil {
 		slog.Error("upstream error", "provider", providerID, "error", err)
-		s.markConnectionResult(conn.ID, model, 0, err)
+		s.markConnectionResult(conn.ID, model, 0, nil, err)
 		// Try fallback
 		if excludeIDs == nil {
 			excludeIDs = []string{}
@@ -324,8 +337,30 @@ func (s *Server) executeRequestWithCtx(
 		respBody, _ := io.ReadAll(result.Body)
 		statusCode := result.StatusCode
 
-		// Mark connection state based on error
-		s.markConnectionResult(conn.ID, model, statusCode, nil)
+		// Mark connection state based on error. Pass respBody so 401/403 can
+		// detect model-level rejections (vs. token-level rejections) and
+		// add the model to the per-connection denylist accordingly.
+		s.markConnectionResult(conn.ID, model, statusCode, respBody, nil)
+
+		// Models Discovery M2.7 — on-404 ad-hoc refresh (AC16).
+		// Upstream "model not found" usually means the catalog is stale:
+		// either a new model launched, or the upstream renamed/retired one.
+		// Fire-and-forget a discovery refresh so the next request — and the
+		// dashboard — see the up-to-date list. The helper's own gates
+		// (backoff + 5-min debounce) keep request-flood scenarios from
+		// hammering /v1/models.
+		//
+		// Detection is intentionally over-broad: any upstream 404 triggers
+		// the helper, not just true "model not found" responses. Other 404
+		// causes — Ollama-model-not-pulled, OpenRouter region restriction,
+		// malformed Gemini paths, LM Studio / vLLM path mismatches behind
+		// `default` — will also trigger a refresh that won't help. The
+		// debounce (5 min) caps wasted lister calls to one per provider per
+		// window. A future per-executor `IsModelNotFound(statusCode, body)`
+		// helper would narrow the trigger; deferred per the M2.7 manifest.
+		if statusCode == http.StatusNotFound && s.deps.Discovery != nil && s.deps.CatalogStore != nil {
+			go s.triggerOnNotFoundDiscovery(providerID, conn)
+		}
 
 		// Fallback on retryable errors
 		if executor.IsFallbackEligible(statusCode) {
@@ -361,7 +396,7 @@ func (s *Server) executeRequestWithCtx(
 	}
 
 	// Mark success after response is written
-	s.markConnectionResult(conn.ID, model, result.StatusCode, nil)
+	s.markConnectionResult(conn.ID, model, result.StatusCode, nil, nil)
 }
 
 func (s *Server) streamResponse(
@@ -584,7 +619,7 @@ func (s *Server) handleComboRequest(
 	apiKeyID string,
 ) {
 	for _, modelStr := range comboModels {
-		providerID, model, _, _ := s.resolveModel(modelStr, body)
+		providerID, model, _, _ := s.resolveModel(r.Context(), modelStr, body)
 		conn, _, err := s.selectConnection(providerID, model, nil)
 		if err != nil {
 			slog.Info("combo skip", "model", modelStr, "error", err)
@@ -679,10 +714,10 @@ type ConnectionInfo struct {
 	Endpoint    string
 }
 
-func (s *Server) resolveModel(model string, body []byte) (provider, resolvedModel string, isCombo bool, comboModels []string) {
+func (s *Server) resolveModel(ctx context.Context, model string, body []byte) (provider, resolvedModel string, isCombo bool, comboModels []string) {
 	// Check smart routing (auto[:strategy])
 	if strategy, isAuto := routing.ParseAutoModel(model); isAuto && s.deps.SmartRouter != nil {
-		candidates := s.buildSmartCandidates()
+		candidates := s.buildSmartCandidates(ctx, strategy)
 		if len(candidates) > 0 {
 			// Detect request constraints (Layer 2)
 			constraints := detectRequestConstraints(body)
@@ -745,34 +780,192 @@ func (s *Server) resolveModel(model string, body []byte) (provider, resolvedMode
 	return guessProvider(model), model, false, nil
 }
 
+// pickSampleConnByProvider (Models Discovery M3.4a, NM-r3-6 fix)
+// returns a map[provider]connection_id picking the lowest-ID active
+// connection per provider. Used by M3.4b to consult
+// `Store.GetCacheHitRate` with a STABLE sample per provider — without
+// a deterministic pick, the cheap-strategy `effectivePrice` ranking
+// would swing between requests as `ListConnections` ordering varies.
+//
+// Pure function (no Server receiver) so tests can exercise it
+// directly with a shuffled slice and assert order-independence.
+// Returns an empty (not nil) map for safe indexing.
+func pickSampleConnByProvider(connections []store.Connection) map[string]string {
+	out := map[string]string{}
+	for _, c := range connections {
+		if c.State == "disabled" {
+			continue
+		}
+		cur, have := out[c.Provider]
+		if !have || c.ID < cur {
+			out[c.Provider] = c.ID
+		}
+	}
+	return out
+}
+
 // buildSmartCandidates builds the list of available models from active connections.
-func (s *Server) buildSmartCandidates() []routing.ModelCandidate {
+//
+// For each candidate, HasSubscriptionConnection is true when the user has
+// at least one non-disabled subscription connection for the model's
+// provider AND that subscription tier permits the model. The smart
+// router's StrategyCheap branch uses this to prefer zero-marginal-cost
+// candidates over priced ones.
+//
+// Models Discovery M3.4a — connections are sorted by ID before the
+// pass that builds activeProviders + providersWithSubscription +
+// sampleConnByProvider. The sort is for deterministic sample-
+// connection selection (consumed by M3.4b's cache-hit-rate
+// enrichment); activeProviders / providersWithSubscription are
+// set-based so iteration order doesn't matter to them, but the sort
+// is cheap and makes the loop self-consistent for future readers.
+//
+// Models Discovery M3.4b — two enrichment passes added:
+//
+//  1. Capability override: when the provider's executor implements
+//     `executor.CapabilityOverrider`, the catalog's capability flags
+//     are passed through `OverrideCapabilities(modelID, base)` and
+//     the returned struct replaces the candidate's flags. Catches
+//     newer model variants whose seed row hasn't been updated yet.
+//
+//  2. Cache-hit-rate enrichment: under `StrategyCheap` and only for
+//     models with non-zero `CacheRead` pricing, the per-connection
+//     24h cache-hit-rate is queried via `Store.GetCacheHitRate` using
+//     the deterministic `sampleConnByProvider` pick. The result feeds
+//     `routing.effectivePrice` for cache-aware ranking (AC26). Other
+//     strategies skip the query (zero SQL hits on the hot path).
+//
+// `ctx` is propagated to the cache-hit-rate query so request
+// cancellation flows through. `strategy` is needed to gate the query.
+func (s *Server) buildSmartCandidates(ctx context.Context, strategy routing.Strategy) []routing.ModelCandidate {
 	connections, err := s.deps.Store.ListConnections(store.ConnectionFilter{})
 	if err != nil {
 		return nil
 	}
 
+	// Sort by ID for determinism (M3.4a). `ListConnections` returns
+	// rows ordered by `priority ASC, name ASC` per sqlite.go, but
+	// M3.4b's cache-hit-rate path needs a stable sample regardless
+	// of priority/name churn. Sorting here means pickSampleConnByProvider
+	// can scan in order; it could also use `c.ID < cur` independently
+	// (which it does), so the sort is belt-and-suspenders.
+	sort.Slice(connections, func(i, j int) bool {
+		return connections[i].ID < connections[j].ID
+	})
+
 	activeProviders := map[string]bool{}
+	providersWithSubscription := map[string]bool{}
 	for _, conn := range connections {
-		if conn.State != "disabled" {
-			activeProviders[conn.Provider] = true
+		if conn.State == "disabled" {
+			continue
+		}
+		activeProviders[conn.Provider] = true
+		if conn.AuthType == auth.AuthTypeSubscription {
+			providersWithSubscription[conn.Provider] = true
 		}
 	}
 
+	// M3.4b — sample connection per provider (lowest-ID active),
+	// used downstream by the cache-hit-rate query so the cheap
+	// ranking is stable across requests.
+	sampleConn := pickSampleConnByProvider(connections)
+
+	// M3.4b post-review fix — memo GetCacheHitRate results by
+	// connID across the catalog iteration. The query input
+	// (connID, lookback) is constant per provider, so without
+	// memoization N models × K providers issue N×K identical SQL
+	// hits per StrategyCheap request. With the memo, exactly one
+	// query per active provider fires regardless of catalog size.
+	// `ok` is tracked alongside the value so we don't re-query
+	// after a transient SQL error (we cache the zero result too).
+	type cacheRatioCache struct {
+		ratio  float64
+		cached bool
+	}
+	hitRateByConn := map[string]cacheRatioCache{}
+
+	// Iterate the runtime catalog (Models Discovery M1.9a — rewires
+	// the static model map read to catalog.Registry). The catalog
+	// Store guarantees ORDER BY provider, model_id ASC (AC11b), so
+	// iteration order is deterministic across runs — preserves the
+	// M1.9-baseline golden snapshot.
+	if s.deps.Catalog == nil {
+		// Defensive fallback for tests / partial wiring. Production
+		// bootstrap (M1.11) always wires Catalog.
+		return nil
+	}
 	var candidates []routing.ModelCandidate
-	for _, m := range config.ModelCatalog {
-		if activeProviders[m.Provider] {
-			candidates = append(candidates, routing.ModelCandidate{
-				Provider:         m.Provider,
-				Model:            m.ID,
-				Tier:             m.Tier,
-				InputPrice:       m.InputPrice,
-				ContextWindow:    m.ContextWindow,
-				SupportsImages:   m.SupportsImages,
-				SupportsTools:    m.SupportsTools,
-				SupportsThinking: m.SupportsThinking,
-			})
+	for _, m := range s.deps.Catalog.ListProvider("") {
+		if !activeProviders[m.Provider] {
+			continue
 		}
+		hasSub := providersWithSubscription[m.Provider] &&
+			providers.SubscriptionAllowed(m.Provider, m.ModelID)
+
+		// M3.4b — capability override. If the provider's executor
+		// implements `executor.CapabilityOverrider`, run the catalog
+		// flags through it; otherwise pass through unchanged. The
+		// type-assertion short-circuits when (a) no executor is
+		// registered for the provider, or (b) the executor doesn't
+		// implement the interface (current state for all executors
+		// until M3.5 wires implementations).
+		caps := executor.Capabilities{
+			SupportsImages:   m.Caps.SupportsImages,
+			SupportsTools:    m.Caps.SupportsTools,
+			SupportsThinking: m.Caps.SupportsThinking,
+		}
+		if exec, ok := s.deps.Executors[m.Provider]; ok {
+			if overrider, ok := exec.(executor.CapabilityOverrider); ok {
+				caps = overrider.OverrideCapabilities(m.ModelID, caps)
+			}
+		}
+
+		// M3.4b — cache-hit-rate enrichment. Two-way gate: only fire
+		// the SQL when (1) the strategy actually consumes the result
+		// (`effectivePrice` runs under StrategyCheap only) AND (2) the
+		// model has non-zero CacheRead pricing (otherwise the cache-
+		// aware blend collapses back to InputPrice — no value in the
+		// query). When either gate is closed, CachedRatio stays at 0
+		// — `effectivePrice` then degenerates to InputPrice and the
+		// pre-M3.3 ordering is preserved (AC26b).
+		//
+		// The query is memoized by connID so K providers × N models
+		// per provider produces at most K queries, not K×N (post-
+		// review fix).
+		cacheReadPrice := m.Pricing.CacheRead
+		var cachedRatio float64
+		if strategy == routing.StrategyCheap && cacheReadPrice > 0 {
+			if connID, ok := sampleConn[m.Provider]; ok && connID != "" {
+				entry, seen := hitRateByConn[connID]
+				if !seen {
+					// Errors are swallowed deliberately — a transient SQL
+					// failure shouldn't disqualify the model from routing.
+					// We cache the zero-result so we don't re-query for the
+					// same connID later in the same request.
+					if r, err := s.deps.Store.GetCacheHitRate(ctx, connID, 24*time.Hour); err == nil {
+						entry = cacheRatioCache{ratio: r, cached: true}
+					} else {
+						entry = cacheRatioCache{ratio: 0, cached: true}
+					}
+					hitRateByConn[connID] = entry
+				}
+				cachedRatio = entry.ratio
+			}
+		}
+
+		candidates = append(candidates, routing.ModelCandidate{
+			Provider:                  m.Provider,
+			Model:                     m.ModelID,
+			Tier:                      m.Tier,
+			InputPrice:                m.Pricing.Input,
+			ContextWindow:             m.ContextWindow,
+			SupportsImages:            caps.SupportsImages,
+			SupportsTools:             caps.SupportsTools,
+			SupportsThinking:          caps.SupportsThinking,
+			HasSubscriptionConnection: hasSub,
+			CacheReadPrice:            cacheReadPrice,
+			CachedRatio:               cachedRatio,
+		})
 	}
 	return candidates
 }
@@ -823,13 +1016,26 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 		APIKey:       storedConn.APIKey,
 	}
 
+	// For subscription connections, also pull through AuthStore so we
+	// pick up provider_data → AccountID → ExtraHeaders (specifically
+	// the ChatGPT-Account-ID header DefaultExecutor injects when
+	// serving requests via an OpenAI subscription). Non-fatal if the
+	// AuthStore isn't wired or the credential parse fails — the
+	// executor still has the access token and will work for everything
+	// that doesn't need extra headers.
+	if storedConn.AuthType == auth.AuthTypeSubscription && s.deps.AuthStore != nil {
+		if cred, err := s.deps.AuthStore.GetCredential(conn.ID); err == nil && cred != nil {
+			creds.ExtraHeaders = cred.ExtraHeaders()
+		}
+	}
+
 	// For auto_detect connections, resolve credentials from the filesystem at request time.
 	// The store doesn't hold the actual token — it's read fresh each time.
 	if storedConn.AuthType == "auto_detect" {
 		freshCreds := s.resolveAutoDetectCredentials(storedConn.Provider)
 		if freshCreds != nil {
 			creds.AccessToken = freshCreds.AccessToken
-			creds.AuthType = "oauth" // upstream executor expects oauth for bearer token auth
+			creds.AuthType = "subscription" // canonical AuthType after M3.7 drops legacy "oauth" support.
 		} else {
 			conn.MarkSuccess() // release back to idle
 			return nil, 0, fmt.Errorf("auto_detect credentials unavailable for %s", storedConn.Provider)
@@ -872,7 +1078,7 @@ func (s *Server) resolveAutoDetectCredentials(provider string) *executor.Credent
 			return nil
 		}
 		return &executor.Credentials{
-			AuthType:    "oauth",
+			AuthType:    "subscription", // canonical AuthType after M3.7 drops legacy "oauth" support.
 			AccessToken: creds.AccessToken,
 		}
 	default:
@@ -881,24 +1087,85 @@ func (s *Server) resolveAutoDetectCredentials(provider string) *executor.Credent
 }
 
 // markConnectionResult transitions the connection state based on the upstream outcome.
-func (s *Server) markConnectionResult(connID, model string, statusCode int, err error) {
+//
+// For 401/403, also invalidates the in-memory credential cache so the next
+// request triggers a refresh attempt rather than reusing a token the upstream
+// just rejected. The respBody is scanned for model-level rejection markers
+// (distinct from auth-token rejection) — when present, the model is added to
+// the connection's per-model denylist (1h TTL) so the selector skips it for
+// future requests on this connection.
+func (s *Server) markConnectionResult(connID, model string, statusCode int, respBody []byte, err error) {
 	conn := s.deps.ProviderSelector.ConnectionByID(connID)
 	if conn == nil {
 		return
 	}
 
+	// All Mark* methods return errors only when the state-machine transition
+	// is rejected (e.g., already in AuthExpired due to a concurrent failure).
+	// We log these at debug-as-warn level so operators can see stuck-state
+	// situations without inundating logs in the common case. Cred
+	// invalidation runs regardless: even if the state transition couldn't
+	// happen, the in-memory token is known-bad and dropping it is correct.
+	var terr error
 	switch {
 	case err != nil:
-		conn.MarkErrored(err)
+		terr = conn.MarkErrored(err)
 	case statusCode == 429:
-		conn.MarkRateLimited(model, conn.BackoffLevel()+1)
+		terr = conn.MarkRateLimited(model, conn.BackoffLevel()+1)
 	case statusCode == 401 || statusCode == 403:
-		conn.MarkAuthExpired()
+		// Differentiate "this token can't do this model" from "this
+		// token is dead". Model-tier rejections only denylist the
+		// model on this connection — the rest of the connection's
+		// model surface remains usable, no refresh needed. Auth
+		// failures still hit AuthExpired + credential invalidation.
+		if statusCode == 403 && model != "" && isModelRejection(respBody) {
+			conn.RecordModelRejection(model)
+			// Treat as a successful response from the connection's
+			// perspective — the upstream did answer, just declined
+			// this model. Keeps the connection's backoff/error state
+			// clean.
+			terr = conn.MarkSuccess()
+		} else {
+			terr = conn.MarkAuthExpired()
+			conn.InvalidateCredential()
+		}
 	case statusCode >= 500:
-		conn.MarkErrored(fmt.Errorf("upstream %d", statusCode))
+		terr = conn.MarkErrored(fmt.Errorf("upstream %d", statusCode))
 	default:
-		conn.MarkSuccess()
+		terr = conn.MarkSuccess()
 	}
+
+	if terr != nil {
+		slog.Warn("connection state transition rejected",
+			"conn_id", connID,
+			"model", model,
+			"status", statusCode,
+			"err", terr,
+		)
+	}
+}
+
+// modelRejectionPattern matches upstream error bodies indicating the model
+// is unavailable for the connection's auth context (e.g., a subscription
+// token that lacks access to a particular model tier). Distinct from a
+// generic auth rejection — those keep the model in the routing pool for
+// other connections. Compiled once at package init.
+var modelRejectionPattern = regexp.MustCompile(`(?i)model.{0,40}(not available|unsupported|unavailable|forbidden|access denied|not (?:supported|allowed)|invalid)`)
+
+// isModelRejection reports whether the upstream's response body suggests
+// the connection's auth context cannot serve this model (vs. a generic
+// auth failure that affects all models on the connection).
+func isModelRejection(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	// Truncate the regex search to a sane prefix — error bodies can be huge
+	// for streaming responses.
+	const maxScan = 4 * 1024
+	if len(body) > maxScan {
+		body = body[:maxScan]
+	}
+	return modelRejectionPattern.Match(body)
 }
 
 func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID string, u *canonical.Usage, startTime time.Time, status string) {
@@ -922,6 +1189,32 @@ func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID s
 		cacheWriteTokens = u.CacheCreationTokens
 	}
 
+	// Determine cost_source from the connection's AuthType. Subscription
+	// connections record cost=0 (user paid flat subscription); the
+	// dashboard computes "savings" against the would-have-been API cost.
+	//
+	// Models Discovery M1.9a — cost computed via catalog.Registry's
+	// EstimateCost instead of the static config helper. The
+	// TokenBreakdown carries cache columns so cache-aware pricing
+	// applies whenever the catalog row has non-zero
+	// CacheRead/CacheWrite (Anthropic Input*1.25 etc.).
+	costSource := "apikey"
+	var cost float64
+	if s.deps.Catalog != nil {
+		cost = s.deps.Catalog.EstimateCost(provider, model, catalog.TokenBreakdown{
+			Input:        inputTokens,
+			Output:       outputTokens,
+			CacheReadIn:  cacheReadTokens,
+			CacheWriteIn: cacheWriteTokens,
+		})
+	}
+	if conn := s.deps.ProviderSelector.ConnectionByID(connectionID); conn != nil {
+		if conn.AuthType == "subscription" {
+			costSource = "subscription"
+			cost = 0
+		}
+	}
+
 	entry := &usage.Entry{
 		RequestID:        requestID,
 		Provider:         provider,
@@ -933,7 +1226,8 @@ func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID s
 		TotalTokens:      totalTokens,
 		CacheReadTokens:  cacheReadTokens,
 		CacheWriteTokens: cacheWriteTokens,
-		Cost:             config.EstimateCost(provider, model, inputTokens, outputTokens),
+		Cost:             cost,
+		CostSource:       costSource,
 		Latency:          time.Since(startTime),
 		Status:           status,
 		CreatedAt:        time.Now(),

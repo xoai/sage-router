@@ -3,7 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +14,7 @@ import (
 
 	"sage-router/internal/auth"
 	"sage-router/internal/auth/detect"
+	"sage-router/internal/catalog"
 	"sage-router/internal/config"
 	"sage-router/internal/provider"
 	"sage-router/internal/store"
@@ -152,29 +156,64 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Redact sensitive fields
+	// Redact sensitive fields. Subscription connections additionally
+	// surface expires_at, account_id (parsed from provider_data),
+	// refresh_failures, and last_error so the dashboard can render the
+	// AC32 details (badge, expiry countdown, re-authenticate action).
+	// Access/refresh tokens and API keys are never echoed.
 	type safeConn struct {
-		ID        string    `json:"id"`
-		Provider  string    `json:"provider"`
-		Name      string    `json:"name"`
-		AuthType  string    `json:"auth_type"`
-		Priority  int       `json:"priority"`
-		State     string    `json:"state"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
+		ID              string     `json:"id"`
+		Provider        string     `json:"provider"`
+		Name            string     `json:"name"`
+		AuthType        string     `json:"auth_type"`
+		Priority        int        `json:"priority"`
+		State           string     `json:"state"`
+		ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+		AccountID       string     `json:"account_id,omitempty"`
+		RefreshFailures int        `json:"refresh_failures,omitempty"`
+		LastError       string     `json:"last_error,omitempty"`
+		CreatedAt       time.Time  `json:"created_at"`
+		UpdatedAt       time.Time  `json:"updated_at"`
 	}
-	var safe []safeConn
+	safe := make([]safeConn, 0, len(conns))
 	for _, c := range conns {
-		safe = append(safe, safeConn{
-			ID:        c.ID,
-			Provider:  c.Provider,
-			Name:      c.Name,
-			AuthType:  c.AuthType,
-			Priority:  c.Priority,
-			State:     c.State,
-			CreatedAt: c.CreatedAt,
-			UpdatedAt: c.UpdatedAt,
-		})
+		sc := safeConn{
+			ID:              c.ID,
+			Provider:        c.Provider,
+			Name:            c.Name,
+			AuthType:        c.AuthType,
+			Priority:        c.Priority,
+			State:           c.State,
+			ExpiresAt:       c.ExpiresAt,
+			RefreshFailures: c.RefreshFailures,
+			CreatedAt:       c.CreatedAt,
+			UpdatedAt:       c.UpdatedAt,
+		}
+		// account_id lives inside provider_data, populated by JWT
+		// extraction (OpenAI) or import parsers (Anthropic email,
+		// GitHub user). Fail-soft on parse: a row without account_id
+		// just renders without one.
+		if len(c.ProviderData) > 0 {
+			var pd struct {
+				AccountID string `json:"account_id"`
+			}
+			_ = json.Unmarshal(c.ProviderData, &pd)
+			sc.AccountID = pd.AccountID
+		}
+		// last_error comes from the in-memory provider.Connection — it
+		// rotates on every state transition, so the DB doesn't hold it.
+		// Only expose it when the connection is in a state where the
+		// user might need to act (errored / disabled / auth_expired);
+		// otherwise it's noise.
+		if pc := s.deps.ProviderSelector.ConnectionByID(c.ID); pc != nil {
+			if err := pc.LastError(); err != nil {
+				switch c.State {
+				case "errored", "disabled", "auth_expired":
+					sc.LastError = err.Error()
+				}
+			}
+		}
+		safe = append(safe, sc)
 	}
 	writeJSON(w, http.StatusOK, safe)
 }
@@ -209,7 +248,7 @@ func (s *Server) handleCreateConnection(w http.ResponseWriter, r *http.Request) 
 		}
 		conn.AccessToken = creds.AccessToken
 		conn.RefreshToken = creds.RefreshToken
-		conn.AuthType = "oauth" // store as oauth since we now have a real token
+		conn.AuthType = auth.AuthTypeSubscription // canonical: we now have a real OAuth token
 	}
 
 	if err := s.deps.Store.CreateConnection(&conn); err != nil {
@@ -221,7 +260,160 @@ func (s *Server) handleCreateConnection(w http.ResponseWriter, r *http.Request) 
 	provConn := provider.NewConnection(conn.ID, conn.Provider, conn.Name, conn.Priority, conn.AuthType)
 	s.deps.ProviderSelector.Register(provConn)
 
+	// Models Discovery M2.4 — fire-and-forget discovery for the new
+	// connection. Surfaces models to catalog_models within seconds of
+	// "add connection" so the dashboard's /api/catalog/models reflects
+	// reality without waiting for the 24h ticker.
+	//
+	// AC13: triggers for apikey connections on discovery_enabled providers.
+	// AC19: subscription-auth connections only trigger when the
+	// provider's subscription_discoverable=true (static M3 allowlist
+	// remains authoritative for providers that opt out).
+	if s.deps.Discovery != nil && s.deps.CatalogStore != nil {
+		go s.triggerOnCreateDiscovery(conn)
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{"id": conn.ID})
+}
+
+// triggerOnCreateDiscovery runs the model-discovery flow for a
+// newly-created connection. Called as a goroutine — never blocks the
+// HTTP response.
+//
+// Discovery is skipped when:
+//   - provider has discovery_enabled=false (e.g., github-copilot)
+//   - AuthType=subscription but subscription_discoverable=false
+//   - no lister is registered for the provider (returns gracefully)
+//   - the provider is unknown to KnownProviders (no BaseURL)
+//
+// Bypasses backoff per ADR-2 §"On-connection-create discovery
+// bypasses backoff once" — new credentials are reason enough to
+// retry. (Backoff-state checks against the freshly-written ProviderMeta
+// don't apply: the user took an explicit action.)
+func (s *Server) triggerOnCreateDiscovery(conn store.Connection) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	meta, err := s.deps.CatalogStore.GetProviderMeta(ctx, conn.Provider)
+	if err != nil {
+		slog.Warn("on-create discovery: read ProviderMeta failed",
+			"provider", conn.Provider, "err", err)
+		return
+	}
+	if meta == nil || !meta.DiscoveryEnabled {
+		return
+	}
+	if conn.AuthType == auth.AuthTypeSubscription && !meta.SubscriptionDiscoverable {
+		return
+	}
+
+	creds := buildListerCredentials(conn)
+	if creds.BaseURL == "" {
+		// Unknown provider — we have no idea where to send the request.
+		// Shouldn't happen if the connection passed validation, but be
+		// defensive.
+		slog.Warn("on-create discovery: no BaseURL for provider", "provider", conn.Provider)
+		return
+	}
+
+	res := s.deps.Discovery.DiscoverProvider(ctx, conn.Provider, creds)
+	if res.Err != nil {
+		slog.Warn("on-create discovery: lister error",
+			"provider", conn.Provider, "connection_id", conn.ID, "err", res.Err)
+	}
+}
+
+// buildListerCredentials translates a store.Connection + the static
+// provider definition into a catalog.ListerCredentials. Keeps the
+// catalog package decoupled from store.Connection / config types.
+func buildListerCredentials(conn store.Connection) catalog.ListerCredentials {
+	provDef, ok := config.KnownProviders[conn.Provider]
+	if !ok {
+		return catalog.ListerCredentials{}
+	}
+	return catalog.ListerCredentials{
+		BaseURL:     provDef.BaseURL,
+		APIKey:      conn.APIKey,
+		AccessToken: conn.AccessToken,
+	}
+}
+
+// triggerOnNotFoundDiscovery is the upstream-404 sibling of
+// triggerOnCreateDiscovery (M2.7, AC16). When an executor returns
+// "model not found," the catalog is likely stale — refresh it so the
+// next request and the dashboard see the up-to-date list. Fire-and-
+// forget — the 30s budget is independent of the client's already-
+// returned 404 response.
+//
+// Gates (mirrored from M2.4 for parity):
+//  1. `SubscriptionDiscoverable=false` for subscription-auth connections
+//     (AC19) — the static M3 allowlist stays authoritative for providers
+//     that opted out of OAuth-token-driven discovery.
+//  2. Persistent backoff + 5-min debounce — owned by
+//     `DiscoveryRunner.TryDiscoverOnNotFound`; the server-side hook
+//     only translates `ConnectionInfo` into `ListerCredentials`.
+func (s *Server) triggerOnNotFoundDiscovery(providerID string, conn *ConnectionInfo) {
+	if conn == nil || conn.Credentials == nil {
+		return
+	}
+	// Defensive nil checks (M2.7 review m2-r3-2). The hook site in
+	// routes_v1.go already guards on these, but this helper might be
+	// called from a future code path that doesn't — keep the contract
+	// local so a missing-wiring bug surfaces as a no-op, not a panic.
+	if s.deps.CatalogStore == nil || s.deps.Discovery == nil {
+		return
+	}
+	provDef, ok := config.KnownProviders[providerID]
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// AC19 parity with M2.4: subscription tokens may only be used as
+	// discovery credentials on providers that explicitly opt in. Without
+	// this gate the on-404 hook would silently undo M2.4's protection
+	// every time the upstream returned 404 to a subscription connection
+	// on `gemini` / `openrouter` / `ollama` (all seeded
+	// SubscriptionDiscoverable=false). The duplicate ProviderMeta read
+	// vs. TryDiscoverOnNotFound is intentional — the gate is an auth
+	// concern that the catalog package shouldn't know about.
+	if conn.Credentials.AuthType == auth.AuthTypeSubscription {
+		meta, err := s.deps.CatalogStore.GetProviderMeta(ctx, providerID)
+		if err != nil {
+			slog.Warn("on-404 discovery: read ProviderMeta failed",
+				"provider", providerID, "err", err)
+			return
+		}
+		if meta == nil || !meta.SubscriptionDiscoverable {
+			slog.Debug("on-404 discovery: subscription_discoverable=false; skipping",
+				"provider", providerID, "connection_id", conn.ID)
+			return
+		}
+	}
+
+	creds := catalog.ListerCredentials{
+		BaseURL:     provDef.BaseURL,
+		APIKey:      conn.Credentials.APIKey,
+		AccessToken: conn.Credentials.AccessToken,
+	}
+
+	res := s.deps.Discovery.TryDiscoverOnNotFound(ctx, providerID, creds)
+	switch {
+	case res.Skipped:
+		// Gated by backoff or debounce — expected during 404 storms.
+		// Trace-level only to keep production logs quiet.
+		slog.Debug("on-404 discovery: skipped",
+			"provider", providerID, "connection_id", conn.ID)
+	case res.Err != nil:
+		slog.Warn("on-404 discovery: lister error",
+			"provider", providerID, "connection_id", conn.ID, "err", res.Err)
+	default:
+		slog.Info("on-404 discovery: completed",
+			"provider", providerID, "connection_id", conn.ID,
+			"count", res.Count, "empty", res.Empty)
+	}
 }
 
 func (s *Server) handleUpdateConnection(w http.ResponseWriter, r *http.Request) {
@@ -584,13 +776,111 @@ func (s *Server) handleGetUsageSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Enrich with SubscriptionSavings — sum of would-have-been API cost
+	// across subscription-served rows, using the current pricing table.
+	// Computed at query time so pricing-table updates retroactively
+	// reflect in reported savings (intentional per spec; documented in
+	// the dashboard tooltip in 3.5c).
+	groups, err := s.deps.Store.SubscriptionUsageGroups(filter)
+	if err != nil {
+		// Non-fatal — log and continue without savings.
+		slog.Warn("usage summary: subscription groups query failed", "err", err)
+	} else if s.deps.Catalog != nil {
+		// Models Discovery M1.9b (LOAD-BEARING for AC25 + AC25b).
+		// EstimateCost now flows cache_read + cache_write tokens
+		// through the catalog's per-row Pricing, so subscription
+		// savings reflect cache pricing whenever the underlying row
+		// has non-zero CacheRead/CacheWrite (Anthropic Input*1.25 etc).
+		// Without the catalog wired (e.g., partial-wired tests),
+		// savings default to 0 — explicit fallback per RC1.
+		var savings float64
+		for _, g := range groups {
+			savings += s.deps.Catalog.EstimateCost(g.Provider, g.Model, catalog.TokenBreakdown{
+				Input:        g.InputTokens,
+				Output:       g.OutputTokens,
+				CacheReadIn:  g.CacheReadTokens,
+				CacheWriteIn: g.CacheWriteTokens,
+			})
+		}
+		summary.SubscriptionSavings = savings
+	}
+
 	writeJSON(w, http.StatusOK, summary)
 }
 
 // ── Provider & Model Catalog Routes ──
 
+// providerListEntry is the per-provider row shape for /api/providers.
+// Models Discovery M2.12 (AC22) enriched the static config.ProviderDef
+// with discovery-loop state. Per AC9's M2.12 revision the change is
+// **additive**: every M1 field is preserved, new fields are appended.
+// Clients ignoring unknown fields continue to work. The
+// /api/catalog/providers endpoint (M2.10) carries the same meta but
+// in a flat array; this merged view powers the existing providers.jsx
+// page without forcing it to do client-side joins.
+//
+// Field design notes:
+//   - `discovery_enabled`, `subscription_discoverable`, and `backoff_step`
+//     are NOT `omitempty`: their zero values (`false`, `0`) are
+//     load-bearing — `discovery_enabled=false` for github-copilot is the
+//     signal the dashboard renders "discovery off" off. Production
+//     always has a `catalog_provider_meta` row (seeded by `SeedProviderMeta`
+//     in M1.11), so the "no meta row" fallback path is a test-rig case.
+//   - `last_discovered_at` / `last_discovery_error` / `next_discovery_after`
+//     ARE `omitempty`: a zero timestamp and empty error string aren't
+//     meaningful to surface to operators; the dashboard treats their
+//     absence as "no event yet."
+//   - Embedding `config.ProviderDef` anonymously promotes its JSON
+//     fields to the top level. If `ProviderDef` ever gains a field
+//     whose name collides with a meta field (e.g., a future
+//     `BackoffStep`), `encoding/json` would silently drop one per
+//     embedding rules. Flatten the struct if that risk materialises.
+type providerListEntry struct {
+	config.ProviderDef
+	DiscoveryEnabled         bool   `json:"discovery_enabled"`
+	SubscriptionDiscoverable bool   `json:"subscription_discoverable"`
+	LastDiscoveredAt         string `json:"last_discovered_at,omitempty"`
+	LastDiscoveryError       string `json:"last_discovery_error,omitempty"`
+	BackoffStep              int    `json:"backoff_step"`
+	NextDiscoveryAfter       string `json:"next_discovery_after,omitempty"`
+}
+
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, config.KnownProviders)
+	// Snapshot ProviderMeta into a lookup map. A nil CatalogStore (test
+	// wiring without M2 deps) leaves every entry with zero-value meta
+	// fields. The bool/int fields will still serialise (no omitempty
+	// on them — see providerListEntry field notes); the dashboard's
+	// "no meta" path expects false/0 to mean "no data yet" and the
+	// production seed (M1.11) ensures every provider has a real row.
+	metas := map[string]catalog.ProviderMeta{}
+	if s.deps.CatalogStore != nil {
+		rows, err := s.deps.CatalogStore.ListProviderMetas(r.Context())
+		if err == nil {
+			for _, m := range rows {
+				metas[m.Provider] = m
+			}
+		}
+	}
+
+	out := make(map[string]providerListEntry, len(config.KnownProviders))
+	for id, def := range config.KnownProviders {
+		entry := providerListEntry{ProviderDef: def}
+		if m, ok := metas[id]; ok {
+			entry.DiscoveryEnabled = m.DiscoveryEnabled
+			entry.SubscriptionDiscoverable = m.SubscriptionDiscoverable
+			entry.LastDiscoveryError = m.LastDiscoveryError
+			entry.BackoffStep = m.BackoffStep
+			if !m.LastDiscoveredAt.IsZero() {
+				entry.LastDiscoveredAt = m.LastDiscoveredAt.UTC().Format(time.RFC3339)
+			}
+			if !m.NextDiscoveryAfter.IsZero() {
+				entry.NextDiscoveryAfter = m.NextDiscoveryAfter.UTC().Format(time.RFC3339)
+			}
+		}
+		out[id] = entry
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleListModelCatalog(w http.ResponseWriter, r *http.Request) {
@@ -605,7 +895,10 @@ func (s *Server) handleListModelCatalog(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Filter catalog to models from active providers, using provider/model format
+	// Models Discovery M1.9b — iterate the runtime catalog instead of
+	// the static model map. The JSON shape (modelEntry) is preserved
+	// byte-for-byte to honor AC9's backward-compat contract; only the
+	// iteration source changes.
 	type modelEntry struct {
 		ID          string  `json:"id"`
 		Provider    string  `json:"provider"`
@@ -614,18 +907,459 @@ func (s *Server) handleListModelCatalog(w http.ResponseWriter, r *http.Request) 
 		OutputPrice float64 `json:"output_price,omitempty"`
 	}
 	var models []modelEntry
-	for _, m := range config.ModelCatalog {
-		if activeProviders[m.Provider] {
-			models = append(models, modelEntry{
-				ID:          m.Provider + "/" + m.ID,
-				Provider:    m.Provider,
-				DisplayName: m.DisplayName,
-				InputPrice:  m.InputPrice,
-				OutputPrice: m.OutputPrice,
-			})
+	if s.deps.Catalog != nil {
+		for _, m := range s.deps.Catalog.ListProvider("") {
+			if activeProviders[m.Provider] {
+				models = append(models, modelEntry{
+					ID:          m.Provider + "/" + m.ModelID,
+					Provider:    m.Provider,
+					DisplayName: m.DisplayName,
+					InputPrice:  m.Pricing.Input,
+					OutputPrice: m.Pricing.Output,
+				})
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, models)
+}
+
+// ── Catalog Routes (Models Discovery M2.10) ──
+//
+// The new /api/catalog/* endpoints expose the runtime catalog
+// (catalog_models, catalog_pricing, catalog_provider_meta) so the
+// dashboard can render the discovery loop's effects + edit pricing
+// overrides. Distinct from the M1 backward-compat /api/models
+// (active-connections filter) and /api/providers (static
+// KnownProviders dump):
+//
+//   - /api/catalog/models       — every catalog row, with source badge
+//   - /api/catalog/models/{provider} — same, filtered to one provider
+//   - PUT /api/catalog/pricing/{provider}/{model_id...} — user override
+//   - DELETE same — remove the user override
+//   - /api/catalog/providers    — catalog_provider_meta rows
+//
+// Path semantics: `model_id` is a catch-all (Go 1.22+ `{name...}`)
+// because OpenRouter qualifies IDs as `<vendor>/<model>` (e.g.
+// `anthropic/claude-sonnet-4`). Two-segment IDs must round-trip the
+// slash.
+
+// catalogModelView is the JSON shape returned by /api/catalog/models.
+// Carries every field the dashboard surfaces: source badge,
+// capabilities, pricing, and the row's `updated_at` timestamp so
+// operators can see when discovery / OpenRouter / a manual edit last
+// touched it (AC21 — added after M2.11 review MAJOR-1; the dashboard's
+// "last-refreshed" column reads this field).
+type catalogModelView struct {
+	Provider         string  `json:"provider"`
+	ModelID          string  `json:"model_id"`
+	DisplayName      string  `json:"display_name"`
+	Tier             int     `json:"tier"`
+	ContextWindow    int     `json:"context_window"`
+	MaxOutput        int     `json:"max_output"`
+	SupportsImages   bool    `json:"supports_images"`
+	SupportsTools    bool    `json:"supports_tools"`
+	SupportsThinking bool    `json:"supports_thinking"`
+	Source           string  `json:"source"`
+	InputPrice       float64 `json:"input_price"`
+	OutputPrice      float64 `json:"output_price"`
+	CacheReadPrice   float64 `json:"cache_read_price"`
+	CacheWritePrice  float64 `json:"cache_write_price"`
+	ThinkingPrice    float64 `json:"thinking_price"`
+	PricingSource    string  `json:"pricing_source"`
+	UpdatedAt        string  `json:"updated_at,omitempty"`     // RFC3339; empty when unknown
+	DiscoveredAt     string  `json:"discovered_at,omitempty"`  // RFC3339; empty when unknown
+}
+
+func modelToCatalogView(m catalog.Model) catalogModelView {
+	v := catalogModelView{
+		Provider:         m.Provider,
+		ModelID:          m.ModelID,
+		DisplayName:      m.DisplayName,
+		Tier:             int(m.Tier),
+		ContextWindow:    m.ContextWindow,
+		MaxOutput:        m.MaxOutput,
+		SupportsImages:   m.Caps.SupportsImages,
+		SupportsTools:    m.Caps.SupportsTools,
+		SupportsThinking: m.Caps.SupportsThinking,
+		Source:           m.Source,
+		InputPrice:       m.Pricing.Input,
+		OutputPrice:      m.Pricing.Output,
+		CacheReadPrice:   m.Pricing.CacheRead,
+		CacheWritePrice:  m.Pricing.CacheWrite,
+		ThinkingPrice:    m.Pricing.Thinking,
+		PricingSource:    m.Pricing.Source,
+	}
+	if !m.UpdatedAt.IsZero() {
+		v.UpdatedAt = m.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	if !m.DiscoveredAt.IsZero() {
+		v.DiscoveredAt = m.DiscoveredAt.UTC().Format(time.RFC3339)
+	}
+	return v
+}
+
+func (s *Server) handleGetCatalogModels(w http.ResponseWriter, r *http.Request) {
+	// Unknown-provider contract (M2.10 review MINOR-4): an unknown
+	// provider returns an empty list with 200 OK, not 404. This is
+	// the REST list-filter convention — "filtered to a set with no
+	// matches" is a valid query result, not a missing resource. The
+	// route is /api/catalog/models[/{provider}]; both shapes return
+	// a JSON array (possibly empty).
+	if s.deps.Catalog == nil {
+		writeJSON(w, http.StatusOK, []catalogModelView{})
+		return
+	}
+	provider := r.PathValue("provider") // "" when matched at /api/catalog/models
+	models := s.deps.Catalog.ListProvider(provider)
+	out := make([]catalogModelView, 0, len(models))
+	for _, m := range models {
+		out = append(out, modelToCatalogView(m))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// putCatalogPricingRequest is the request body for PUT
+// /api/catalog/pricing. **All five price fields are required.** PUT is
+// strictly replace-not-patch — see the handler doc for the rationale.
+// `*float64` distinguishes "field omitted" (nil) from "field set to 0"
+// (which is a valid value for free models / inapplicable dimensions).
+type putCatalogPricingRequest struct {
+	InputPrice      *float64 `json:"input_price"`
+	OutputPrice     *float64 `json:"output_price"`
+	CacheReadPrice  *float64 `json:"cache_read_price"`
+	CacheWritePrice *float64 `json:"cache_write_price"`
+	ThinkingPrice   *float64 `json:"thinking_price"`
+}
+
+// handlePutCatalogPricing — PUT a user pricing override.
+//
+// **Contract: PUT is replace-not-patch.** The request body must
+// include all five price fields; omitted fields are rejected with 400.
+// This prevents the silent-zeroing footgun that would happen if a
+// caller sent `{"input_price": 5}` expecting "update only input_price"
+// — under replace semantics that request would zero output_price,
+// cache_read_price, etc. Callers wanting partial updates must
+// read-modify-write: GET the current pricing, mutate, PUT back.
+//
+// **Model row auto-creation:** if (provider, model_id) doesn't yet
+// exist in catalog_models, the handler creates a placeholder model
+// row at `source='seed'`. This satisfies the catalog_pricing FK
+// without locking out future discovery — seed loses to discovery,
+// openrouter, AND user on the precedence ladder (ADR-2 §Conflict
+// resolution), so a subsequent discovery cycle can populate the
+// model's display_name, tier, capabilities, etc. Writing
+// `source='user'` for the model row (the obvious choice) would block
+// discovery from ever touching it — see M2.10-review MAJOR-1.
+func (s *Server) handlePutCatalogPricing(w http.ResponseWriter, r *http.Request) {
+	if s.deps.CatalogStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog store unavailable")
+		return
+	}
+	providerID := r.PathValue("provider")
+	modelID := r.PathValue("model_id")
+	if providerID == "" || modelID == "" {
+		writeError(w, http.StatusBadRequest, "provider and model_id are required")
+		return
+	}
+
+	var req putCatalogPricingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Strict-replace validation: every field must be present. Surface
+	// the missing field name so the caller can fix their payload.
+	missing := []string{}
+	if req.InputPrice == nil {
+		missing = append(missing, "input_price")
+	}
+	if req.OutputPrice == nil {
+		missing = append(missing, "output_price")
+	}
+	if req.CacheReadPrice == nil {
+		missing = append(missing, "cache_read_price")
+	}
+	if req.CacheWritePrice == nil {
+		missing = append(missing, "cache_write_price")
+	}
+	if req.ThinkingPrice == nil {
+		missing = append(missing, "thinking_price")
+	}
+	if len(missing) > 0 {
+		writeError(w, http.StatusBadRequest,
+			"PUT requires all five price fields (replace semantics); missing: "+strings.Join(missing, ", "))
+		return
+	}
+
+	// Value validation (spec §6 / decision-log RM5 — surfaced by Gate
+	// 3 cumulative review as MAJOR-1; the contract was promised but
+	// not implemented). Reject:
+	//   - NaN / +-Inf (would propagate through EstimateCost and
+	//     corrupt usage_log cost rows);
+	//   - negative prices (would invert the cheap-strategy sort);
+	//   - prices above 10000 USD per 1M tokens (~3 orders of
+	//     magnitude above the most expensive frontier model;
+	//     anything higher is a fat-finger error).
+	const maxPricePer1M = 10000.0
+	type priceField struct {
+		name string
+		v    float64
+	}
+	fields := []priceField{
+		{"input_price", *req.InputPrice},
+		{"output_price", *req.OutputPrice},
+		{"cache_read_price", *req.CacheReadPrice},
+		{"cache_write_price", *req.CacheWritePrice},
+		{"thinking_price", *req.ThinkingPrice},
+	}
+	for _, f := range fields {
+		if math.IsNaN(f.v) {
+			writeError(w, http.StatusBadRequest, f.name+" must be a real number (got NaN)")
+			return
+		}
+		if math.IsInf(f.v, 0) {
+			writeError(w, http.StatusBadRequest, f.name+" must be finite (got Inf)")
+			return
+		}
+		if f.v < 0 {
+			writeError(w, http.StatusBadRequest, f.name+" must be non-negative")
+			return
+		}
+		if f.v > maxPricePer1M {
+			writeError(w, http.StatusBadRequest,
+				f.name+" exceeds sanity cap of $10000 per 1M tokens")
+			return
+		}
+	}
+
+	// Auto-create model row at source='seed' so the FK is satisfied
+	// AND a future discovery refresh can still populate the row's
+	// metadata. See handler doc above + M2.10-review MAJOR-1.
+	if err := s.deps.CatalogStore.UpsertModel(r.Context(), catalog.Model{
+		Provider: providerID,
+		ModelID:  modelID,
+		Source:   catalog.SourceSeed,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "upsert model: "+err.Error())
+		return
+	}
+
+	if err := s.deps.CatalogStore.UpsertPricing(r.Context(), providerID, modelID, catalog.Pricing{
+		Input:      *req.InputPrice,
+		Output:     *req.OutputPrice,
+		CacheRead:  *req.CacheReadPrice,
+		CacheWrite: *req.CacheWritePrice,
+		Thinking:   *req.ThinkingPrice,
+		Source:     catalog.SourceUser,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "upsert pricing: "+err.Error())
+		return
+	}
+
+	// Invalidate the Registry cache so subsequent reads (cost
+	// computation, dashboard /api/models) see the new values.
+	if s.deps.Catalog != nil {
+		s.deps.Catalog.Invalidate()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteCatalogPricing(w http.ResponseWriter, r *http.Request) {
+	if s.deps.CatalogStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog store unavailable")
+		return
+	}
+	providerID := r.PathValue("provider")
+	modelID := r.PathValue("model_id")
+	if providerID == "" || modelID == "" {
+		writeError(w, http.StatusBadRequest, "provider and model_id are required")
+		return
+	}
+
+	// Idempotent — DeletePricing returns nil error when no row
+	// exists, so 200 OK is the right response for missing-row too.
+	if err := s.deps.CatalogStore.DeletePricing(r.Context(), providerID, modelID); err != nil {
+		writeError(w, http.StatusInternalServerError, "delete pricing: "+err.Error())
+		return
+	}
+
+	if s.deps.Catalog != nil {
+		s.deps.Catalog.Invalidate()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// catalogProviderView is the JSON shape for /api/catalog/providers.
+// One row per provider in catalog_provider_meta. Distinct from
+// /api/providers which dumps the static KnownProviders map (no
+// runtime state).
+type catalogProviderView struct {
+	Provider                 string `json:"provider"`
+	DiscoveryEnabled         bool   `json:"discovery_enabled"`
+	SubscriptionDiscoverable bool   `json:"subscription_discoverable"`
+	LastDiscoveredAt         string `json:"last_discovered_at,omitempty"`
+	LastDiscoveryError       string `json:"last_discovery_error,omitempty"`
+	BackoffStep              int    `json:"backoff_step"`
+	NextDiscoveryAfter       string `json:"next_discovery_after,omitempty"`
+}
+
+func (s *Server) handleGetCatalogProviders(w http.ResponseWriter, r *http.Request) {
+	if s.deps.CatalogStore == nil {
+		writeJSON(w, http.StatusOK, []catalogProviderView{})
+		return
+	}
+	metas, err := s.deps.CatalogStore.ListProviderMetas(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list provider metas: "+err.Error())
+		return
+	}
+	out := make([]catalogProviderView, 0, len(metas))
+	for _, m := range metas {
+		v := catalogProviderView{
+			Provider:                 m.Provider,
+			DiscoveryEnabled:         m.DiscoveryEnabled,
+			SubscriptionDiscoverable: m.SubscriptionDiscoverable,
+			LastDiscoveryError:       m.LastDiscoveryError,
+			BackoffStep:              m.BackoffStep,
+		}
+		if !m.LastDiscoveredAt.IsZero() {
+			v.LastDiscoveredAt = m.LastDiscoveredAt.UTC().Format(time.RFC3339)
+		}
+		if !m.NextDiscoveryAfter.IsZero() {
+			v.NextDiscoveryAfter = m.NextDiscoveryAfter.UTC().Format(time.RFC3339)
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ── Recompute Route (Models Discovery M3.1) ──
+//
+// POST /api/catalog/recompute re-applies *current* catalog pricing to
+// historical apikey usage_log rows in a date range. Subscription rows
+// are skipped — their cost is 0 in usage_log and `subscription_savings`
+// is computed at query time in the /api/usage/summary endpoint
+// (via `catalog.Registry.EstimateCost` after M1's rewires), so live
+// pricing already flows through automatically.
+//
+// Contract (ADR-3 §Part F):
+//   - apikey rows whose stored cost differs from EstimateCost are
+//     updated to the fresh value via Store.UpdateUsageCost
+//   - cost_source is never touched
+//   - dry_run=true returns the deltas in the response shape without
+//     writing
+//   - JWT required (operator action, mutates user-visible data)
+
+type recomputeReq struct {
+	From   string `json:"from"`    // RFC3339 or YYYY-MM-DD
+	To     string `json:"to"`      // RFC3339 or YYYY-MM-DD
+	DryRun bool   `json:"dry_run"` // preview without persisting
+}
+
+type recomputeResp struct {
+	RowsInspected    int     `json:"rows_inspected"`
+	RowsUpdated      int     `json:"rows_updated"`
+	TotalCostDelta   float64 `json:"total_cost_delta_usd"`
+	SubscriptionNote string  `json:"subscription_note"`
+}
+
+// parseRecomputeTime accepts RFC3339 (the dashboard's likely format)
+// or YYYY-MM-DD (operator-friendly curl). The `isUpperBound` flag
+// shifts a date-only input to end-of-day (23:59:59.999999999 UTC) so
+// `to: "2026-05-12"` means "through the end of 2026-05-12" instead of
+// "midnight at the START of 2026-05-12" — the latter would exclude
+// every row on that day, the opposite of operator intent (M3.1 review
+// MINOR-2).
+func parseRecomputeTime(s string, isUpperBound bool) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		if isUpperBound {
+			// End of the named day (UTC). The range query uses
+			// `< to`, so anchoring at 23:59:59.999... includes
+			// every wall-clock row on the date.
+			t = t.Add(24*time.Hour - time.Nanosecond)
+		}
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("invalid time %q (want RFC3339 or YYYY-MM-DD)", s)
+}
+
+func (s *Server) handleRecompute(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Store == nil || s.deps.Catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "recompute requires catalog + store")
+		return
+	}
+
+	var req recomputeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	from, err := parseRecomputeTime(req.From, false)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "from: "+err.Error())
+		return
+	}
+	to, err := parseRecomputeTime(req.To, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "to: "+err.Error())
+		return
+	}
+	if !from.Before(to) {
+		writeError(w, http.StatusBadRequest, "from must be before to")
+		return
+	}
+
+	// Only apikey rows are recomputed (ADR-3 §Part F). Subscription
+	// cost is structurally 0 and savings are query-time computed.
+	rows, err := s.deps.Store.ListUsageInRange(r.Context(), from, to, "apikey")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list usage: "+err.Error())
+		return
+	}
+
+	const subscriptionNote = "subscription_savings auto-reflects current pricing at next /api/usage/summary read"
+	var updated int
+	var delta float64
+	for _, row := range rows {
+		// Thinking tokens aren't stored separately in usage_log
+		// today — they're folded into Output. ADR-3 §Part F is
+		// explicit about this; the recompute matches the original
+		// EstimateCost call's token-breakdown shape from the record
+		// write to keep cost arithmetic consistent.
+		breakdown := catalog.TokenBreakdown{
+			Input:        row.InputTokens,
+			Output:       row.OutputTokens,
+			CacheReadIn:  row.CacheReadTokens,
+			CacheWriteIn: row.CacheWriteTokens,
+			Thinking:     0,
+		}
+		newCost := s.deps.Catalog.EstimateCost(row.Provider, row.Model, breakdown)
+		if newCost == row.Cost {
+			continue
+		}
+		if !req.DryRun {
+			if err := s.deps.Store.UpdateUsageCost(r.Context(), row.ID, newCost); err != nil {
+				slog.Warn("recompute: update failed",
+					"id", row.ID, "provider", row.Provider, "model", row.Model, "err", err)
+				continue
+			}
+		}
+		updated++
+		delta += newCost - row.Cost
+	}
+
+	writeJSON(w, http.StatusOK, recomputeResp{
+		RowsInspected:    len(rows),
+		RowsUpdated:      updated,
+		TotalCostDelta:   delta,
+		SubscriptionNote: subscriptionNote,
+	})
 }
 
 // ── Status Route ──
@@ -660,70 +1394,20 @@ func (s *Server) handleDetectClaude(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// ── OpenAI OAuth Routes ──
+// ── OpenAI OAuth Routes (legacy device-code, retired in M2.8) ──
+//
+// These handlers used to drive a device-code login. M2.8 retired the
+// flow in favor of PKCE (see routes_auth_oauth.go). The handlers below
+// return 410 Gone with a pointer at the replacement so any clients still
+// polling the old endpoints fail loudly. M3.7 deletes them plus the
+// OpenAIAuth dependency.
 
 func (s *Server) handleOpenAIDeviceStart(w http.ResponseWriter, r *http.Request) {
-	if s.deps.OpenAIAuth == nil {
-		writeError(w, http.StatusServiceUnavailable, "OpenAI OAuth not configured")
-		return
-	}
-
-	resp, err := s.deps.OpenAIAuth.StartDeviceFlow()
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "Failed to start device flow: "+err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusOK, resp)
+	s.handleOpenAIDeviceStartDeprecated(w, r)
 }
 
 func (s *Server) handleOpenAIDevicePoll(w http.ResponseWriter, r *http.Request) {
-	if s.deps.OpenAIAuth == nil {
-		writeError(w, http.StatusServiceUnavailable, "OpenAI OAuth not configured")
-		return
-	}
-
-	var req struct {
-		UserCode string `json:"user_code"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserCode == "" {
-		writeError(w, http.StatusBadRequest, "user_code required")
-		return
-	}
-
-	tokenResp, err := s.deps.OpenAIAuth.PollForToken(req.UserCode)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	// Create a connection with the OAuth token
-	conn := store.Connection{
-		ID:          generateRequestID(),
-		Provider:    "openai",
-		Name:        "OpenAI (OAuth)",
-		AuthType:    "oauth",
-		AccessToken: tokenResp.AccessToken,
-		State:       "idle",
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-	}
-	if tokenResp.RefreshToken != "" {
-		conn.RefreshToken = tokenResp.RefreshToken
-	}
-
-	if err := s.deps.Store.CreateConnection(&conn); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	provConn := provider.NewConnection(conn.ID, conn.Provider, conn.Name, conn.Priority, conn.AuthType)
-	s.deps.ProviderSelector.Register(provConn)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":            true,
-		"connection_id": conn.ID,
-	})
+	s.handleOpenAIDevicePollDeprecated(w, r)
 }
 
 // ── Routing Analytics Routes ──

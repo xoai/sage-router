@@ -148,15 +148,6 @@ export function setupPassword(password) {
   return request('/auth/setup', { method: 'POST', body: { password } });
 }
 
-// OpenAI OAuth device code flow
-export function openaiDeviceStart() {
-  return request('/oauth/openai/device', { method: 'POST' });
-}
-
-export function openaiDevicePoll(userCode) {
-  return request('/oauth/openai/poll', { method: 'POST', body: { user_code: userCode } });
-}
-
 // Status
 export function getStatus() {
   return request('/status');
@@ -174,6 +165,44 @@ export function getProviders() {
 
 export function getModels() {
   return request('/models');
+}
+
+// Models Discovery M2.10 — new /api/catalog/* endpoints.
+//
+// getCatalogModels returns the full catalog (every row, every source —
+// distinct from getModels() which filters to active connections).
+// Pass a provider string to filter; pass nothing for all.
+export function getCatalogModels(provider) {
+  return provider ? request(`/catalog/models/${encodeURIComponent(provider)}`) : request('/catalog/models');
+}
+
+// putCatalogPricing writes a user pricing override. PUT is strictly
+// replace-not-patch — the body MUST include all five price fields
+// (input_price, output_price, cache_read_price, cache_write_price,
+// thinking_price). The handler rejects partial bodies with 400 + the
+// missing field name. Caller is responsible for round-tripping the
+// current state when editing one field.
+export function putCatalogPricing(provider, modelId, pricing) {
+  // model_id may contain a slash for OpenRouter (e.g. anthropic/claude-sonnet-4);
+  // the route uses Go 1.22+ {model_id...} catch-all, so we must NOT
+  // encode the slash. Encode each segment instead.
+  const path = `/catalog/pricing/${encodeURIComponent(provider)}/${modelId.split('/').map(encodeURIComponent).join('/')}`;
+  return request(path, { method: 'PUT', body: pricing });
+}
+
+// deleteCatalogPricing removes a user pricing override. Idempotent —
+// 200 OK even when the row doesn't exist.
+export function deleteCatalogPricing(provider, modelId) {
+  const path = `/catalog/pricing/${encodeURIComponent(provider)}/${modelId.split('/').map(encodeURIComponent).join('/')}`;
+  return request(path, { method: 'DELETE' });
+}
+
+// getCatalogProviders returns the catalog_provider_meta rows: per-
+// provider discovery-loop state (enabled, last_discovered_at, error,
+// backoff_step, next_discovery_after). Distinct from getProviders()
+// which dumps the static KnownProviders map.
+export function getCatalogProviders() {
+  return request('/catalog/providers');
 }
 
 // Routing analytics

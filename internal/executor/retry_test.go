@@ -230,3 +230,63 @@ func TestRetryExecutorContextCanceled(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
+
+// ── OverrideCapabilities delegation ──
+//
+// Models Discovery M3.4b post-review fix. Production wiring at
+// cmd/sage-router/main.go wraps every Executor in NewRetryExecutor
+// before storing in `deps.Executors`. Without explicit delegation, the
+// type assertion `exec.(CapabilityOverrider)` in
+// server.buildSmartCandidates would fail in production even after
+// M3.5 implements OverrideCapabilities on the inner executors.
+
+type capOverridingMock struct {
+	mockExecutor
+	overrideFor string
+}
+
+func (c *capOverridingMock) OverrideCapabilities(model string, base Capabilities) Capabilities {
+	if model == c.overrideFor {
+		base.SupportsThinking = true
+	}
+	return base
+}
+
+func TestRetryExecutor_OverrideCapabilities_DelegatesToInner(t *testing.T) {
+	inner := &capOverridingMock{overrideFor: "model-x"}
+	re := NewRetryExecutor(inner, RetryConfig{})
+
+	// re must be observable as CapabilityOverrider for the
+	// server.buildSmartCandidates type-assertion to succeed.
+	overrider, ok := any(re).(CapabilityOverrider)
+	if !ok {
+		t.Fatal("*RetryExecutor does not satisfy CapabilityOverrider — production override path is dead")
+	}
+
+	out := overrider.OverrideCapabilities("model-x", Capabilities{})
+	if !out.SupportsThinking {
+		t.Errorf("override for model-x: SupportsThinking=false, want true (inner flipped it)")
+	}
+	out = overrider.OverrideCapabilities("model-other", Capabilities{})
+	if out.SupportsThinking {
+		t.Errorf("override for model-other: SupportsThinking=true, want false (inner left it alone)")
+	}
+}
+
+func TestRetryExecutor_OverrideCapabilities_InnerLacksInterface(t *testing.T) {
+	// mockExecutor (base) doesn't implement CapabilityOverrider — the
+	// RetryExecutor wrap must still return the interface (so the
+	// production type-assertion succeeds) but the body becomes identity.
+	inner := &mockExecutor{}
+	re := NewRetryExecutor(inner, RetryConfig{})
+
+	overrider, ok := any(re).(CapabilityOverrider)
+	if !ok {
+		t.Fatal("*RetryExecutor missing CapabilityOverrider")
+	}
+	in := Capabilities{SupportsImages: true, SupportsTools: true}
+	out := overrider.OverrideCapabilities("any-model", in)
+	if out != in {
+		t.Errorf("identity broken: got %+v, want %+v (inner has no override)", out, in)
+	}
+}

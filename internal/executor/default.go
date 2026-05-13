@@ -50,22 +50,22 @@ func (e *DefaultExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Re
 
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// Apply authentication.
+	// Apply authentication. Unknown AuthType values fail loudly — see the
+	// claude.go comment for the rationale on dropping the legacy fallback.
 	if req.Credentials != nil {
 		switch req.Credentials.AuthType {
 		case "apikey":
 			httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.APIKey)
-		case "oauth":
+		case "subscription":
 			httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.AccessToken)
+			for k, v := range req.Credentials.ExtraHeaders {
+				httpReq.Header.Set(k, v)
+			}
 		case "none":
 			// No auth header needed.
 		default:
-			// Fall back to API key if present, otherwise access token.
-			if req.Credentials.APIKey != "" {
-				httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.APIKey)
-			} else if req.Credentials.AccessToken != "" {
-				httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.AccessToken)
-			}
+			return nil, fmt.Errorf("%s executor: unsupported auth_type %q for connection %s",
+				e.provider, req.Credentials.AuthType, req.Credentials.ConnectionID)
 		}
 	}
 
@@ -86,4 +86,15 @@ func (e *DefaultExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Re
 		URL:        targetURL,
 		Latency:    latency,
 	}, nil
+}
+
+// OverrideCapabilities implements CapabilityOverrider (Models Discovery M3.5).
+// Identity body for the M3 baseline — DefaultExecutor is shared by
+// openai / openrouter / ollama / custom OpenAI-compat providers, each
+// with its own catalog row set. The interface is wired so a future
+// patch (e.g., GPT-5 capability inheritance) doesn't need to rewire
+// the smart-router. The current body returns base unchanged.
+func (e *DefaultExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
+	_ = model
+	return base
 }

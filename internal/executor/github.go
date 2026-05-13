@@ -97,3 +97,14 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, req *ExecuteRequest
 		Latency:    latency,
 	}, nil
 }
+
+// OverrideCapabilities implements CapabilityOverrider (Models Discovery M3.5).
+// Identity body — github-copilot has its own dedicated executor (not
+// routed through DefaultExecutor) and the M3 baseline trusts the
+// catalog rows seeded for this provider. Wiring the interface now
+// keeps the smart-router's type-assertion path uniform across all
+// production executors (no silent override-skip for copilot models).
+func (e *GitHubCopilotExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
+	_ = model
+	return base
+}

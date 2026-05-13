@@ -1,12 +1,34 @@
 import { signal } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
 import { addToast } from '../components/toast';
-import { getAliases, setAlias, deleteAlias, getCombos, createCombo, deleteCombo, getModels } from '../api/client';
+import { fmtPrice, fmtTimestamp } from '../utils/format';
+import {
+  getAliases, setAlias, deleteAlias,
+  getCombos, createCombo, deleteCombo,
+  getModels,
+  getCatalogModels, putCatalogPricing, deleteCatalogPricing,
+} from '../api/client';
 
 const aliases = signal([]);
 const combos = signal([]);
-const availableModels = signal([]);
+const availableModels = signal([]); // /api/models (filtered to active connections)
+const catalogModels = signal([]);   // /api/catalog/models (full catalog with source badges)
 const providerFilter = signal('all');
+
+// Inline pricing editor state. editingPricing is "<provider>/<model_id>"
+// of the row currently being edited; pricingDraft holds the *raw string*
+// form values until the user clicks Save. We store strings, not floats,
+// so incremental decimal entry ("0.", "0.0", "0.00") doesn't get
+// coerced through parseFloat every keystroke — the M2.11 review's
+// MINOR-1 finding. parseFloat is deferred to Save time.
+const editingPricing = signal(null);
+const pricingDraft = signal({
+  input_price: '0',
+  output_price: '0',
+  cache_read_price: '0',
+  cache_write_price: '0',
+  thinking_price: '0',
+});
 
 function loadAliases() {
   getAliases().then(data => {
@@ -32,6 +54,106 @@ function loadModels() {
       availableModels.value = data;
     }
   }).catch(() => {});
+}
+
+function loadCatalogModels() {
+  getCatalogModels().then(data => {
+    if (Array.isArray(data)) {
+      catalogModels.value = data;
+    }
+  }).catch(err => {
+    // M2.11 review MINOR-3: don't silently swallow catalog fetch
+    // errors. An unreachable backend or 500 from the catalog DB
+    // should surface to the operator so they can act.
+    addToast('Failed to load catalog: ' + err.message, 'error');
+  });
+}
+
+// Models Discovery M2.10 — color-coded source badges so the operator
+// can tell at a glance where a row's data came from. Distinct colors
+// reuse the existing status palette so the dashboard stays cohesive.
+// openrouter uses --status-yellow (defined in tokens.css) to stay
+// visibly distinct from discovery's --accent — review M2.11 MAJOR-2
+// caught that --status-amber was undefined and silently fell back to
+// --accent, merging the two visually.
+const sourceBadgeStyle = {
+  seed:       { background: 'var(--bg-3)',         color: 'var(--text-tertiary)' },
+  discovery:  { background: 'var(--accent-muted)', color: 'var(--accent)' },
+  openrouter: { background: 'var(--accent-muted)', color: 'var(--status-yellow)' },
+  user:       { background: 'var(--accent)',       color: 'var(--bg-0)' },
+};
+
+// fmtDraftValue stringifies a row's numeric price for the editor. We
+// keep the raw string in pricingDraft (see MINOR-1 above) so we render
+// "0" for legitimate zero — not the empty string — and the user sees
+// what they're about to PUT.
+function fmtDraftValue(v) {
+  if (v == null) return '0';
+  return String(v);
+}
+
+function startEditPricing(row) {
+  editingPricing.value = row.provider + '/' + row.model_id;
+  pricingDraft.value = {
+    input_price: fmtDraftValue(row.input_price),
+    output_price: fmtDraftValue(row.output_price),
+    cache_read_price: fmtDraftValue(row.cache_read_price),
+    cache_write_price: fmtDraftValue(row.cache_write_price),
+    thinking_price: fmtDraftValue(row.thinking_price),
+  };
+}
+
+function cancelEditPricing() {
+  editingPricing.value = null;
+}
+
+function updatePricingDraft(field, value) {
+  // Store the raw string verbatim. parseFloat happens at savePricing,
+  // not here — keeps decimal entry usable (typing "0." doesn't snap
+  // back to "0" through truthiness coercion).
+  pricingDraft.value = { ...pricingDraft.value, [field]: value };
+}
+
+function savePricing(row) {
+  // PUT is replace-not-patch (M2.10): all five fields are required.
+  // Coerce the raw string drafts to numbers at the boundary — empty
+  // string or non-numeric → 0 (the backend accepts 0 as a legitimate
+  // free-tier price; see parseORFloat empty-string contract in ADR-3).
+  const num = s => {
+    const v = parseFloat(s);
+    return Number.isFinite(v) ? v : 0;
+  };
+  const body = {
+    input_price: num(pricingDraft.value.input_price),
+    output_price: num(pricingDraft.value.output_price),
+    cache_read_price: num(pricingDraft.value.cache_read_price),
+    cache_write_price: num(pricingDraft.value.cache_write_price),
+    thinking_price: num(pricingDraft.value.thinking_price),
+  };
+  putCatalogPricing(row.provider, row.model_id, body)
+    .then(() => {
+      addToast(`Pricing updated for ${row.provider}/${row.model_id}`, 'success');
+      editingPricing.value = null;
+      loadCatalogModels();
+    })
+    .catch(err => addToast('Failed to save pricing: ' + err.message, 'error'));
+}
+
+function resetPricing(row) {
+  // DELETE removes the user override; next discovery / openrouter
+  // refresh re-populates if one is scheduled. Idempotent. (M2.11
+  // review MINOR-2 — copy refined to be honest about the "if scheduled"
+  // condition: a non-discoverable provider has no refresh cycle and
+  // the row stays at zero pricing until manually re-priced.)
+  if (!confirm(`Remove pricing override for ${row.provider}/${row.model_id}?\nThe row will fall back to seed/discovery/OpenRouter pricing if present, or to $0 if no other source has populated this row.`)) {
+    return;
+  }
+  deleteCatalogPricing(row.provider, row.model_id)
+    .then(() => {
+      addToast(`Pricing override removed for ${row.provider}/${row.model_id}`, 'info');
+      loadCatalogModels();
+    })
+    .catch(err => addToast('Failed to remove override: ' + err.message, 'error'));
 }
 
 const editingAlias = signal(null);
@@ -91,6 +213,28 @@ function handleDeleteCombo(id, name) {
 }
 
 // ── Components ──
+
+// PriceInput — narrow numeric input for the inline pricing editor.
+// Accepts decimals (incl. tiny per-token prices like 0.0003). The
+// onChange callback receives the raw string so the caller can decide
+// whether/when to parseFloat.
+function PriceInput({ value, onChange, placeholder }) {
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={value}
+      placeholder={placeholder}
+      onInput={e => onChange(e.target.value)}
+      style={{
+        width: 70, padding: '4px 6px', background: 'var(--bg-2)',
+        border: '1px solid var(--accent)', borderRadius: 'var(--radius-sm)',
+        color: 'var(--text-primary)', fontSize: 11, fontFamily: 'var(--font-mono)',
+        textAlign: 'right',
+      }}
+    />
+  );
+}
 
 function AliasRow({ alias }) {
   const isEditing = editingAlias.value === alias.name;
@@ -216,27 +360,36 @@ export function ModelsPage() {
     loadAliases();
     loadCombos();
     loadModels();
+    loadCatalogModels();
   }, []);
 
   return (
-    <div style={{ padding: 'var(--space-2xl)', maxWidth: 960, width: '100%' }}>
+    <div style={{ padding: 'var(--space-2xl)', maxWidth: 1100, width: '100%' }}>
       <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 'var(--space-xl)' }}>Models</h1>
 
-      {/* Available Models */}
-      {availableModels.value.length > 0 && (() => {
-        const providers = [...new Set(availableModels.value.map(m => m.provider))];
+      {/* Catalog (Models Discovery M2.11) — full catalog rows with
+          source badge + inline pricing editor. Distinct from the
+          "Available Models" view: this shows EVERY row regardless of
+          whether a connection currently exists for it. */}
+      {catalogModels.value.length > 0 && (() => {
+        const providers = [...new Set(catalogModels.value.map(m => m.provider))];
         const filtered = providerFilter.value === 'all'
-          ? availableModels.value
-          : availableModels.value.filter(m => m.provider === providerFilter.value);
+          ? catalogModels.value
+          : catalogModels.value.filter(m => m.provider === providerFilter.value);
         return (
           <div style={{ marginBottom: 'var(--space-2xl)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-md)' }}>
-              <h2 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-secondary)' }}>
-                Available Models
-                <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', marginLeft: 6, fontSize: 12 }}>
-                  ({filtered.length})
-                </span>
-              </h2>
+              <div>
+                <h2 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                  Model Catalog
+                  <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', marginLeft: 6, fontSize: 12 }}>
+                    ({filtered.length})
+                  </span>
+                </h2>
+                <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>
+                  Live discovery + seed + OpenRouter pricing oracle. Edit a row to override pricing locally.
+                </div>
+              </div>
               {providers.length > 1 && (
                 <select
                   value={providerFilter.value}
@@ -256,29 +409,97 @@ export function ModelsPage() {
               background: 'var(--bg-1)', border: '1px solid var(--border)',
               borderRadius: 'var(--radius-lg)', overflow: 'hidden',
             }}>
-              <table>
+              <table style={{ width: '100%' }}>
                 <thead>
                   <tr style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                     <th style={{ padding: '8px 16px', textAlign: 'left', fontWeight: 500 }}>Model</th>
-                    <th style={{ padding: '8px 16px', textAlign: 'right', fontWeight: 500 }}>Input $/M</th>
-                    <th style={{ padding: '8px 16px', textAlign: 'right', fontWeight: 500 }}>Output $/M</th>
+                    <th style={{ padding: '8px 16px', textAlign: 'left', fontWeight: 500 }}>Source</th>
+                    <th style={{ padding: '8px 16px', textAlign: 'right', fontWeight: 500 }}>Input</th>
+                    <th style={{ padding: '8px 16px', textAlign: 'right', fontWeight: 500 }}>Output</th>
+                    <th style={{ padding: '8px 16px', textAlign: 'right', fontWeight: 500 }}>Cache R/W</th>
+                    <th style={{ padding: '8px 16px', textAlign: 'right', fontWeight: 500 }}>Updated</th>
+                    <th style={{ padding: '8px 16px', textAlign: 'right', fontWeight: 500 }}>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(m => (
-                    <tr key={m.id} style={{ borderTop: '1px solid var(--border)' }}>
-                      <td style={{ padding: '10px 16px' }}>
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{m.id}</span>
-                        {m.display_name && <span style={{ fontSize: 11, color: 'var(--text-tertiary)', marginLeft: 8 }}>{m.display_name}</span>}
-                      </td>
-                      <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}>
-                        {m.input_price ? '$' + m.input_price.toFixed(2) : '-'}
-                      </td>
-                      <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}>
-                        {m.output_price ? '$' + m.output_price.toFixed(2) : '-'}
-                      </td>
-                    </tr>
-                  ))}
+                  {filtered.map(m => {
+                    const key = m.provider + '/' + m.model_id;
+                    const editing = editingPricing.value === key;
+                    const pricingSrc = m.pricing_source || m.source || 'seed';
+                    const badgeStyle = sourceBadgeStyle[pricingSrc] || sourceBadgeStyle.seed;
+                    return (
+                      <tr key={key} style={{ borderTop: '1px solid var(--border)' }}>
+                        <td style={{ padding: '10px 16px' }}>
+                          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{m.provider}/{m.model_id}</div>
+                          {m.display_name && (
+                            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>{m.display_name}</div>
+                          )}
+                        </td>
+                        <td style={{ padding: '10px 16px' }}>
+                          <span style={{
+                            display: 'inline-block', padding: '2px 8px',
+                            fontSize: 10, fontFamily: 'var(--font-mono)',
+                            fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.05em',
+                            borderRadius: 'var(--radius-sm)',
+                            ...badgeStyle,
+                          }}>
+                            {pricingSrc}
+                          </span>
+                        </td>
+                        {editing ? (
+                          <>
+                            <td style={{ padding: '6px 8px' }}>
+                              <PriceInput value={pricingDraft.value.input_price} onChange={v => updatePricingDraft('input_price', v)} />
+                            </td>
+                            <td style={{ padding: '6px 8px' }}>
+                              <PriceInput value={pricingDraft.value.output_price} onChange={v => updatePricingDraft('output_price', v)} />
+                            </td>
+                            <td style={{ padding: '6px 8px' }}>
+                              <div style={{ display: 'flex', gap: 4 }}>
+                                <PriceInput value={pricingDraft.value.cache_read_price} onChange={v => updatePricingDraft('cache_read_price', v)} placeholder="read" />
+                                <PriceInput value={pricingDraft.value.cache_write_price} onChange={v => updatePricingDraft('cache_write_price', v)} placeholder="write" />
+                              </div>
+                            </td>
+                            <td style={{ padding: '10px 16px', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}>
+                              {fmtTimestamp(m.updated_at)}
+                            </td>
+                            <td style={{ padding: '10px 16px', textAlign: 'right' }}>
+                              <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                                <button onClick={() => savePricing(m)} style={{ fontSize: 11, color: 'var(--status-green)', padding: '3px 8px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}>Save</button>
+                                <button onClick={cancelEditPricing} style={{ fontSize: 11, color: 'var(--text-tertiary)', padding: '3px 8px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}>Cancel</button>
+                              </div>
+                            </td>
+                          </>
+                        ) : (
+                          <>
+                            <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}>
+                              {fmtPrice(m.input_price)}
+                            </td>
+                            <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}>
+                              {fmtPrice(m.output_price)}
+                            </td>
+                            <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}>
+                              {fmtPrice(m.cache_read_price)} / {fmtPrice(m.cache_write_price)}
+                            </td>
+                            <td
+                              title={m.updated_at || ''}
+                              style={{ padding: '10px 16px', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}
+                            >
+                              {fmtTimestamp(m.updated_at)}
+                            </td>
+                            <td style={{ padding: '10px 16px', textAlign: 'right' }}>
+                              <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                                <button onClick={() => startEditPricing(m)} style={{ fontSize: 11, color: 'var(--text-tertiary)', padding: '3px 8px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}>Edit</button>
+                                {pricingSrc === 'user' && (
+                                  <button onClick={() => resetPricing(m)} style={{ fontSize: 11, color: 'var(--status-red)', padding: '3px 8px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}>Reset</button>
+                                )}
+                              </div>
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

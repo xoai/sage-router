@@ -53,10 +53,17 @@ func (e *GeminiExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Res
 
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// For OAuth-based auth, set the Authorization header (API-key auth is
-	// handled via the URL query parameter in buildURL).
-	if req.Credentials != nil && req.Credentials.AuthType == "oauth" {
+	// For subscription auth, set the Authorization header (API-key auth
+	// is handled via the URL query parameter in buildURL). Unknown values
+	// pass through silently here because Gemini's apikey path is in the
+	// URL not the header — the executor doesn't reject unknown AuthTypes
+	// outright (api-key auth would still work via buildURL). The store-
+	// side scan WARN catches misconfigurations.
+	if req.Credentials != nil && req.Credentials.AuthType == "subscription" {
 		httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.AccessToken)
+		for k, v := range req.Credentials.ExtraHeaders {
+			httpReq.Header.Set(k, v)
+		}
 	}
 
 	client := e.pool.Get(req.ProxyURL)
@@ -92,10 +99,12 @@ func (e *GeminiExecutor) buildURL(req *ExecuteRequest) (string, error) {
 	sb.WriteString("/models/")
 	sb.WriteString(req.Model)
 
-	// Resolve the API key (if any) before building the query string so we
-	// can avoid a dangling '?' when there is no key.
+	// Resolve the API key only for AuthType=apikey. Subscription connections
+	// authenticate via the Authorization: Bearer header set in Execute; we
+	// must NOT leak any APIKey value into the URL even if one is set on the
+	// credential row (defensive).
 	var apiKey string
-	if req.Credentials != nil {
+	if req.Credentials != nil && req.Credentials.AuthType == "apikey" {
 		apiKey = req.Credentials.APIKey
 	}
 
@@ -114,4 +123,14 @@ func (e *GeminiExecutor) buildURL(req *ExecuteRequest) (string, error) {
 	}
 
 	return sb.String(), nil
+}
+
+// OverrideCapabilities implements CapabilityOverrider (Models Discovery M3.5).
+// Identity body for the M3 baseline — Gemini's catalog rows are
+// authoritative today. Future work may flip flags for variants the
+// seed lags on (e.g., flash-lite v2 gaining thinking); wiring the
+// interface now avoids a callers-rewire when that happens.
+func (e *GeminiExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
+	_ = model
+	return base
 }

@@ -56,22 +56,24 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Res
 	httpReq.Header.Set("anthropic-version", claudeAnthropicVersion)
 
 	// Apply authentication. Claude uses x-api-key for API key auth and
-	// Authorization: Bearer for OAuth tokens.
+	// Authorization: Bearer for subscription tokens. Unknown AuthType
+	// values return a loud error rather than a silent best-effort guess —
+	// store-side NormalizeAuthType canonicalizes the value before it ever
+	// reaches the executor (auth/authtype.go + store/sqlite.go scan).
 	if req.Credentials != nil {
 		switch req.Credentials.AuthType {
 		case "apikey":
 			httpReq.Header.Set("x-api-key", req.Credentials.APIKey)
-		case "oauth":
+		case "subscription":
 			httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.AccessToken)
+			for k, v := range req.Credentials.ExtraHeaders {
+				httpReq.Header.Set(k, v)
+			}
 		case "none":
 			// No auth header needed.
 		default:
-			// Best-effort fallback.
-			if req.Credentials.APIKey != "" {
-				httpReq.Header.Set("x-api-key", req.Credentials.APIKey)
-			} else if req.Credentials.AccessToken != "" {
-				httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.AccessToken)
-			}
+			return nil, fmt.Errorf("claude executor: unsupported auth_type %q for connection %s",
+				req.Credentials.AuthType, req.Credentials.ConnectionID)
 		}
 	}
 
@@ -92,4 +94,51 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Res
 		URL:        targetURL,
 		Latency:    latency,
 	}, nil
+}
+
+// OverrideCapabilities implements CapabilityOverrider (Models Discovery M3.5).
+//
+// Anthropic's /v1/models endpoint does not return capability flags, so
+// discovery-sourced rows land in catalog_models with zero capabilities.
+// Without this override the smart-router would treat thinking-capable
+// variants as non-thinking. The override flips SupportsThinking=true
+// for any Claude variant known to support extended thinking; other
+// flags pass through (additive-only semantic — the override never
+// REMOVES a capability the catalog asserted).
+//
+// Known thinking-capable families (as of Claude 4.6 / Haiku 4.5):
+//   - claude-3-7-* (first thinking-capable family)
+//   - claude-{opus,sonnet,haiku}-N-* where N ≥ 4 (4.x and forward)
+//
+// The pattern is intentionally inclusive — future Anthropic releases
+// in the 4.x/5.x/6.x lineages inherit the flag without a code change.
+func (e *ClaudeExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
+	if claudeSupportsThinking(model) {
+		base.SupportsThinking = true
+	}
+	return base
+}
+
+// claudeSupportsThinking returns true for Claude model IDs known to
+// support extended thinking. See OverrideCapabilities for the
+// matched lineages.
+func claudeSupportsThinking(model string) bool {
+	if strings.HasPrefix(model, "claude-3-7-") {
+		return true
+	}
+	for _, family := range []string{"claude-opus-", "claude-sonnet-", "claude-haiku-"} {
+		rest, ok := strings.CutPrefix(model, family)
+		if !ok || rest == "" {
+			continue
+		}
+		// First char of `rest` is the major version digit. Treat
+		// '4'..'9' as thinking-capable; older majors ('0'..'3') and
+		// non-digits as non-thinking. The boundary at '4' matches the
+		// Anthropic versioning convention where extended thinking
+		// became standard in the 4.x family.
+		if rest[0] >= '4' && rest[0] <= '9' {
+			return true
+		}
+	}
+	return false
 }
