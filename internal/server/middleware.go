@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
-	"strings"
 	"time"
 )
 
@@ -62,19 +61,27 @@ func CORSMiddleware(next http.Handler) http.Handler {
 }
 
 // AuthGuardMiddleware protects dashboard API routes with JWT cookie auth.
+//
+// PublicPaths is an exact-match allowlist. Prefix matching here would
+// be dangerous: `/api/auth/` matches `/api/auth/oauth/start` which is a
+// protected endpoint. Callers should list each unauthenticated route
+// individually (e.g. `/api/auth/login`, `/api/auth/check`).
 type AuthGuardMiddleware struct {
 	ValidateToken func(token string) (bool, error)
 	PublicPaths   []string
 }
 
 func (a *AuthGuardMiddleware) Middleware(next http.Handler) http.Handler {
+	publicSet := make(map[string]struct{}, len(a.PublicPaths))
+	for _, p := range a.PublicPaths {
+		publicSet[p] = struct{}{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for public paths
-		for _, p := range a.PublicPaths {
-			if strings.HasPrefix(r.URL.Path, p) {
-				next.ServeHTTP(w, r)
-				return
-			}
+		// Exact-match allowlist. Anything not in the set requires a
+		// valid session cookie.
+		if _, ok := publicSet[r.URL.Path]; ok {
+			next.ServeHTTP(w, r)
+			return
 		}
 
 		// Check cookie

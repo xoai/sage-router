@@ -6,6 +6,9 @@
 package cost
 
 import (
+	"log/slog"
+	"sync"
+
 	"sage-router/pkg/canonical"
 )
 
@@ -25,12 +28,25 @@ func estimateTokens(s string) int {
 // hints where they would reduce cost. This is Stage ⑤b of the pipeline.
 //
 // Currently supports:
-//   - Claude/Anthropic: adds cache_control on system blocks that exceed the
-//     token threshold. Only the last qualifying block gets the hint (Anthropic
-//     requires cache breakpoints to be on the last block in a cacheable prefix).
+//   - Claude/Anthropic (apikey): adds cache_control on system blocks that
+//     exceed the token threshold. Only the last qualifying block gets the
+//     hint (Anthropic requires cache breakpoints on the last block in a
+//     cacheable prefix).
+//   - Claude/Anthropic (subscription): same injection — verified at M2
+//     checkpoint that the subscription endpoints accept the beta header.
+//     If a future Anthropic change breaks this, swap to the Gemini-sub
+//     pattern (skip injection).
+//   - Gemini (subscription): SKIPPED. Gemini's prompt-caching path uses
+//     a separate SetupCache/TeardownCache HTTP call (when implemented)
+//     that bypasses the authTransport. Until that path is wired into
+//     the canonical pipeline, this branch is a no-op forward-compat hook.
 //
 // Returns true if any hints were injected.
-func InjectCacheHints(req *canonical.Request, provider string) bool {
+//
+// authType is the connection's canonical AuthType ("apikey" | "subscription"
+// | "none"). Pass empty string for "don't know / don't care" — used in
+// existing tests that pre-date subscription auth.
+func InjectCacheHints(req *canonical.Request, provider, authType string) bool {
 	if req == nil {
 		return false
 	}
@@ -38,9 +54,40 @@ func InjectCacheHints(req *canonical.Request, provider string) bool {
 	switch provider {
 	case "anthropic":
 		return injectClaudeCacheHints(req)
+	case "gemini":
+		if authType == "subscription" {
+			// Forward-compat: when Gemini caching ships in the canonical
+			// pipeline, we need to skip it for subscription connections
+			// to avoid the SetupCache HTTP bypass issue (spec §M3.2).
+			logCachingDisabled(provider, "gemini-subscription")
+			return false
+		}
+		return false
 	default:
 		return false
 	}
+}
+
+// logCachingDisabled emits a one-time INFO when caching is skipped for a
+// reason worth surfacing to operators. Deduplicated by (provider, reason)
+// so a steady stream of subscription requests doesn't flood logs.
+var (
+	cacheLogMu   sync.Mutex
+	cacheLogSeen = map[string]bool{}
+)
+
+func logCachingDisabled(provider, reason string) {
+	key := provider + ":" + reason
+	cacheLogMu.Lock()
+	defer cacheLogMu.Unlock()
+	if cacheLogSeen[key] {
+		return
+	}
+	cacheLogSeen[key] = true
+	slog.Info("prompt caching disabled",
+		"provider", provider,
+		"reason", reason,
+	)
 }
 
 // injectClaudeCacheHints adds ephemeral cache_control to Claude system blocks.

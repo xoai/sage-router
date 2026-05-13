@@ -1,0 +1,9 @@
+{
+  "tokens": {
+    "access_token": "atk-codex-abc123",
+    "refresh_token": "rtk-codex-xyz789",
+    "id_token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEiLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGguY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC04OCJ9.sig",
+    "expires_at": 9999999999
+  },
+  "OPENAI_API_KEY": "sk-old-key-can-coexist"
+}

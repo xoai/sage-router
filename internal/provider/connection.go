@@ -4,10 +4,22 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"sage-router/internal/auth"
+	"sage-router/internal/auth/providers"
 )
+
+// modelDenylistTTL is how long a connection refuses a model after the
+// upstream returned a model-level rejection (distinct from a rate limit).
+const modelDenylistTTL = 1 * time.Hour
 
 // Connection represents a single configured connection to an upstream provider.
 // All exported methods are safe for concurrent use.
+//
+// Lock-order rule (auto-review M6): c.mu is the only mutex on Connection.
+// Methods that acquire c.mu MUST NOT call into stores or refresh code under
+// the lock — release c.mu before any I/O and reacquire afterward to publish
+// results. A custom go vet analyzer (Task 1.9) enforces this.
 type Connection struct {
 	ID       string
 	Provider string
@@ -23,18 +35,23 @@ type Connection struct {
 	cooldownUntil   time.Time
 	backoffLevel    int
 	lastError       error
+
+	// Subscription-auth additions, ALL guarded by c.mu.
+	cred          *auth.Credential     // decrypted token cache; nil until loaded
+	modelDenylist map[string]time.Time // model → blocked-until after a model-rejection 403
 }
 
 // NewConnection creates a connection in the Idle state.
 func NewConnection(id, provider, name string, priority int, authType string) *Connection {
 	return &Connection{
-		ID:         id,
-		Provider:   provider,
-		Name:       name,
-		Priority:   priority,
-		AuthType:   authType,
-		state:      StateIdle,
-		modelLocks: make(map[string]time.Time),
+		ID:            id,
+		Provider:      provider,
+		Name:          name,
+		Priority:      priority,
+		AuthType:      authType,
+		state:         StateIdle,
+		modelLocks:    make(map[string]time.Time),
+		modelDenylist: make(map[string]time.Time),
 	}
 }
 
@@ -80,9 +97,12 @@ func (c *Connection) LastError() error {
 	return c.lastError
 }
 
-// transition moves the connection to a new state if the transition is valid.
-// Caller must hold c.mu (write lock).
-func (c *Connection) transition(to State) error {
+// transitionLocked moves the connection to a new state if the transition is valid.
+// CALLER MUST HOLD c.mu (write lock). The trailing "Locked" suffix is the lock-
+// discipline convention used elsewhere in the codebase. Errors are
+// errors.Is(ErrTransitionRejected) so callers can distinguish a benign
+// state-machine race from a hard failure.
+func (c *Connection) transitionLocked(to State) error {
 	if !CanTransition(c.state, to) {
 		return &ErrInvalidTransition{From: c.state, To: to}
 	}
@@ -130,7 +150,7 @@ func (c *Connection) MarkUsed() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateActive); err != nil {
+	if err := c.transitionLocked(StateActive); err != nil {
 		return fmt.Errorf("MarkUsed: %w", err)
 	}
 	c.lastUsedAt = time.Now()
@@ -145,7 +165,7 @@ func (c *Connection) MarkRateLimited(model string, backoffLevel int) error {
 	defer c.mu.Unlock()
 
 	// Active → RateLimited
-	if err := c.transition(StateRateLimited); err != nil {
+	if err := c.transitionLocked(StateRateLimited); err != nil {
 		return fmt.Errorf("MarkRateLimited: %w", err)
 	}
 
@@ -167,7 +187,7 @@ func (c *Connection) MarkRateLimited(model string, backoffLevel int) error {
 	}
 
 	// RateLimited → Cooldown (immediate)
-	if err := c.transition(StateCooldown); err != nil {
+	if err := c.transitionLocked(StateCooldown); err != nil {
 		return fmt.Errorf("MarkRateLimited (cooldown): %w", err)
 	}
 
@@ -179,7 +199,7 @@ func (c *Connection) MarkAuthExpired() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateAuthExpired); err != nil {
+	if err := c.transitionLocked(StateAuthExpired); err != nil {
 		return fmt.Errorf("MarkAuthExpired: %w", err)
 	}
 	return nil
@@ -190,7 +210,7 @@ func (c *Connection) MarkRefreshing() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateRefreshing); err != nil {
+	if err := c.transitionLocked(StateRefreshing); err != nil {
 		return fmt.Errorf("MarkRefreshing: %w", err)
 	}
 	return nil
@@ -201,7 +221,7 @@ func (c *Connection) MarkRefreshSuccess() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateActive); err != nil {
+	if err := c.transitionLocked(StateActive); err != nil {
 		return fmt.Errorf("MarkRefreshSuccess: %w", err)
 	}
 	c.backoffLevel = 0
@@ -215,7 +235,7 @@ func (c *Connection) MarkRefreshFailure(err error) error {
 	defer c.mu.Unlock()
 
 	c.lastError = err
-	if terr := c.transition(StateErrored); terr != nil {
+	if terr := c.transitionLocked(StateErrored); terr != nil {
 		return fmt.Errorf("MarkRefreshFailure: %w", terr)
 	}
 	return nil
@@ -227,7 +247,7 @@ func (c *Connection) MarkErrored(err error) error {
 	defer c.mu.Unlock()
 
 	c.lastError = err
-	if terr := c.transition(StateErrored); terr != nil {
+	if terr := c.transitionLocked(StateErrored); terr != nil {
 		return fmt.Errorf("MarkErrored: %w", terr)
 	}
 	return nil
@@ -238,7 +258,7 @@ func (c *Connection) MarkSuccess() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateIdle); err != nil {
+	if err := c.transitionLocked(StateIdle); err != nil {
 		return fmt.Errorf("MarkSuccess: %w", err)
 	}
 	c.backoffLevel = 0
@@ -262,7 +282,7 @@ func (c *Connection) ResetCooldown() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateIdle); err != nil {
+	if err := c.transitionLocked(StateIdle); err != nil {
 		return fmt.Errorf("ResetCooldown: %w", err)
 	}
 	c.backoffLevel = 0
@@ -276,7 +296,7 @@ func (c *Connection) Disable() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateDisabled); err != nil {
+	if err := c.transitionLocked(StateDisabled); err != nil {
 		return fmt.Errorf("Disable: %w", err)
 	}
 	return nil
@@ -287,11 +307,97 @@ func (c *Connection) Enable() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.transition(StateIdle); err != nil {
+	if err := c.transitionLocked(StateIdle); err != nil {
 		return fmt.Errorf("Enable: %w", err)
 	}
 	c.backoffLevel = 0
 	c.cooldownUntil = time.Time{}
 	c.lastError = nil
 	return nil
+}
+
+// ── Subscription-auth additions ──
+
+// cachedCredential returns the in-memory cached credential under RLock,
+// or nil if none is cached. AcquireCredential (M2) uses this on its fast
+// path before considering a refresh.
+func (c *Connection) cachedCredential() *auth.Credential {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cred
+}
+
+// HasCredential reports whether a credential is currently cached. Useful for
+// the dashboard ("subscription connected") indicator and for tests outside
+// this package that need to assert post-Invalidate state without touching
+// the raw token.
+func (c *Connection) HasCredential() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cred != nil
+}
+
+// SetCredentialForTest seeds the in-memory cache. Test-only. Production code
+// populates this via AcquireCredential (M2). The "ForTest" suffix is
+// deliberately ugly so reviewers notice if it leaks into a non-test path.
+func (c *Connection) SetCredentialForTest(cred *auth.Credential) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cred = cred
+}
+
+// InvalidateCredential drops the in-memory token cache. Called on upstream
+// 401/403 so the next request triggers a fresh load + refresh.
+func (c *Connection) InvalidateCredential() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cred = nil
+}
+
+// CanServeModel reports whether this connection can serve the given model
+// right now. Two layered checks:
+//
+//  1. Per-connection runtime denylist (1h TTL after a model-level 403).
+//     This is the "self-healing" half — the connection learns to avoid
+//     models the provider has dropped from this subscription tier.
+//
+//  2. Static subscription allowlist from the provider registry, but ONLY
+//     when AuthType is "subscription". API-key connections aren't
+//     constrained by a subscription tier so the allowlist doesn't apply.
+//
+// An empty model passes through unconditionally — selection paths that
+// don't know the model yet shouldn't be punished.
+func (c *Connection) CanServeModel(model string) bool {
+	if model == "" {
+		return true
+	}
+	c.mu.RLock()
+	until, denied := c.modelDenylist[model]
+	c.mu.RUnlock()
+	if denied && time.Now().Before(until) {
+		return false
+	}
+	if c.AuthType == auth.AuthTypeSubscription {
+		if !providers.SubscriptionAllowed(c.Provider, model) {
+			return false
+		}
+	}
+	return true
+}
+
+// RecordModelRejection adds model to the per-connection denylist for the
+// standard TTL (1h). Called when the upstream returns a model-level 403.
+// Distinct from the rate-limit-driven modelLocks.
+func (c *Connection) RecordModelRejection(model string) {
+	c.addModelDenylistFor(model, modelDenylistTTL)
+}
+
+// addModelDenylistFor is the inner helper that lets tests inject a custom TTL.
+func (c *Connection) addModelDenylistFor(model string, ttl time.Duration) {
+	if model == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.modelDenylist[model] = time.Now().Add(ttl)
 }

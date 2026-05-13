@@ -40,10 +40,14 @@ type ExecuteRequest struct {
 // Credentials carries authentication material for a single upstream connection.
 type Credentials struct {
 	ConnectionID string
-	AuthType     string // "oauth" | "apikey" | "none"
+	AuthType     string // "apikey" | "subscription" | "none" (canonical — see auth.NormalizeAuthType)
 	AccessToken  string
 	RefreshToken string
 	APIKey       string
 	ExpiresAt    time.Time
 	ProviderData map[string]any
+	// ExtraHeaders are provider-specific request headers beyond the standard
+	// Authorization header. The server populates this from auth.Credential.ExtraHeaders().
+	// Currently used by OpenAI subscription for the ChatGPT-Account-ID header.
+	ExtraHeaders map[string]string
 }

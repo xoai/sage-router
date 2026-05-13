@@ -30,8 +30,8 @@ type DeviceCodeResponse struct {
 	Interval        int    `json:"interval"`
 }
 
-// TokenResponse is returned after successful token exchange.
-type TokenResponse struct {
+// DeviceTokenResponse is returned after successful token exchange.
+type DeviceTokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	TokenType    string `json:"token_type"`
@@ -112,7 +112,7 @@ func (a *OpenAIAuth) StartDeviceFlow() (*DeviceCodeResponse, error) {
 
 // PollForToken polls OpenAI's token endpoint until the user completes
 // authorization or the flow expires. Returns the token response.
-func (a *OpenAIAuth) PollForToken(userCode string) (*TokenResponse, error) {
+func (a *OpenAIAuth) PollForToken(userCode string) (*DeviceTokenResponse, error) {
 	a.mu.Lock()
 	flow, ok := a.pending[userCode]
 	a.mu.Unlock()
@@ -155,7 +155,7 @@ func (a *OpenAIAuth) PollForToken(userCode string) (*TokenResponse, error) {
 	}
 }
 
-func (a *OpenAIAuth) exchangeDeviceCode(deviceCode string) (*TokenResponse, error) {
+func (a *OpenAIAuth) exchangeDeviceCode(deviceCode string) (*DeviceTokenResponse, error) {
 	data := url.Values{
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 		"device_code": {deviceCode},
@@ -185,7 +185,7 @@ func (a *OpenAIAuth) exchangeDeviceCode(deviceCode string) (*TokenResponse, erro
 		return nil, fmt.Errorf("token request returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var tokenResp TokenResponse
+	var tokenResp DeviceTokenResponse
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("parse token response: %w", err)
 	}

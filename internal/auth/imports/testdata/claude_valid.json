@@ -1,0 +1,9 @@
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-fixture-access",
+    "refreshToken": "sk-ant-ort01-fixture-refresh",
+    "expiresAt": 9999999999000,
+    "scopes": ["user:inference", "user:profile"],
+    "subscriptionType": "max"
+  }
+}

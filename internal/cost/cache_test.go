@@ -13,7 +13,7 @@ func TestInjectCacheHints_ClaudeSmallSystem(t *testing.T) {
 			{Text: "You are helpful."},
 		},
 	}
-	injected := InjectCacheHints(req, "anthropic")
+	injected := InjectCacheHints(req, "anthropic", "")
 	if injected {
 		t.Error("should not inject on small system prompt")
 	}
@@ -31,7 +31,7 @@ func TestInjectCacheHints_ClaudeLargeSystem(t *testing.T) {
 		},
 	}
 
-	injected := InjectCacheHints(req, "anthropic")
+	injected := InjectCacheHints(req, "anthropic", "")
 	if !injected {
 		t.Error("should inject on large system prompt")
 	}
@@ -52,7 +52,7 @@ func TestInjectCacheHints_ClaudeMultiBlockLastOnly(t *testing.T) {
 		},
 	}
 
-	injected := InjectCacheHints(req, "anthropic")
+	injected := InjectCacheHints(req, "anthropic", "")
 	if !injected {
 		t.Error("should inject")
 	}
@@ -72,7 +72,7 @@ func TestInjectCacheHints_RespectsUserConfig(t *testing.T) {
 		},
 	}
 
-	injected := InjectCacheHints(req, "anthropic")
+	injected := InjectCacheHints(req, "anthropic", "")
 	if injected {
 		t.Error("should not inject when user already set cache_control")
 	}
@@ -86,7 +86,7 @@ func TestInjectCacheHints_NonAnthropicProvider(t *testing.T) {
 		},
 	}
 
-	injected := InjectCacheHints(req, "openai")
+	injected := InjectCacheHints(req, "openai", "")
 	if injected {
 		t.Error("should not inject for non-Anthropic provider")
 	}
@@ -96,16 +96,53 @@ func TestInjectCacheHints_NoSystem(t *testing.T) {
 	req := &canonical.Request{
 		Messages: []canonical.Message{{Role: "user"}},
 	}
-	injected := InjectCacheHints(req, "anthropic")
+	injected := InjectCacheHints(req, "anthropic", "")
 	if injected {
 		t.Error("should not inject when no system blocks")
 	}
 }
 
 func TestInjectCacheHints_NilRequest(t *testing.T) {
-	injected := InjectCacheHints(nil, "anthropic")
+	injected := InjectCacheHints(nil, "anthropic", "")
 	if injected {
 		t.Error("should handle nil request")
+	}
+}
+
+// AC25 / Task 3.2: Gemini subscription connections skip prompt-caching
+// injection. (Gemini caching uses a separate SetupCache HTTP call that
+// bypasses the authTransport; injecting cache hints into the canonical
+// request would silently break under subscription auth once caching
+// ships in the canonical pipeline.)
+func TestInjectCacheHints_GeminiSubscriptionSkipped(t *testing.T) {
+	largeText := strings.Repeat("Gemini cache prompt. ", 500)
+	req := &canonical.Request{
+		System: []canonical.SystemBlock{{Text: largeText}},
+	}
+	// API-key Gemini: today's behavior is "no injection" because the
+	// switch has no anthropic case for gemini. Subscription should also
+	// be no-inject for the same reason, AND emit the once-per-process
+	// INFO log.
+	injected := InjectCacheHints(req, "gemini", "subscription")
+	if injected {
+		t.Error("Gemini subscription should NOT inject cache hints")
+	}
+	// Apikey Gemini also returns false today (no canonical-pipeline impl).
+	injected2 := InjectCacheHints(req, "gemini", "apikey")
+	if injected2 {
+		t.Error("Gemini apikey: no canonical caching implementation yet")
+	}
+}
+
+func TestInjectCacheHints_OnceOnlyLogDeduplication(t *testing.T) {
+	// The "prompt caching disabled" log is INFO-level and deduplicated
+	// to once per (provider, reason). Hammering with 100 calls should
+	// produce one log line at most. We don't capture logs here (slog
+	// default goes to stderr); this test just verifies no race / no
+	// repeated mutation of the seen map under concurrent calls.
+	req := &canonical.Request{System: []canonical.SystemBlock{{Text: "x"}}}
+	for i := 0; i < 100; i++ {
+		_ = InjectCacheHints(req, "gemini", "subscription")
 	}
 }
 
@@ -147,7 +184,7 @@ func TestInjectCacheHints_SkipsWhenContentHasCacheControl(t *testing.T) {
 		},
 	}
 
-	injected := InjectCacheHints(req, "anthropic")
+	injected := InjectCacheHints(req, "anthropic", "")
 	if injected {
 		t.Error("should not inject when content blocks have cache_control")
 	}

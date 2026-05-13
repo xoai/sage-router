@@ -1,6 +1,15 @@
 package provider
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrTransitionRejected is the sentinel returned when a state-machine
+// transition is not allowed. Callers can use errors.Is to distinguish
+// a benign state-machine race (next-connection fallthrough) from a
+// hard failure that should bubble up to the user.
+var ErrTransitionRejected = errors.New("state transition rejected")
 
 // State represents the current lifecycle state of a provider connection.
 type State string
@@ -92,6 +101,8 @@ func CanTransition(from, to State) bool {
 }
 
 // ErrInvalidTransition is returned when a state transition is not allowed.
+// It satisfies errors.Is(ErrTransitionRejected) so callers don't have to
+// type-assert.
 type ErrInvalidTransition struct {
 	From State
 	To   State
@@ -99,6 +110,10 @@ type ErrInvalidTransition struct {
 
 func (e *ErrInvalidTransition) Error() string {
 	return fmt.Sprintf("invalid state transition: %s -> %s", e.From, e.To)
+}
+
+func (e *ErrInvalidTransition) Is(target error) bool {
+	return target == ErrTransitionRejected
 }
 
 // statePriority returns a sort key used during provider selection.

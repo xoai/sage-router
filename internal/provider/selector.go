@@ -127,7 +127,11 @@ func (s *Selector) Select(provider, model string, excludeIDs []string) (*SelectR
 			continue
 		}
 
-		if c.IsAvailable(model) {
+		// IsAvailable: state-machine + rate-limit lock for this model.
+		// CanServeModel: auth-context allowlist (subscription tier) +
+		// per-model denylist from prior model-rejection 403s. Both must
+		// be true for a connection to serve this request.
+		if c.IsAvailable(model) && c.CanServeModel(model) {
 			candidates = append(candidates, c)
 			continue
 		}
@@ -191,4 +195,22 @@ func (s *Selector) ConnectionByID(id string) *Connection {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.byID[id]
+}
+
+// SnapshotAll returns every registered connection across every provider
+// as a single flat slice. Used by the refresh loop to enumerate
+// candidates without needing to know which providers are in play.
+// The returned slice is a snapshot; mutations to it don't affect the
+// selector.
+func (s *Selector) SnapshotAll() []*Connection {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.byID) == 0 {
+		return nil
+	}
+	out := make([]*Connection, 0, len(s.byID))
+	for _, c := range s.byID {
+		out = append(out, c)
+	}
+	return out
 }

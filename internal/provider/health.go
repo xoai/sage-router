@@ -78,7 +78,7 @@ func (h *HealthChecker) checkConnection(c *Connection, now time.Time) {
 	case StateCooldown:
 		// If cooldown has expired, transition back to Idle.
 		if !c.cooldownUntil.IsZero() && now.After(c.cooldownUntil) {
-			if err := c.transition(StateIdle); err == nil {
+			if err := c.transitionLocked(StateIdle); err == nil {
 				c.cooldownUntil = time.Time{}
 				slog.Info("health: cooldown expired, connection restored",
 					"connection", c.ID, "provider", c.Provider)
@@ -89,7 +89,7 @@ func (h *HealthChecker) checkConnection(c *Connection, now time.Time) {
 		// Auto-recover errored connections after a grace period (5 minutes).
 		grace := 5 * time.Minute
 		if !c.lastUsedAt.IsZero() && now.Sub(c.lastUsedAt) > grace {
-			if err := c.transition(StateIdle); err == nil {
+			if err := c.transitionLocked(StateIdle); err == nil {
 				c.backoffLevel = 0
 				c.lastError = nil
 				slog.Info("health: errored connection auto-recovered",

@@ -13,6 +13,7 @@ import { ConnectPage } from './pages/connect';
 import { RoutingPage } from './pages/routing';
 import { LoginPage } from './pages/login';
 import { SetupPage } from './pages/setup';
+import { OAuthCompletePage } from './pages/oauth-complete';
 import { authCheck, tokenLogin } from './api/client';
 
 // Auth states: 'loading' | 'login' | 'setup' | 'ready'
@@ -51,6 +52,7 @@ function Dashboard() {
         <Route path="/routing" component={RoutingPage} />
         <Route path="/settings" component={SettingsPage} />
         <Route path="/connect" component={ConnectPage} />
+        <Route path="/oauth-complete" component={OAuthCompletePage} />
       </main>
       <ToastContainer />
       <CommandPalette onNavigate={setLocation} />

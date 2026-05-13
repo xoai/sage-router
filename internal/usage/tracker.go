@@ -31,6 +31,11 @@ type Entry struct {
 	Strategy      string // "fast", "cheap", "best", "balanced", "manual"
 	RoutingReason string // "session_affinity", "strategy_sort", "manual"
 	AffinityHit   bool
+
+	// CostSource: "apikey" (default) or "subscription". Set by the
+	// caller based on the connection's AuthType. Subscription rows have
+	// Cost=0; the dashboard computes "savings" against current pricing.
+	CostSource string
 }
 
 // Tracker batches usage entries and periodically flushes to the store.
@@ -137,6 +142,7 @@ func (t *Tracker) writeEntry(entry *Entry) {
 		CacheReadTokens:  entry.CacheReadTokens,
 		CacheWriteTokens: entry.CacheWriteTokens,
 		Cost:             entry.Cost,
+		CostSource:       entry.CostSource,
 		Latency:          entry.Latency,
 		Status:           entry.Status,
 		CreatedAt:        entry.CreatedAt,

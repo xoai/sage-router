@@ -1,0 +1,8 @@
+{
+  "access_token": "ya29.fixture-gemini-access",
+  "refresh_token": "1//fixture-gemini-refresh",
+  "scope": "https://www.googleapis.com/auth/generative-language.tuning",
+  "token_type": "Bearer",
+  "id_token": "ignored",
+  "expiry_date": 9999999999000
+}

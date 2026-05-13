@@ -1,0 +1,8 @@
+{
+  "tokens": {
+    "github.com": {
+      "oauth_token": "ghp_fixture_copilot_token_xyz",
+      "user": "fixture-user"
+    }
+  }
+}
