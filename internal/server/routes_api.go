@@ -235,7 +235,14 @@ func (s *Server) handleCreateConnection(w http.ResponseWriter, r *http.Request) 
 	conn.CreatedAt = time.Now()
 	conn.UpdatedAt = time.Now()
 
-	// For auto_detect connections, read credentials from disk now
+	// For auto_detect connections, read credentials from disk now and
+	// convert to a standard subscription connection (encrypted token
+	// storage + refresh-loop rotation from then on). The auto_detect
+	// auth_type is a transient signal from the frontend: "please read
+	// my CLI's auth file instead of asking me for tokens." It never
+	// persists to the DB — the conversion below changes auth_type to
+	// AuthTypeSubscription so the rest of the system treats the row
+	// like any other imported subscription.
 	if conn.AuthType == "auto_detect" && conn.Provider == "anthropic" {
 		result, creds := detect.DetectClaude()
 		if !result.Found || creds == nil {
@@ -249,6 +256,24 @@ func (s *Server) handleCreateConnection(w http.ResponseWriter, r *http.Request) 
 		conn.AccessToken = creds.AccessToken
 		conn.RefreshToken = creds.RefreshToken
 		conn.AuthType = auth.AuthTypeSubscription // canonical: we now have a real OAuth token
+	} else if conn.AuthType == "auto_detect" && conn.Provider == "openai" {
+		// Parallel arm for Codex CLI auto-detect (initiative
+		// 20260513-openai-autodetect). Mirrors the anthropic arm
+		// byte-for-byte in shape; only the detect source + error
+		// messages differ. Adding a third provider in the future
+		// remains additive at this block.
+		result, creds := detect.DetectCodex()
+		if !result.Found || creds == nil {
+			writeError(w, http.StatusBadRequest, "Codex CLI credentials not found on this machine")
+			return
+		}
+		if result.Expired {
+			writeError(w, http.StatusBadRequest, "Codex CLI credentials are expired — restart Codex CLI to refresh")
+			return
+		}
+		conn.AccessToken = creds.AccessToken
+		conn.RefreshToken = creds.RefreshToken
+		conn.AuthType = auth.AuthTypeSubscription
 	}
 
 	if err := s.deps.Store.CreateConnection(&conn); err != nil {
@@ -1444,6 +1469,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDetectClaude(w http.ResponseWriter, r *http.Request) {
 	result, _ := detect.DetectClaude()
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleDetectCodex is the OpenAI/Codex CLI sibling of handleDetectClaude
+// (initiative 20260513-openai-autodetect). Probes the local filesystem
+// for `~/.codex/auth.json` and returns a safe `{found, subscription_type,
+// expired}` shape — never exposes raw tokens. The dashboard's
+// `detectCodex()` API wrapper calls this at Add-Provider-modal mount
+// time to decide whether to render the "Codex CLI detected" auto-detect
+// card.
+func (s *Server) handleDetectCodex(w http.ResponseWriter, r *http.Request) {
+	result, _ := detect.DetectCodex()
 	writeJSON(w, http.StatusOK, result)
 }
 

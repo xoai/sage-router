@@ -190,6 +190,7 @@ func (s *Server) setupRoutes() {
 
 	s.mux.Handle("GET /api/status", protect(s.handleStatus))
 	s.mux.Handle("GET /api/detect/claude", protect(s.handleDetectClaude))
+	s.mux.Handle("GET /api/detect/codex", protect(s.handleDetectCodex))
 
 	// Legacy OpenAI OAuth device-code flow — deprecated in M2.8 (returns
 	// 410 Gone with a pointer at the replacement). Final removal in M3.7

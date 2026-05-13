@@ -5,7 +5,7 @@ import {
   importSubscription,
   TOS_GATE_STATUS,
 } from '../api/oauth';
-import { createConnection, detectClaude, getConnections } from '../api/client';
+import { createConnection, detectClaude, detectCodex, getConnections } from '../api/client';
 import { addToast } from './toast';
 import { TosModal } from './tos-modal';
 
@@ -35,6 +35,13 @@ const apiKey = signal('');
 const importPath = signal('');
 const claudeDetect = signal(null);
 const claudeDisclosure = signal(false);
+// Codex CLI auto-detect parallels Claude's. The duplicated card needs
+// its OWN checkbox-state signal so the two cards' disclosure states
+// don't bleed into each other (a user who acknowledges Claude's
+// disclosure shouldn't have OpenAI's checkbox pre-checked, and vice
+// versa). Initiative 20260513-openai-autodetect.
+const codexDetect = signal(null);
+const codexDisclosure = signal(false);
 const oauthHealth = signal({ openai: 'available', anthropic: 'available' });
 const flowState = signal(null);   // { state, authorize_url, status, conn_id, error }
 const tosPrompt = signal(null);   // { message, retry: fn() }
@@ -70,6 +77,8 @@ function resetState() {
   importPath.value = '';
   claudeDetect.value = null;
   claudeDisclosure.value = false;
+  codexDetect.value = null;
+  codexDisclosure.value = false;
   flowState.value = null;
   tosPrompt.value = null;
   pendingAction.value = false;
@@ -190,6 +199,27 @@ function doApiKey(canonicalProvider) {
   }).then(() => {
     pendingAction.value = false;
     addToast('Provider added', 'success');
+    window.dispatchEvent(new CustomEvent('sage:connection-added'));
+  }).catch(err => {
+    pendingAction.value = false;
+    addToast('Failed: ' + err.message, 'error');
+  });
+}
+
+// doCodexAutoDetect — OpenAI parallel of doClaudeAutoDetect. Initiative
+// 20260513-openai-autodetect. Backend at routes_api.go:252-272 reads
+// `~/.codex/auth.json`, populates tokens, and converts auth_type to
+// subscription so this row behaves like an imported subscription
+// from then on (refresh-loop handles token rotation).
+function doCodexAutoDetect() {
+  pendingAction.value = true;
+  createConnection({
+    provider: 'openai',
+    name: 'Codex CLI',  // HARDCODED per spec; Label input is ignored, matches Claude's 'Claude Code'.
+    auth_type: 'auto_detect',
+  }).then(() => {
+    pendingAction.value = false;
+    addToast('Codex CLI connected', 'success');
     window.dispatchEvent(new CustomEvent('sage:connection-added'));
   }).catch(err => {
     pendingAction.value = false;
@@ -349,14 +379,36 @@ function FlowPending({ state }) {
 export function ConnectionAddModal({ onClose, onAdded }) {
   useEffect(() => {
     startHealthPoll();
-    // Pull Claude auto-detect status alongside connection list (used to
-    // decide whether to show the auto-detect card).
-    Promise.all([detectClaude(), getConnections()]).then(([detect, conns]) => {
-      const alreadyConnected = Array.isArray(conns) && conns.some(
+    // Pull auto-detect status for both Claude and Codex CLI alongside
+    // the connection list. Detection fires ONCE at modal mount via
+    // this Promise.all — visibility per provider is then a pure
+    // dropdown-gate (no re-fetch on dropdown change).
+    //
+    // _alreadyConnected guards against showing the auto-detect card
+    // when an existing auto_detect-typed connection already exists for
+    // the same provider. Currently vacuous: the backend converts
+    // auth_type=auto_detect to auth_type=subscription at create time
+    // (routes_api.go:251,272), so no row ever persists as auto_detect.
+    // We keep the keying parallel to the Claude pattern for forward
+    // compatibility AND to preserve AC-AD-6b's coexistence semantics:
+    // a user with an imported subscription connection + Codex CLI
+    // installed locally SHOULD still see the auto-detect card.
+    // Suppression is keyed on auth_type=auto_detect specifically —
+    // NOT "any openai/anthropic connection exists" — so this stays
+    // correct if the backend ever stops the create-time conversion.
+    Promise.all([detectClaude(), detectCodex(), getConnections()]).then(([detectClaude_, detectCodex_, conns]) => {
+      const claudeAlready = Array.isArray(conns) && conns.some(
         c => c.provider === 'anthropic' && c.auth_type === 'auto_detect'
       );
-      claudeDetect.value = { ...detect, _alreadyConnected: alreadyConnected };
-    }).catch(() => { claudeDetect.value = { found: false }; });
+      const codexAlready = Array.isArray(conns) && conns.some(
+        c => c.provider === 'openai' && c.auth_type === 'auto_detect'
+      );
+      claudeDetect.value = { ...detectClaude_, _alreadyConnected: claudeAlready };
+      codexDetect.value = { ...detectCodex_, _alreadyConnected: codexAlready };
+    }).catch(() => {
+      claudeDetect.value = { found: false };
+      codexDetect.value = { found: false };
+    });
 
     const onAdd = () => {
       if (onAdded) onAdded();
@@ -378,6 +430,9 @@ export function ConnectionAddModal({ onClose, onAdded }) {
   const showAutoDetect = canonical === 'anthropic'
     && claudeDetect.value?.found
     && !claudeDetect.value._alreadyConnected;
+  const showCodexAutoDetect = canonical === 'openai'
+    && codexDetect.value?.found
+    && !codexDetect.value._alreadyConnected;
 
   return (
     <>
@@ -508,10 +563,63 @@ export function ConnectionAddModal({ onClose, onAdded }) {
             </div>
           )}
 
+          {/* Codex CLI auto-detect — initiative 20260513-openai-autodetect.
+              Parallel to the Claude card above. Codex's auth.json has no
+              tier field today so the badge usually doesn't render. */}
+          {showCodexAutoDetect && (
+            <div style={{
+              marginBottom: 'var(--space-md)', padding: 'var(--space-md)',
+              background: 'var(--bg-2)', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <span style={{ color: 'var(--status-green)', fontSize: 14 }}>&#10003;</span>
+                <span style={{ fontSize: 13, fontWeight: 500 }}>Codex CLI detected</span>
+                {codexDetect.value.subscription_type && (
+                  <span style={{
+                    fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)',
+                    background: 'var(--bg-3)', padding: '2px 6px', borderRadius: 'var(--radius-sm)',
+                  }}>
+                    {codexDetect.value.subscription_type}
+                  </span>
+                )}
+              </div>
+              <label style={{
+                display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 11,
+                color: 'var(--text-secondary)', cursor: 'pointer', lineHeight: 1.4,
+              }}>
+                <input
+                  type="checkbox"
+                  checked={codexDisclosure.value}
+                  onChange={e => { codexDisclosure.value = e.target.checked; }}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  I understand this uses Codex CLI credentials. OpenAI's TOS restricts OAuth
+                  tokens to Codex CLI and ChatGPT. OpenAI does not officially support this.
+                </span>
+              </label>
+              <button
+                disabled={!codexDisclosure.value || pendingAction.value}
+                onClick={doCodexAutoDetect}
+                style={{
+                  width: '100%', marginTop: 'var(--space-md)', padding: '6px 14px',
+                  fontSize: 12, fontWeight: 500, color: 'var(--text-primary)',
+                  background: codexDisclosure.value ? 'var(--accent)' : 'var(--bg-3)',
+                  borderRadius: 'var(--radius-md)',
+                  cursor: codexDisclosure.value ? 'pointer' : 'not-allowed',
+                  opacity: codexDisclosure.value ? 1 : 0.5,
+                }}
+              >
+                Connect with Codex CLI (auto-detect)
+              </button>
+            </div>
+          )}
+
           {/* API key fallback */}
           {showApiKey && !flowState.value && (
             <>
-              {(showPkce || showImport || showAutoDetect) && (
+              {(showPkce || showImport || showAutoDetect || showCodexAutoDetect) && (
                 <div style={{
                   fontSize: 11, color: 'var(--text-tertiary)', textAlign: 'center',
                   margin: 'var(--space-md) 0',

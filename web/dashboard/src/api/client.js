@@ -182,6 +182,15 @@ export function detectClaude() {
   return request('/detect/claude');
 }
 
+// Codex CLI credential detection — OpenAI parallel of detectClaude.
+// Returns {found, subscription_type, expired}. The dashboard's
+// connection-add-modal uses this to render the "Codex CLI detected"
+// auto-detect card when the user selects OpenAI in the provider
+// dropdown. Initiative 20260513-openai-autodetect.
+export function detectCodex() {
+  return request('/detect/codex');
+}
+
 // Providers & Models (catalog)
 export function getProviders() {
   return request('/providers');

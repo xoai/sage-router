@@ -63,8 +63,10 @@ func claudeCredPaths() []string {
 			userProfile = home
 		}
 		if userProfile != "" {
-			// Try common WSL user home paths via \\wsl$
-			for _, distro := range []string{"Ubuntu", "Ubuntu-22.04", "Ubuntu-24.04", "Debian", "kali-linux"} {
+			// Try common WSL user home paths via \\wsl$. Distro list
+			// shared with codex.go via `wslDistros` in wsl.go; tests can
+			// clear it via `DisableWSLForTesting`.
+			for _, distro := range wslDistros {
 				wslPath := filepath.Join(`\\wsl$`, distro, "home")
 				entries, err := os.ReadDir(wslPath)
 				if err == nil {
