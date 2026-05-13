@@ -30,12 +30,12 @@ func TestWireCatalog_SeedsCatalogOnEmptyDB(t *testing.T) {
 	st := freshDB(t)
 	ctx := context.Background()
 
-	reg, err := wireCatalog(ctx, st.DB())
+	wiring, err := wireCatalog(ctx, st.DB())
 	if err != nil {
 		t.Fatalf("wireCatalog: %v", err)
 	}
-	if reg == nil {
-		t.Fatal("wireCatalog returned nil registry")
+	if wiring == nil {
+		t.Fatal("wireCatalog returned nil *CatalogWiring")
 	}
 
 	// Verify catalog_models populated.

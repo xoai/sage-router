@@ -30,27 +30,53 @@ function groupByProvider(connections) {
   return Object.values(map);
 }
 
+// loadAll fetches providerMeta and connections in parallel so the
+// page renders both surfaces in one paint instead of letting the
+// badges pop in ~100ms after the cards (carryover #28). Previously
+// loadConnections and loadProviderMeta were called sequentially; the
+// providerMeta fetch was the slower of the two, and ProviderCard
+// rendered the cards before the discovery-state badges had data.
+function loadAll() {
+  Promise.all([
+    getConnections().catch(err => {
+      // Surface non-silent errors per loadProviderMeta's policy.
+      // Silent (401) errors are handled by the sage:unauthorized
+      // navigation; an extra toast flashes before the redirect.
+      if (!err.silent) {
+        addToast('Failed to load connections: ' + err.message, 'error');
+      }
+      return null;
+    }),
+    getProviders().catch(err => {
+      if (!err.silent) {
+        addToast('Failed to load provider meta: ' + err.message, 'error');
+      }
+      return null;
+    }),
+  ]).then(([connections, meta]) => {
+    if (Array.isArray(connections)) {
+      providers.value = groupByProvider(connections);
+    }
+    if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+      providerMeta.value = meta;
+    }
+  });
+}
+
+// loadConnections refreshes connections only, after a per-card
+// mutation (delete, re-auth, etc.). The providerMeta surface lags
+// the connection set by at most one full page reload — it doesn't
+// re-fetch here because nothing in ProviderCard's mutation surface
+// changes the discovery state.
 function loadConnections() {
   getConnections().then(data => {
     if (Array.isArray(data)) {
       providers.value = groupByProvider(data);
     }
   }).catch(err => {
-    // M2.12 review MINOR-4: surface errors instead of swallowing.
-    // Matches loadProviderMeta's policy below.
+    if (err.silent) return;
     addToast('Failed to load connections: ' + err.message, 'error');
   });
-}
-
-function loadProviderMeta() {
-  // /api/providers returns a map keyed by provider id (config.KnownProviders
-  // shape, enriched with discovery state). Store as-is for O(1) lookup
-  // by ProviderCard.
-  getProviders().then(data => {
-    if (data && typeof data === 'object' && !Array.isArray(data)) {
-      providerMeta.value = data;
-    }
-  }).catch(err => addToast('Failed to load provider meta: ' + err.message, 'error'));
 }
 
 function ProviderCard({ provider, meta, onChanged }) {
@@ -152,8 +178,7 @@ function ProviderCard({ provider, meta, onChanged }) {
 
 export function ProvidersPage() {
   useEffect(() => {
-    loadConnections();
-    loadProviderMeta();
+    loadAll();
   }, []);
 
   return (

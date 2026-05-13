@@ -111,10 +111,11 @@ type recomputeBody struct {
 
 // recomputeResponse is the response shape from /api/catalog/recompute.
 type recomputeResponse struct {
-	RowsInspected    int     `json:"rows_inspected"`
-	RowsUpdated      int     `json:"rows_updated"`
-	TotalCostDelta   float64 `json:"total_cost_delta_usd"`
-	SubscriptionNote string  `json:"subscription_note"`
+	RowsInspected           int     `json:"rows_inspected"`
+	RowsUpdated             int     `json:"rows_updated"`
+	RowsSkippedUnknownModel int     `json:"rows_skipped_unknown_model"`
+	TotalCostDelta          float64 `json:"total_cost_delta_usd"`
+	SubscriptionNote        string  `json:"subscription_note"`
 }
 
 // callRecompute issues the POST and returns the decoded response.
@@ -359,6 +360,97 @@ func TestRecompute_NoStaleRowsNoOp(t *testing.T) {
 	}
 	if resp.RowsInspected != 2 {
 		t.Errorf("rows_inspected = %d, want 2 (still inspects, doesn't write)", resp.RowsInspected)
+	}
+}
+
+// TestRecompute_SkipsUnknownModelToPreserveHistoricalCost — M3.1
+// review MINOR-6. When a usage_log row references a (provider, model)
+// that no longer exists in the catalog (e.g., a deprecated model was
+// purged by discovery), EstimateCost returns 0 for the lookup. Blindly
+// writing that 0 over a real historical cost is silent data loss; the
+// recompute must skip such rows and surface the count so operators
+// can investigate the catalog drift before re-running.
+func TestRecompute_SkipsUnknownModelToPreserveHistoricalCost(t *testing.T) {
+	srv, db := newRecomputeTestServer(t)
+	now := time.Now().UTC()
+	from := now.Add(-1 * time.Hour)
+	to := now.Add(1 * time.Hour)
+
+	// A row for a model that the catalog DOES know — recompute should
+	// rewrite its stale cost normally.
+	seedRecomputeUsage(t, db, "u1-known", store.UsageEntry{
+		Provider:     "anthropic",
+		Model:        "claude-sonnet-4-6",
+		InputTokens:  1000,
+		OutputTokens: 500,
+		Cost:         99.99,
+		CostSource:   "apikey",
+	})
+	// A row for a model that the catalog does NOT know (purged or never
+	// seeded). EstimateCost returns 0; recompute must skip rather than
+	// zero out the historical cost.
+	const purgedCost = 7.5
+	seedRecomputeUsage(t, db, "u2-purged", store.UsageEntry{
+		Provider:     "anthropic",
+		Model:        "claude-removed-model-9-9",
+		InputTokens:  1000,
+		OutputTokens: 500,
+		Cost:         purgedCost,
+		CostSource:   "apikey",
+	})
+
+	rec, resp := callRecompute(t, srv, recomputeBody{
+		From: from.Format(time.RFC3339),
+		To:   to.Format(time.RFC3339),
+	}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if resp.RowsInspected != 2 {
+		t.Errorf("rows_inspected = %d, want 2 (both apikey rows in window)", resp.RowsInspected)
+	}
+	if resp.RowsUpdated != 1 {
+		t.Errorf("rows_updated = %d, want 1 (only the known-model row updated)", resp.RowsUpdated)
+	}
+	if resp.RowsSkippedUnknownModel != 1 {
+		t.Errorf("rows_skipped_unknown_model = %d, want 1 (claude-removed-model-9-9 row preserved)",
+			resp.RowsSkippedUnknownModel)
+	}
+
+	// Critical assertion: the historical cost on the purged-model row
+	// is preserved, not zeroed.
+	entries, err := db.ListUsageInRange(context.Background(), from, to, "apikey")
+	if err != nil {
+		t.Fatalf("ListUsageInRange: %v", err)
+	}
+	for _, e := range entries {
+		if e.ID == "u2-purged" && e.Cost != purgedCost {
+			t.Errorf("u2-purged: cost = %g after recompute, want %g (recompute must preserve historical cost for purged models)",
+				e.Cost, purgedCost)
+		}
+	}
+}
+
+// TestRecompute_RejectsRangeOver365Days — M3.1 review MINOR-3. The
+// in-memory []UsageEntry returned by ListUsageInRange is unbounded for
+// an open-ended date range. Cap at 365 days and return 400 to prevent
+// an operator from accidentally scanning a multi-year window.
+func TestRecompute_RejectsRangeOver365Days(t *testing.T) {
+	srv, _ := newRecomputeTestServer(t)
+
+	// 366 days — just past the cap.
+	from := time.Now().UTC().Add(-366 * 24 * time.Hour)
+	to := time.Now().UTC()
+
+	rec, _ := callRecompute(t, srv, recomputeBody{
+		From: from.Format(time.RFC3339),
+		To:   to.Format(time.RFC3339),
+	}, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (range exceeds 365 days); body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "365 days") {
+		t.Errorf("response body missing '365 days' explanation; got: %s", rec.Body.String())
 	}
 }
 

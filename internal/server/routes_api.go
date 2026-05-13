@@ -880,6 +880,12 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 		}
 		out[id] = entry
 	}
+	// encoding/json serialises maps with sorted keys (Go ≥1.12), so the
+	// /api/providers payload is deterministic across calls without an
+	// explicit ordering step. Dashboard consumers and snapshot-style
+	// tests can rely on stable key order. If the serialisation library
+	// ever changes, this convention should be promoted to an explicit
+	// sort before writeJSON.
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -1004,7 +1010,8 @@ func (s *Server) handleGetCatalogModels(w http.ResponseWriter, r *http.Request) 
 	// the REST list-filter convention — "filtered to a set with no
 	// matches" is a valid query result, not a missing resource. The
 	// route is /api/catalog/models[/{provider}]; both shapes return
-	// a JSON array (possibly empty).
+	// a JSON array (possibly empty). Cross-ref: ADR-1 §JSON shape
+	// contracts pins the empty-array-not-404 rule for all list endpoints.
 	if s.deps.Catalog == nil {
 		writeJSON(w, http.StatusOK, []catalogModelView{})
 		return
@@ -1259,11 +1266,23 @@ type recomputeReq struct {
 	DryRun bool   `json:"dry_run"` // preview without persisting
 }
 
+// recomputeResp is the JSON response from POST /api/catalog/recompute.
+//
+// TotalCostDelta semantics under concurrency: this value is advisory
+// when concurrent recompute calls overlap the same time range. Both
+// callers compute newCost from the same Catalog snapshot, so the final
+// row.cost is identical regardless of order (benign last-write-wins),
+// but each response double-counts its own delta. Operators inspecting
+// the delta after concurrent overlap should treat it as "this caller's
+// contribution to convergence", not a global tally. The serialised
+// post-recompute state is authoritative; query usage_log for the
+// definitive cost view.
 type recomputeResp struct {
-	RowsInspected    int     `json:"rows_inspected"`
-	RowsUpdated      int     `json:"rows_updated"`
-	TotalCostDelta   float64 `json:"total_cost_delta_usd"`
-	SubscriptionNote string  `json:"subscription_note"`
+	RowsInspected           int     `json:"rows_inspected"`
+	RowsUpdated             int     `json:"rows_updated"`
+	RowsSkippedUnknownModel int     `json:"rows_skipped_unknown_model"`
+	TotalCostDelta          float64 `json:"total_cost_delta_usd"`
+	SubscriptionNote        string  `json:"subscription_note"`
 }
 
 // parseRecomputeTime accepts RFC3339 (the dashboard's likely format)
@@ -1288,6 +1307,24 @@ func parseRecomputeTime(s string, isUpperBound bool) (time.Time, error) {
 	}
 	return time.Time{}, fmt.Errorf("invalid time %q (want RFC3339 or YYYY-MM-DD)", s)
 }
+
+// recomputeMaxRangeDays caps the date span a single recompute request
+// may scan. ListUsageInRange issues one bounded SELECT so the SQL side
+// is not a runaway, but the in-memory []UsageEntry returned to the
+// handler is unbounded for an open-ended range. 365 days is well past
+// any operational use case while keeping the worst-case allocation
+// bounded by typical retention windows.
+const recomputeMaxRangeDays = 365
+
+// recomputeCostEpsilon defines the threshold below which a recompute
+// is treated as a no-op short-circuit. Floating-point equality on
+// EstimateCost output would treat ULP-different reconvergences (e.g.,
+// a rounding drift after a price-table edit) as updates, inflating
+// rows_updated and total_cost_delta_usd by ~1e-15 each. 1e-9 USD
+// (= 1 picoUSD) is many orders of magnitude below any plausible
+// billable cost and matches the epsilon already used by the M3
+// integration tests for pricing assertions.
+const recomputeCostEpsilon = 1e-9
 
 func (s *Server) handleRecompute(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Store == nil || s.deps.Catalog == nil {
@@ -1314,6 +1351,11 @@ func (s *Server) handleRecompute(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "from must be before to")
 		return
 	}
+	if to.Sub(from) > recomputeMaxRangeDays*24*time.Hour {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("recompute date range cannot exceed %d days", recomputeMaxRangeDays))
+		return
+	}
 
 	// Only apikey rows are recomputed (ADR-3 §Part F). Subscription
 	// cost is structurally 0 and savings are query-time computed.
@@ -1325,6 +1367,7 @@ func (s *Server) handleRecompute(w http.ResponseWriter, r *http.Request) {
 
 	const subscriptionNote = "subscription_savings auto-reflects current pricing at next /api/usage/summary read"
 	var updated int
+	var skippedUnknownModel int
 	var delta float64
 	for _, row := range rows {
 		// Thinking tokens aren't stored separately in usage_log
@@ -1340,7 +1383,16 @@ func (s *Server) handleRecompute(w http.ResponseWriter, r *http.Request) {
 			Thinking:     0,
 		}
 		newCost := s.deps.Catalog.EstimateCost(row.Provider, row.Model, breakdown)
-		if newCost == row.Cost {
+		// Preserve historical cost when the catalog no longer knows the
+		// model. EstimateCost returns 0 for purged (provider, model)
+		// pairs (e.g., a model removed by discovery); blindly writing
+		// that 0 over a real historical cost is silent data loss. Surface
+		// the count so operators can investigate the catalog drift.
+		if newCost == 0 && row.Cost > 0 {
+			skippedUnknownModel++
+			continue
+		}
+		if math.Abs(newCost-row.Cost) < recomputeCostEpsilon {
 			continue
 		}
 		if !req.DryRun {
@@ -1355,10 +1407,11 @@ func (s *Server) handleRecompute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, recomputeResp{
-		RowsInspected:    len(rows),
-		RowsUpdated:      updated,
-		TotalCostDelta:   delta,
-		SubscriptionNote: subscriptionNote,
+		RowsInspected:           len(rows),
+		RowsUpdated:             updated,
+		RowsSkippedUnknownModel: skippedUnknownModel,
+		TotalCostDelta:          delta,
+		SubscriptionNote:        subscriptionNote,
 	})
 }
 

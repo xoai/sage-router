@@ -45,6 +45,17 @@ type DiscoveryResult struct {
 // reports zero count, no error, and ProviderMeta is left alone.
 // This prevents the 24h ticker from flooding last_discovery_error
 // with a permanent state.
+//
+// Construction invariant: callers MUST use NewDiscoveryRunner.
+// A bare struct literal (`&DiscoveryRunner{Store: s, Listers: ls}`)
+// leaves Clock nil and panics at the first `d.Clock()` call inside
+// TryDiscoverOnNotFound or DiscoverProvider. recentlyDiscovered is
+// lazy-initialized at write time so the map field tolerates the
+// zero value, but Clock has no lazy default — the constructor is
+// the only safe path. Defense-in-depth nil-checks for Clock are
+// intentionally NOT added here; the panic surfaces the wiring bug
+// loudly at first use, which is the better failure mode than
+// silently substituting time.Now and hiding the misconstruction.
 type DiscoveryRunner struct {
 	Store   Store
 	Listers map[string]ModelLister
@@ -60,7 +71,20 @@ type DiscoveryRunner struct {
 	// recentlyDiscovered tracks per-provider timestamps of the most
 	// recent on-404 trigger (M2.7). Used by TryDiscoverOnNotFound to
 	// suppress repeated lister calls within onNotFoundDebounce.
-	// Guarded by mu. Never accessed while a Store call is in flight.
+	//
+	// Lock-order discipline (mirrors ADR-1 §Lock-order discipline for
+	// Registry.mu):
+	//   - mu guards recentlyDiscovered only.
+	//   - NEVER hold mu while calling Store, ShouldRunForProvider, or
+	//     any other method that may perform I/O. Acquire, mutate or
+	//     read the map, release; then make the Store call.
+	//   - TryDiscoverOnNotFound is the canonical pattern: Lock,
+	//     check/update the debounce map, Unlock, then call into the
+	//     Store and DiscoverProvider. The debounce stamp at the tail
+	//     of the function takes mu a second time after the Store
+	//     calls return.
+	// Re-entrant Store calls under mu would deadlock against an
+	// Invalidate that takes a write lock during a debounce read.
 	mu                 sync.Mutex
 	recentlyDiscovered map[string]time.Time
 }
@@ -277,8 +301,15 @@ func (d *DiscoveryRunner) TryDiscoverOnNotFound(ctx context.Context, provider st
 	}
 	// Missing meta row → fail-closed skip. Bootstrap seeds meta rows
 	// for every KnownProvider, so a nil result indicates a wiring
-	// gap, not a runtime expected condition.
+	// gap, not a runtime expected condition. Surface the wiring gap
+	// via slog.Warn — silent skips obscure the fact that on-404
+	// discovery is not running at all for this provider; operators
+	// would otherwise discover it only by absence-of-discovery, which
+	// reads as "everything is fine" until a separate signal contradicts.
 	if meta == nil {
+		slog.Warn("on-404 discovery skipped: no ProviderMeta row",
+			"provider", provider,
+			"hint", "bootstrap seeds meta rows for every KnownProvider; nil indicates wiring gap or post-bootstrap deletion")
 		return DiscoveryResult{Provider: provider, Skipped: true}
 	}
 	if !d.ShouldRunForProvider(*meta, now) {

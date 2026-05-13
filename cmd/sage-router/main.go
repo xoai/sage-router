@@ -234,7 +234,26 @@ func main() {
 	// every 24h thereafter. Failures are logged + non-fatal — the
 	// catalog falls back to whatever rows already exist (seed +
 	// per-provider discovery).
-	if v, err := db.GetSetting("openrouter_refresh_enabled"); err == nil && v == "true" {
+	//
+	// Restart requirement: this setting is read ONCE at boot. A runtime
+	// flip via the dashboard (PUT /api/settings/openrouter_refresh_enabled)
+	// persists to the DB but does not start/stop the refresher until the
+	// process restarts. A live-toggle would need a settings-hot-reload
+	// subsystem that does not exist yet; until then the dashboard tooltip
+	// at web/dashboard/src/pages/providers.jsx surfaces this to operators.
+	settingValue, settingErr := db.GetSetting("openrouter_refresh_enabled")
+	switch {
+	case settingErr != nil:
+		slog.Warn("openrouter_refresh_enabled lookup failed; refresher disabled this boot",
+			"err", settingErr)
+	case settingValue == "":
+		// Missing setting row — fail-closed (refresher off). Bootstrap
+		// (wireCatalog/M1.11) seeds the row to "true" on first boot, so a
+		// missing row indicates a non-bootstrapped or manually-edited DB.
+		// Surface explicitly so the operator can spot the misconfiguration.
+		slog.Warn("openrouter_refresh_enabled setting absent; refresher disabled this boot",
+			"hint", "wireCatalog seeds this on first boot; re-run bootstrap if expected")
+	case settingValue == "true":
 		(&catalog.OpenRouterRefresher{
 			Store:    catalogW.Store,
 			Registry: catalogW.Registry,
@@ -244,43 +263,10 @@ func main() {
 	// Models Discovery M2.5 — 24h background discovery ticker (AC15).
 	// Sweeps every provider with DiscoveryEnabled=true and no active
 	// backoff, calls the matching ModelLister via DiscoveryRunner.
-	// The credsLookup adapter walks store-side connections per
-	// provider, picks the lowest-ID non-disabled connection, and
-	// builds ListerCredentials from its API key / access token + the
-	// provider's static BaseURL. (M2.13 close — wiring previously
-	// missing per Gate 3 review CRITICAL-1.)
-	credsLookup := func(providerID string) (catalog.ListerCredentials, bool) {
-		conns, err := db.ListConnections(store.ConnectionFilter{Provider: providerID})
-		if err != nil || len(conns) == 0 {
-			return catalog.ListerCredentials{}, false
-		}
-		// Filter to non-disabled and pick the lowest-ID one for
-		// deterministic credential selection (mirrors the sample-
-		// connection pattern in buildSmartCandidates).
-		var picked *store.Connection
-		for i := range conns {
-			c := &conns[i]
-			if c.State == "disabled" {
-				continue
-			}
-			if picked == nil || c.ID < picked.ID {
-				picked = c
-			}
-		}
-		if picked == nil {
-			return catalog.ListerCredentials{}, false
-		}
-		provDef, ok := config.KnownProviders[providerID]
-		if !ok {
-			return catalog.ListerCredentials{}, false
-		}
-		return catalog.ListerCredentials{
-			BaseURL:     provDef.BaseURL,
-			APIKey:      picked.APIKey,
-			AccessToken: picked.AccessToken,
-		}, true
-	}
-	catalog.StartBackgroundRefresh(refreshCtx, catalogW.Discovery, credsLookup)
+	// buildCredsLookup is extracted to credslookup.go so the adapter
+	// has direct unit-test coverage independent of the goroutine
+	// catalog.StartBackgroundRefresh spawns (M3 polish item #34).
+	catalog.StartBackgroundRefresh(refreshCtx, catalogW.Discovery, buildCredsLookup(db))
 
 	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("server error", "error", err)

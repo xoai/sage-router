@@ -105,6 +105,5 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, req *ExecuteRequest
 // keeps the smart-router's type-assertion path uniform across all
 // production executors (no silent override-skip for copilot models).
 func (e *GitHubCopilotExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
-	_ = model
 	return base
 }

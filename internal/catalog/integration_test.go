@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,7 @@ import (
 	"sage-router/internal/store"
 )
 
-// TestEndToEnd_FullCatalogLifecycle — Models Discovery M3.6 (AC30).
+// TestEndToEnd_CatalogToRouter — Models Discovery M3.6 (AC30).
 //
 // One sequential test pinning the integrated behavior across the seven
 // surfaces M1–M3 ship: migrations → seed → OpenRouter refresh →
@@ -29,6 +30,14 @@ import (
 // discovery > seed for models).
 //
 // Steps map 1:1 to plan §3.6.
+//
+// Renamed from TestEndToEnd_FullCatalogLifecycle (carryover #61a): the
+// previous name oversold what this test exercises. It walks the
+// Registry → routing.SmartRouter path directly, not the production
+// server.buildSmartCandidates wrapper. "CatalogToRouter" is more
+// honest about the layer boundary. A parallel server-level integration
+// test would duplicate setup; the server wrapper has its own coverage
+// in internal/server/buildsmartcandidates_test.go.
 //
 // External dependencies stubbed inside the test process:
 //   - OpenRouter `/api/v1/models` → httptest.Server serving the
@@ -45,10 +54,22 @@ import (
 // internal/server's `buildSmartCandidates` — both paths produce
 // equivalent ranking from the same Registry+Store data, and the server
 // path has its own 11-test coverage in
-// internal/server/buildsmartcandidates_test.go. Routing math here is
-// the integration assertion; the server wrapper around it is unit-
-// tested separately.
-func TestEndToEnd_FullCatalogLifecycle(t *testing.T) {
+// internal/server/buildsmartcandidates_test.go.
+//
+// Two API-layer shortcuts intentional in this test, both justified to
+// keep the catalog package free of HTTP/auth-layer dependencies:
+//  1. Routing math: we call routing.SmartRouter directly instead of
+//     internal/server.buildSmartCandidates. The server wrapper is unit-
+//     tested separately (11 tests in buildsmartcandidates_test.go).
+//  2. User pricing override (Step 5): we call cs.UpsertPricing directly
+//     instead of POSTing to /api/catalog/pricing. The PUT handler
+//     delegates to UpsertPricing plus a Registry.Invalidate call; this
+//     test issues both in sequence. Wiring httptest.NewServer + JWT
+//     bootstrap solely to exercise the auth-then-delegate path adds
+//     setup cost without isolating a distinct failure mode — the
+//     handler's contract (delegate to UpsertPricing + Invalidate) is
+//     covered in routes_api_catalog_test.go end-to-end.
+func TestEndToEnd_CatalogToRouter(t *testing.T) {
 	ctx := context.Background()
 
 	// ─── Step 1: migrations ───────────────────────────────────────────
@@ -67,10 +88,13 @@ func TestEndToEnd_FullCatalogLifecycle(t *testing.T) {
 	).Scan(&tableCount); err != nil {
 		t.Fatalf("count tables: %v", err)
 	}
-	// Migrations 1-11 create at least the core production tables. A
-	// drift below 10 means a migration was deleted or didn't run.
-	if tableCount < 10 {
-		t.Errorf("table count = %d, want >= 10 (migrations 1-11 should have created core tables)", tableCount)
+	// Migrations 1-11 create 11 core production tables enumerated in
+	// internal/store/migration_test.go. Tightened from `< 10` to `< 11`
+	// (carryover #54) so a migration-deletion regression that drops
+	// e.g. catalog_provider_meta is caught directly at Step 1 instead
+	// of indirectly through Step 2's SeedProviderMeta error.
+	if tableCount < 11 {
+		t.Errorf("table count = %d, want >= 11 (migrations 1-11 should have created core tables)", tableCount)
 	}
 
 	// ─── Step 2: seed catalog ─────────────────────────────────────────
@@ -136,12 +160,20 @@ func TestEndToEnd_FullCatalogLifecycle(t *testing.T) {
 	}
 
 	var openrouterPricingCount, anthropicSeedPricingAfter int
-	db.DB().QueryRow(
+	// Wrap Scan errors (carryover #55). A schema drift that lost the
+	// `source` column would silently scan 0; equality at 0==0 would
+	// pass without these guards — losing the precedence assertion this
+	// step exists for.
+	if err := db.DB().QueryRow(
 		"SELECT COUNT(*) FROM catalog_pricing WHERE source='openrouter'",
-	).Scan(&openrouterPricingCount)
-	db.DB().QueryRow(
+	).Scan(&openrouterPricingCount); err != nil {
+		t.Fatalf("count openrouter pricing: %v", err)
+	}
+	if err := db.DB().QueryRow(
 		"SELECT COUNT(*) FROM catalog_pricing WHERE provider='anthropic' AND source='seed'",
-	).Scan(&anthropicSeedPricingAfter)
+	).Scan(&anthropicSeedPricingAfter); err != nil {
+		t.Fatalf("count anthropic-after-openrouter seed pricing: %v", err)
+	}
 
 	if openrouterPricingCount < 5 {
 		t.Errorf("openrouter-sourced pricing rows = %d, want >= 5", openrouterPricingCount)
@@ -151,6 +183,25 @@ func TestEndToEnd_FullCatalogLifecycle(t *testing.T) {
 			"(OpenRouter must not clobber anthropic-direct rows — they're addressed "+
 			"as provider='openrouter' with qualified model_ids, not provider='anthropic')",
 			anthropicSeedPricingBefore, anthropicSeedPricingAfter)
+	}
+
+	// Explicit isolation of the two failure modes (carryover #56):
+	// "openrouter wrote its own qualified rows" vs "UpsertPricing's
+	// WHERE clause blocked openrouter from clobbering anthropic seed
+	// rows". The seed-count equality above proves the latter only if
+	// no openrouter row sneaks under provider='anthropic'; this check
+	// pins that explicitly.
+	var anthropicOpenRouterRows int
+	if err := db.DB().QueryRow(
+		"SELECT COUNT(*) FROM catalog_pricing WHERE provider='anthropic' AND source='openrouter'",
+	).Scan(&anthropicOpenRouterRows); err != nil {
+		t.Fatalf("count anthropic+openrouter rows: %v", err)
+	}
+	if anthropicOpenRouterRows != 0 {
+		t.Errorf("anthropic+source=openrouter rows = %d, want 0 "+
+			"(openrouter writes only under provider='openrouter'; any anthropic+openrouter row "+
+			"indicates a misrouted upsert)",
+			anthropicOpenRouterRows)
 	}
 
 	// ─── Step 4: mock anthropic lister + DiscoverProvider ─────────────
@@ -211,17 +262,33 @@ func TestEndToEnd_FullCatalogLifecycle(t *testing.T) {
 
 	// Pricing for the overlapping row stays at seed (Anthropic /v1/models
 	// returns no pricing; the lister's Model carries empty Pricing; the
-	// runner doesn't touch catalog_pricing).
+	// runner doesn't touch catalog_pricing). Carryover #57 — also assert
+	// the seed VALUES survived. A regression that flipped values to zero
+	// while keeping source='seed' would pass the source check otherwise;
+	// pinning input/output prices against the seed constants ($3 / $15
+	// per 1M for claude-sonnet-4-6) catches that failure mode.
 	var overlapPricingSource string
+	var overlapInputPrice, overlapOutputPrice float64
 	if err := db.DB().QueryRow(
-		"SELECT source FROM catalog_pricing WHERE provider='anthropic' AND model_id='claude-sonnet-4-6'",
-	).Scan(&overlapPricingSource); err != nil {
+		"SELECT source, input_price, output_price FROM catalog_pricing "+
+			"WHERE provider='anthropic' AND model_id='claude-sonnet-4-6'",
+	).Scan(&overlapPricingSource, &overlapInputPrice, &overlapOutputPrice); err != nil {
 		t.Fatalf("query overlap pricing: %v", err)
 	}
 	if overlapPricingSource != "seed" {
 		t.Errorf("claude-sonnet-4-6 catalog_pricing.source = %q, want 'seed' "+
 			"(discovery without pricing must NOT clobber seed pricing)",
 			overlapPricingSource)
+	}
+	const sonnet46SeedInput, sonnet46SeedOutput = 3.0, 15.0
+	if math.Abs(overlapInputPrice-sonnet46SeedInput) > 1e-9 {
+		t.Errorf("claude-sonnet-4-6 input_price = %v after discovery, want %v "+
+			"(seed values must survive a no-pricing discovery cycle)",
+			overlapInputPrice, sonnet46SeedInput)
+	}
+	if math.Abs(overlapOutputPrice-sonnet46SeedOutput) > 1e-9 {
+		t.Errorf("claude-sonnet-4-6 output_price = %v after discovery, want %v",
+			overlapOutputPrice, sonnet46SeedOutput)
 	}
 
 	// ─── Step 5: user pricing override ────────────────────────────────
@@ -311,8 +378,13 @@ func TestEndToEnd_FullCatalogLifecycle(t *testing.T) {
 			CachedRatio:    ratio,
 		})
 	}
-	if len(candidates) < 4 {
-		t.Fatalf("len(candidates) = %d, want >= 4 (anthropic seed has 5 + 1 discovered)",
+	// Carryover #58 — tighten floor from `< 4` to `< 6`. Actual cardinality
+	// at this point is 5 anthropic seed rows + 1 discovered row = 6. The
+	// looser `< 4` floor would pass even if a seed migration drift cut
+	// the seed set by two; a regression that drops the seed catalog from
+	// 5 down to 3 would slip through.
+	if len(candidates) < 6 {
+		t.Fatalf("len(candidates) = %d, want >= 6 (anthropic seed has 5 + 1 discovered)",
 			len(candidates))
 	}
 
@@ -345,13 +417,21 @@ func TestEndToEnd_FullCatalogLifecycle(t *testing.T) {
 	// than any positive-priced one. The seed allowlist (subscription /
 	// other gates) would filter such rows at the server level, but at
 	// the routing-math level $0 wins.
+	//
+	// Carryover #59 — hard-pin the FIRST candidate. The previous version
+	// used a t.Logf escape hatch ("Not a hard failure"), contradicting
+	// plan §3.6's "pin one specific expected ordering" intent. With the
+	// mockLister always emitting claude-discovered-test at zero price,
+	// it must rank first under StrategyCheap.
 	first := sorted[0]
-	if first.InputPrice != 0 {
-		// Not a hard failure — depending on seed pricing values, a
-		// zero-priced discovered row may or may not exist. Just log
-		// so a future maintainer sees the actual ordering.
-		t.Logf("cheap-strategy FIRST = %q (price %v) — non-zero is fine, just informational",
-			first.Model, first.InputPrice)
+	if first.Model != "claude-discovered-test" {
+		var sortedModels []string
+		for _, c := range sorted {
+			sortedModels = append(sortedModels, fmt.Sprintf("%s($%v)", c.Model, c.InputPrice))
+		}
+		t.Errorf("cheap-strategy FIRST = %q (price %v), want claude-discovered-test "+
+			"(zero-priced discovered row must rank first under StrategyCheap). Full order: %v",
+			first.Model, first.InputPrice, sortedModels)
 	}
 
 	// ─── Step 7: usage record + cost via EstimateCost ─────────────────

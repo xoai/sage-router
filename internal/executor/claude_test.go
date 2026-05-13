@@ -110,6 +110,52 @@ func TestClaude_OverrideCapabilities(t *testing.T) {
 			wantThinking: true,
 			wantTools: true,
 		},
+
+		// Carryover #52 — additive-only override contract for non-thinking
+		// variants. If the catalog over-asserts SupportsThinking=true for
+		// a model claudeSupportsThinking would otherwise reject (e.g.,
+		// claude-2-1), the override MUST NOT clobber the base value back
+		// to false. Pins against a refactor that replaces
+		// `if X { base.X = true }` with `base.X = X`.
+		{
+			name: "non-thinking model with base=true must not be clobbered",
+			model: "claude-2-1",
+			base: Capabilities{SupportsThinking: true},
+			wantThinking: true,
+		},
+
+		// Carryover #50 — case sensitivity. claudeSupportsThinking uses
+		// byte-exact strings.HasPrefix / strings.CutPrefix; Anthropic
+		// IDs are lowercase by documentation, so a capitalized variant
+		// should NOT flip thinking on. Theoretical drift only today,
+		// but the subtest locks the contract against future refactor.
+		{
+			name: "case-sensitive: Claude-Sonnet-4-6 does NOT flip thinking",
+			model: "Claude-Sonnet-4-6",
+			base: Capabilities{},
+			wantThinking: false,
+		},
+
+		// Carryover #51 — bare-version edges. claude-sonnet-4 (no
+		// trailing version suffix) currently flips thinking (the
+		// `rest == ""` guard in claudeSupportsThinking treats bare
+		// major-version as a valid match). claude-sonnet- (trailing
+		// hyphen with empty version) does NOT flip — the empty rest
+		// after the hyphen is treated as invalid. Both already handled
+		// correctly by the code; these subtests pin the bounds-safety
+		// implementation against future refactor.
+		{
+			name: "bare version: claude-sonnet-4 flips thinking (rest=='' guard)",
+			model: "claude-sonnet-4",
+			base: Capabilities{},
+			wantThinking: true,
+		},
+		{
+			name: "empty version after hyphen: claude-sonnet- does NOT flip",
+			model: "claude-sonnet-",
+			base: Capabilities{},
+			wantThinking: false,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

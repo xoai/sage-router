@@ -3,12 +3,40 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"sage-router/internal/store"
 )
+
+// putPricing issues an authenticated PUT to /api/catalog/pricing for
+// anthropic/claude-sonnet-4-6 with the given input+output prices.
+// Cache + thinking fields are zero — they're required by the
+// strict-replace PUT contract (M2.10) but the seeded usage row has no
+// cache or thinking tokens, so they don't influence the savings ratio.
+func putPricing(t *testing.T, srv *Server, inputPrice, outputPrice float64) {
+	t.Helper()
+	body := fmt.Sprintf(`{
+		"input_price": %v,
+		"output_price": %v,
+		"cache_read_price": 0,
+		"cache_write_price": 0,
+		"thinking_price": 0
+	}`, inputPrice, outputPrice)
+	req := httptest.NewRequest(http.MethodPut,
+		"/api/catalog/pricing/anthropic/claude-sonnet-4-6",
+		bytes.NewReader([]byte(body)))
+	req.AddCookie(catalogTestSessionCookie(t, srv))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT pricing (%v/%v): status = %d, want 200; body: %s",
+			inputPrice, outputPrice, rec.Code, rec.Body.String())
+	}
+}
 
 // Models Discovery M3.2 — AC25 verification.
 //
@@ -28,20 +56,17 @@ import (
 // Scenario:
 //  1. Seed one subscription usage row for anthropic/claude-sonnet-4-6
 //     with non-trivial token counts (so EstimateCost returns > 0).
-//  2. Fetch /api/usage/summary; capture initial subscription_savings
-//     (computed against the seed catalog).
-//  3. PUT a user pricing override that doubles input + output prices.
-//  4. Re-fetch /api/usage/summary; subscription_savings must now be
-//     larger (the new pricing applies retroactively at query time).
-//  5. Verify the underlying usage_log row's cost is STILL 0 — the
-//     subscription contract is "no per-row cost; savings computed
-//     against current pricing on read."
+//  2. PUT a baseline pricing override (1.0/1.0) so the test's
+//     reference point is independent of whatever the seed catalog
+//     happens to contain. Capture savings under the baseline.
+//  3. PUT a doubled override (2.0/2.0). Capture savings again.
+//  4. Assert the ratio is ~2.0.
+//  5. Verify the underlying usage_log row's cost is STILL 0.
 //
-// The exact numerical contract: with input=1000, output=500 tokens,
-// initial savings should equal `1000 * inSeed + 500 * outSeed` /
-// 1_000_000. After the PUT doubles both prices, savings must double.
-// The relative-doubling check is more robust to seed-price drift than
-// pinning absolute USD values.
+// Carryover #46 — the original version PUT 6.0/30.0 once and assumed
+// the seed had 3.0/15.0, which meant a seed-price drift in production
+// would fail the test for a non-bug reason. The baseline-then-double
+// pattern below decouples the assertion from seed values entirely.
 func TestSummary_SubscriptionSavingsReflectsLivePricing(t *testing.T) {
 	srv, db, _ := newCatalogTestServer(t)
 
@@ -65,50 +90,27 @@ func TestSummary_SubscriptionSavingsReflectsLivePricing(t *testing.T) {
 		t.Fatalf("RecordUsage: %v", err)
 	}
 
-	// First summary read — savings against seed catalog pricing.
-	preSavings := fetchSubscriptionSavings(t, srv)
-	if preSavings <= 0 {
-		t.Fatalf("initial subscription_savings = %g, want > 0; seed pricing for claude-sonnet-4-6 must be non-zero",
-			preSavings)
+	// Establish a known baseline pricing via PUT. This replaces the
+	// "compare against seed values" pattern with "compare against an
+	// explicitly-set baseline" — seed-drift-resistant.
+	putPricing(t, srv, 1.0, 1.0)
+	baselineSavings := fetchSubscriptionSavings(t, srv)
+	if baselineSavings <= 0 {
+		t.Fatalf("baseline subscription_savings = %g, want > 0; PUT must persist + Registry.Invalidate must propagate",
+			baselineSavings)
 	}
 
-	// PUT a user pricing override that doubles input + output prices.
-	// The seed catalog has input=3, output=15 for claude-sonnet-4-6 —
-	// set 6/30 so input+output savings are exactly doubled.
-	//
-	// Cache prices are present only to satisfy M2.10's strict-replace
-	// PUT contract (all five fields required). The seeded usage row
-	// has CacheReadTokens=0 and CacheWriteTokens=0, so the cache
-	// price values don't influence the ratio. AC25b's cache-aware
-	// path is independently covered by
-	// `TestHandleUsageSummary_SubscriptionSavingsUsesCacheReadPrice`
-	// in subscription_savings_test.go (M1.9b era).
-	putBody := []byte(`{
-		"input_price": 6.0,
-		"output_price": 30.0,
-		"cache_read_price": 0.6,
-		"cache_write_price": 7.5,
-		"thinking_price": 0
-	}`)
-	req := httptest.NewRequest(http.MethodPut,
-		"/api/catalog/pricing/anthropic/claude-sonnet-4-6",
-		bytes.NewReader(putBody))
-	req.AddCookie(catalogTestSessionCookie(t, srv))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT pricing: status = %d, want 200; body: %s", rec.Code, rec.Body.String())
-	}
+	// Double the prices via a second PUT.
+	putPricing(t, srv, 2.0, 2.0)
 
 	// Second summary read — savings should now reflect the doubled
 	// pricing. AC25's contract holds when the ratio is ~2.0 (the
 	// M1.9b rewire flowed PUT→Registry.Invalidate→EstimateCost).
 	postSavings := fetchSubscriptionSavings(t, srv)
-	ratio := postSavings / preSavings
+	ratio := postSavings / baselineSavings
 	if ratio < 1.99 || ratio > 2.01 {
-		t.Errorf("subscription_savings did not double: pre=%g post=%g ratio=%g (want ~2.0)",
-			preSavings, postSavings, ratio)
+		t.Errorf("subscription_savings did not double under 2x baseline override: baseline=%g post=%g ratio=%g (want ~2.0)",
+			baselineSavings, postSavings, ratio)
 	}
 
 	// Underlying usage_log row's cost is STILL 0 — the
@@ -156,8 +158,12 @@ func fetchSubscriptionSavings(t *testing.T, srv *Server) float64 {
 // The M2.12 reviews flagged the importance of these fallbacks; this
 // test pins the contract.
 func TestSummary_SubscriptionSavingsZeroWhenCatalogMissing(t *testing.T) {
-	srv, db, _ := newCatalogTestServer(t)
-	srv.deps.Catalog = nil // partial wiring — emulates a test setup that didn't include the catalog
+	// Carryover #48 — use the dedicated helper that constructs deps
+	// with Catalog: nil from the start, instead of mutating
+	// srv.deps.Catalog after construction. The latter fights the
+	// constructor-injection design and would mask a regression where
+	// the constructor itself started rejecting nil Catalog.
+	srv, db := newCatalogTestServerWithoutCatalog(t)
 
 	if err := db.RecordUsage(&store.UsageEntry{
 		ID:           "sub-row-1",

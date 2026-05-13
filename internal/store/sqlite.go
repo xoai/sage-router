@@ -952,6 +952,16 @@ func (s *sqliteStore) ListUsageInRange(ctx context.Context, from, to time.Time, 
 // when id doesn't match any row (idempotent no-op via WHERE clause).
 // Never modifies cost_source — the apikey/subscription distinction
 // is the M1 Subscription Auth contract and must survive recompute.
+//
+// Snapshot-staleness invariant: callers using a read-then-write pattern
+// (e.g., POST /api/catalog/recompute) hold row.Cost from a prior SELECT
+// and may collide with a concurrent UpdateUsageCost on the same id. Today
+// the only writers of the cost column are RecordUsage (INSERT) and this
+// function (UPDATE), so the collision window is academic — the recompute
+// handler accepts advisory deltas. Any future write path that issues
+// `UPDATE usage_log SET cost = ...` MUST reconcile with the recompute
+// pattern: either take an explicit lock (SQLite's BEGIN IMMEDIATE) or
+// accept the snapshot-staleness in its own contract.
 func (s *sqliteStore) UpdateUsageCost(ctx context.Context, id string, cost float64) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE usage_log SET cost = ? WHERE id = ?`, cost, id)

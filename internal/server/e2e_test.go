@@ -98,6 +98,28 @@ func newMock401Executor(providerID string) *mockExecutor {
 	}
 }
 
+// sentinelExecutor fails the test when Execute is invoked. Wired as
+// the "default" executor in setupTestServer (when the caller passes
+// nil executors) so a request that unintentionally routes to the
+// default executor fails loudly with the provider name in the message,
+// rather than getting a permissive mock response that masks the
+// misrouting (carryover #37).
+//
+// Tests that legitimately need a working default executor (e.g.,
+// openrouter/ollama integration shapes) MUST register an explicit
+// entry under the "default" key when calling setupTestServer.
+type sentinelExecutor struct {
+	t          *testing.T
+	providerID string
+}
+
+func (s *sentinelExecutor) Provider() string { return s.providerID }
+func (s *sentinelExecutor) Execute(ctx context.Context, req *executor.ExecuteRequest) (*executor.Result, error) {
+	s.t.Fatalf("unexpected dispatch to sentinel executor (provider=%q); the request routed to the default fallback instead of an expected provider executor",
+		s.providerID)
+	return nil, nil
+}
+
 // mock429Executor always returns 429 (rate limited).
 func newMock429Executor(providerID string) *mockExecutor {
 	return &mockExecutor{
@@ -151,7 +173,10 @@ func setupTestServer(t *testing.T, executors map[string]executor.Executor) (*Ser
 		executors = map[string]executor.Executor{
 			"openai":    &mockExecutor{providerID: "openai"},
 			"anthropic": newMockClaudeExecutor(),
-			"default":   &mockExecutor{providerID: "default"},
+			// Sentinel as the default fallback — a test that routes to
+			// "default" without registering an explicit entry has a
+			// misrouting bug, not a wiring shortcut. Carryover #37.
+			"default": &sentinelExecutor{t: t, providerID: "default"},
 		}
 	}
 

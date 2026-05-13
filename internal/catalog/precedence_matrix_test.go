@@ -19,6 +19,17 @@ import (
 // Transition naming convention: `<existing>_then_<incoming>` so the
 // test names sort to a readable matrix in test output.
 
+// Matrix-test seeded identifiers. Sourced from a single pair of
+// constants so the helper closures, the upsert helper, and the GetPricing
+// read-back all reference the same (provider, model_id). A previous
+// version hardcoded "p"/"m" in three closure locations; if any helper
+// changed the seeded ID, the closures would silently write to a different
+// row than GetPricing reads back, and the matrix would assert nothing.
+const (
+	matrixProvider = "p"
+	matrixModelID  = "m"
+)
+
 // matrixCase describes one (existing, incoming) pair and the expected
 // outcome. `overwrite=true` means the incoming row wins; false means
 // the existing row is preserved.
@@ -104,7 +115,7 @@ func TestUpsertModel_PrecedenceMatrix(t *testing.T) {
 
 			// First write: the "existing" row.
 			first := Model{
-				Provider:    "p", ModelID: "m",
+				Provider:    matrixProvider, ModelID: matrixModelID,
 				DisplayName: "EXISTING-" + c.existing,
 				Source:      c.existing,
 			}
@@ -115,7 +126,7 @@ func TestUpsertModel_PrecedenceMatrix(t *testing.T) {
 			// Second write: the "incoming" row with a distinct display_name
 			// so we can tell which one survived.
 			second := Model{
-				Provider:    "p", ModelID: "m",
+				Provider:    matrixProvider, ModelID: matrixModelID,
 				DisplayName: "INCOMING-" + c.incoming,
 				Source:      c.incoming,
 			}
@@ -123,7 +134,7 @@ func TestUpsertModel_PrecedenceMatrix(t *testing.T) {
 				t.Fatalf("UpsertModel incoming(%s): %v", c.incoming, err)
 			}
 
-			got, err := cs.GetModel(ctx, "p", "m")
+			got, err := cs.GetModel(ctx, matrixProvider, matrixModelID)
 			if err != nil {
 				t.Fatalf("GetModel: %v", err)
 			}
@@ -154,7 +165,7 @@ func TestUpsertModel_PrecedenceMatrix(t *testing.T) {
 // path. Distinct input_price values mark the iteration.
 func TestUpsertPricing_PrecedenceMatrix(t *testing.T) {
 	runPricingMatrix(t, func(cs Store, ctx context.Context, p Pricing) error {
-		return cs.UpsertPricing(ctx, "p", "m", p)
+		return cs.UpsertPricing(ctx, matrixProvider, matrixModelID, p)
 	})
 }
 
@@ -167,7 +178,7 @@ func TestUpsertPricing_PrecedenceMatrix(t *testing.T) {
 func TestBulkUpsertPricing_PrecedenceMatrix(t *testing.T) {
 	runPricingMatrix(t, func(cs Store, ctx context.Context, p Pricing) error {
 		return cs.BulkUpsertPricing(ctx, []PricingUpdate{
-			{Provider: "p", ModelID: "m", Pricing: p},
+			{Provider: matrixProvider, ModelID: matrixModelID, Pricing: p},
 		})
 	})
 }
@@ -187,7 +198,7 @@ func runPricingMatrix(t *testing.T, write func(Store, context.Context, Pricing) 
 			// because we never write a model row at SourceUser in these
 			// tests (which would block the matrix).
 			if err := cs.UpsertModel(ctx, Model{
-				Provider: "p", ModelID: "m", Source: SourceSeed,
+				Provider: matrixProvider, ModelID: matrixModelID, Source: SourceSeed,
 			}); err != nil {
 				t.Fatalf("seed model: %v", err)
 			}
@@ -209,7 +220,7 @@ func runPricingMatrix(t *testing.T, write func(Store, context.Context, Pricing) 
 				t.Fatalf("write incoming(%s): %v", c.incoming, err)
 			}
 
-			got, err := cs.GetPricing(ctx, "p", "m")
+			got, err := cs.GetPricing(ctx, matrixProvider, matrixModelID)
 			if err != nil {
 				t.Fatalf("GetPricing: %v", err)
 			}
@@ -277,17 +288,111 @@ func TestPrecedenceMatrix_SourcesAreCanonical(t *testing.T) {
 		seen[c.existing] = true
 		seen[c.incoming] = true
 	}
-	expected := []string{SourceSeed, SourceDiscovery, SourceOpenRouter, SourceUser}
+	expected := ValidSources()
 	if len(seen) != len(expected) {
 		t.Errorf("matrix covers %d sources, want %d (canonical: %v)",
 			len(seen), len(expected), expected)
 	}
 	for _, s := range expected {
 		if !seen[s] {
-			t.Errorf("matrix missing source %q", s)
+			t.Errorf("matrix missing source %q — extend modelsMatrix to cover it", s)
 		}
 		if !IsValidSource(s) {
-			t.Errorf("source %q failed IsValidSource — drift between types.go and matrix", s)
+			t.Errorf("source %q failed IsValidSource — drift between ValidSources() and IsValidSource", s)
+		}
+	}
+}
+
+// TestBulkUpsertPricing_MixedPrecedenceInTx — M2.9 review #2 new-m-1.
+// The matrix tests exercise BulkUpsertPricing with len(updates) == 1,
+// so a regression that processed only the first row of a multi-row tx
+// (e.g., a misplaced `return` or `break`) would not be caught. This test
+// seeds three pre-existing rows of mixed sources, issues ONE bulk-upsert
+// with three incoming rows whose source-precedence outcomes differ
+// (one accept, one reject, one openrouter-blocked-from-discovery), and
+// asserts every final row matches the per-row precedence rules. The tx
+// itself committing is implicit in the read-back succeeding.
+func TestBulkUpsertPricing_MixedPrecedenceInTx(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	// Three (provider, model_id) pairs, each with a different existing
+	// source. FK satisfaction first.
+	seedRows := []struct {
+		provider, modelID, existing string
+		existingInput               float64
+	}{
+		{"p1", "m1", SourceSeed, 1.0},        // bulk-row will be discovery → ACCEPT
+		{"p2", "m2", SourceUser, 10.0},       // bulk-row will be openrouter → REJECT (user wins)
+		{"p3", "m3", SourceOpenRouter, 20.0}, // bulk-row will be discovery → REJECT (openrouter blocks discovery)
+	}
+	for _, r := range seedRows {
+		if err := cs.UpsertModel(ctx, Model{
+			Provider: r.provider, ModelID: r.modelID, Source: SourceSeed,
+		}); err != nil {
+			t.Fatalf("seed model %s/%s: %v", r.provider, r.modelID, err)
+		}
+		if err := cs.UpsertPricing(ctx, r.provider, r.modelID, Pricing{
+			Input: r.existingInput, Source: r.existing,
+		}); err != nil {
+			t.Fatalf("seed pricing %s/%s: %v", r.provider, r.modelID, err)
+		}
+	}
+
+	// Single bulk tx with three incoming rows. Distinct Input values
+	// pin which actually landed.
+	const incomingMarker = 999.0
+	updates := []PricingUpdate{
+		{Provider: "p1", ModelID: "m1", Pricing: Pricing{Input: incomingMarker, Source: SourceDiscovery}},
+		{Provider: "p2", ModelID: "m2", Pricing: Pricing{Input: incomingMarker, Source: SourceOpenRouter}},
+		{Provider: "p3", ModelID: "m3", Pricing: Pricing{Input: incomingMarker, Source: SourceDiscovery}},
+	}
+	if err := cs.BulkUpsertPricing(ctx, updates); err != nil {
+		t.Fatalf("BulkUpsertPricing: %v", err)
+	}
+
+	// Per-row expected outcomes.
+	want := []struct {
+		provider, modelID string
+		expectedInput     float64
+		expectedSource    string
+		reason            string
+	}{
+		{"p1", "m1", incomingMarker, SourceDiscovery, "seed → discovery: discovery wins (ADR-2 rule)"},
+		{"p2", "m2", 10.0, SourceUser, "user → openrouter: user wins (ADR-2 rule 1)"},
+		{"p3", "m3", 20.0, SourceOpenRouter, "openrouter → discovery: openrouter wins (pricing-only rule)"},
+	}
+	for _, w := range want {
+		got, err := cs.GetPricing(ctx, w.provider, w.modelID)
+		if err != nil {
+			t.Fatalf("GetPricing %s/%s: %v", w.provider, w.modelID, err)
+		}
+		if got == nil {
+			t.Fatalf("GetPricing %s/%s returned nil after bulk tx", w.provider, w.modelID)
+		}
+		if got.Input != w.expectedInput {
+			t.Errorf("%s/%s: Input = %g, want %g (%s)", w.provider, w.modelID, got.Input, w.expectedInput, w.reason)
+		}
+		if got.Source != w.expectedSource {
+			t.Errorf("%s/%s: Source = %q, want %q (%s)", w.provider, w.modelID, got.Source, w.expectedSource, w.reason)
+		}
+	}
+}
+
+// TestValidSources_AgreesWithIsValidSource is the drift-detector
+// between the two enum-membership surfaces in types.go/store.go.
+// IsValidSource is a hand-written switch (no allocation, hot-path);
+// ValidSources allocates a slice for test iteration. Both derive from
+// the same Source* constants, but nothing forces them to stay aligned
+// — this test does.
+func TestValidSources_AgreesWithIsValidSource(t *testing.T) {
+	for _, s := range ValidSources() {
+		if !IsValidSource(s) {
+			t.Errorf("ValidSources() returned %q but IsValidSource(%q) = false", s, s)
+		}
+	}
+	for _, bogus := range []string{"", "Seed", "USER", "openrouter ", "unknown"} {
+		if IsValidSource(bogus) {
+			t.Errorf("IsValidSource(%q) = true; expected only canonical values", bogus)
 		}
 	}
 }

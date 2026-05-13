@@ -95,6 +95,5 @@ func (e *DefaultExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Re
 // patch (e.g., GPT-5 capability inheritance) doesn't need to rewire
 // the smart-router. The current body returns base unchanged.
 func (e *DefaultExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
-	_ = model
 	return base
 }

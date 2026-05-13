@@ -14,6 +14,7 @@ import { RoutingPage } from './pages/routing';
 import { LoginPage } from './pages/login';
 import { SetupPage } from './pages/setup';
 import { OAuthCompletePage } from './pages/oauth-complete';
+import { ErrorBoundary } from './ErrorBoundary';
 import { authCheck, tokenLogin } from './api/client';
 
 // Auth states: 'loading' | 'login' | 'setup' | 'ready'
@@ -45,14 +46,18 @@ function Dashboard() {
         overflow: 'auto',
         background: 'var(--bg-0)',
       }}>
-        <Route path="/" component={OverviewPage} />
-        <Route path="/providers" component={ProvidersPage} />
-        <Route path="/models" component={ModelsPage} />
-        <Route path="/usage" component={UsagePage} />
-        <Route path="/routing" component={RoutingPage} />
-        <Route path="/settings" component={SettingsPage} />
-        <Route path="/connect" component={ConnectPage} />
-        <Route path="/oauth-complete" component={OAuthCompletePage} />
+        {/* Per-route ErrorBoundary (carryover #38). A render-time
+            failure in one page renders the reload prompt for that
+            page only; the sidebar stays reachable so the user can
+            navigate to a healthy page. */}
+        <Route path="/" component={() => <ErrorBoundary><OverviewPage /></ErrorBoundary>} />
+        <Route path="/providers" component={() => <ErrorBoundary><ProvidersPage /></ErrorBoundary>} />
+        <Route path="/models" component={() => <ErrorBoundary><ModelsPage /></ErrorBoundary>} />
+        <Route path="/usage" component={() => <ErrorBoundary><UsagePage /></ErrorBoundary>} />
+        <Route path="/routing" component={() => <ErrorBoundary><RoutingPage /></ErrorBoundary>} />
+        <Route path="/settings" component={() => <ErrorBoundary><SettingsPage /></ErrorBoundary>} />
+        <Route path="/connect" component={() => <ErrorBoundary><ConnectPage /></ErrorBoundary>} />
+        <Route path="/oauth-complete" component={() => <ErrorBoundary><OAuthCompletePage /></ErrorBoundary>} />
       </main>
       <ToastContainer />
       <CommandPalette onNavigate={setLocation} />

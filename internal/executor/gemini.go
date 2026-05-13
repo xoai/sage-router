@@ -131,6 +131,5 @@ func (e *GeminiExecutor) buildURL(req *ExecuteRequest) (string, error) {
 // seed lags on (e.g., flash-lite v2 gaining thinking); wiring the
 // interface now avoids a callers-rewire when that happens.
 func (e *GeminiExecutor) OverrideCapabilities(model string, base Capabilities) Capabilities {
-	_ = model
 	return base
 }

@@ -1,6 +1,8 @@
 package catalog
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -409,6 +411,16 @@ func TestParseOpenRouterPricing_FreeModelHasZeroPrices(t *testing.T) {
 // issue from the Warn log without losing pricing data for the rest
 // of the catalog.
 func TestParseOpenRouterPricing_MalformedPriceStringYieldsZeroAndPreservesRow(t *testing.T) {
+	// Capture slog output so the test can assert the Warn line fires on
+	// every malformed field. Without this, a regression to silent-zero
+	// would leave the value assertions intact but eliminate the operator-
+	// visible diagnostic. Same bytes.Buffer + slog.NewTextHandler pattern
+	// used by TestSubscriptionAuth_TokenNeverAppearsInLogs.
+	var logbuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
 	body := []byte(`{
 		"data": [
 			{
@@ -439,6 +451,19 @@ func TestParseOpenRouterPricing_MalformedPriceStringYieldsZeroAndPreservesRow(t 
 	// Valid fields on the same row → preserved.
 	approxEq(t, "Output (valid)", u.Pricing.Output, 5.0)
 	approxEq(t, "CacheWrite (valid)", u.Pricing.CacheWrite, 3.75)
+
+	// Operator-visible diagnostic: both malformed fields produced a Warn.
+	// A regression to silent-zero would leave the value assertions intact
+	// but lose the only signal an operator has that the upstream sent
+	// garbage. The model_id appears in the log so multi-row corruption
+	// can be attributed at log-grep time.
+	logs := logbuf.String()
+	if !strings.Contains(logs, "vendor/garbage-price-model") {
+		t.Errorf("expected slog.Warn to reference model_id; got: %s", logs)
+	}
+	if !strings.Contains(logs, "not-a-number") {
+		t.Errorf("expected slog.Warn to reference the bad input value 'not-a-number'; got: %s", logs)
+	}
 }
 
 // TestParseOpenRouterPricing_NoPricingObjectIsSkipped — a model entry

@@ -4,6 +4,12 @@ class ApiError extends Error {
   constructor(status, message) {
     super(message);
     this.status = status;
+    // Carryover #25 — when silent is true, callers should suppress
+    // user-facing toasts. Used for 401 responses where the
+    // sage:unauthorized event already triggers navigation; an extra
+    // "Unauthorized" toast flashes momentarily before the redirect
+    // and reads as noise. Default false.
+    this.silent = false;
   }
 }
 
@@ -22,14 +28,32 @@ async function request(path, options = {}) {
   });
 
   if (res.status === 401) {
-    // Redirect to login or emit event
+    // Redirect to login or emit event. Mark the error as silent so
+    // page-load fetches don't flash a redundant "Unauthorized" toast
+    // before the unauthorized handler navigates away.
     window.dispatchEvent(new CustomEvent('sage:unauthorized'));
-    throw new ApiError(401, 'Unauthorized');
+    const err = new ApiError(401, 'Unauthorized');
+    err.silent = true;
+    throw err;
   }
 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text);
+    // Carryover #31 — parse the {error: {message}} envelope produced
+    // by writeError in routes_v1.go. The pinned envelope shape is
+    // codified by TestWriteError_EnvelopeShape on the Go side. Falls
+    // back to the raw body text for legacy 4xx/5xx responses that
+    // don't follow the envelope (e.g., reverse-proxy plain-text 502s).
+    let message = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && parsed.error && typeof parsed.error.message === 'string') {
+        message = parsed.error.message;
+      }
+    } catch (_) {
+      // Body wasn't JSON — keep raw text as the message.
+    }
+    throw new ApiError(res.status, message);
   }
 
   if (res.status === 204) return null;

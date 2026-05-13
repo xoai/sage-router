@@ -52,15 +52,16 @@ grep-no-static-config:
 # instrument).
 #
 # Patterns (mirror tokenLeakPatterns in token_leak_test.go):
-#   sk-...          OpenAI API keys (also matches anthropic sk-ant-)
-#   AIza...         Google / Gemini API keys
-#   ghp_... / gho_  GitHub personal / OAuth tokens
-#   ya29....        Google OAuth access tokens
-#   sbp_...         Supabase service / other long-prefix formats
+#   sk-...           OpenAI API keys (also matches anthropic sk-ant-)
+#   AIza...          Google / Gemini API keys
+#   ghp_... / gho_   GitHub personal / classic OAuth tokens
+#   github_pat_...   GitHub fine-grained PATs (underscores in body)
+#   ghu_... / ghs_   GitHub user-to-server / server-to-server OAuth
+#   ya29....         Google OAuth access tokens
 grep-no-secrets:
 	@echo "M3.7 / AC29: scanning go test output for provider-token leaks..."
 	@output=$$(go test -v -count=1 ./... 2>&1); \
-	if echo "$$output" | grep -qE 'sk-[a-zA-Z0-9_\-]{20,}|AIza[A-Za-z0-9\-_]{20,}|ghp_[A-Za-z0-9]{36,}|gho_[A-Za-z0-9]{36,}|ya29\.[A-Za-z0-9\-_]{40,}|sbp_[A-Za-z0-9]{36,}'; then \
+	if echo "$$output" | grep -qE 'sk-[a-zA-Z0-9_\-]{20,}|AIza[A-Za-z0-9\-_]{20,}|ghp_[A-Za-z0-9]{36,}|gho_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{36,}|ghu_[A-Za-z0-9]{36,}|ghs_[A-Za-z0-9]{36,}|ya29\.[A-Za-z0-9\-_]{40,}'; then \
 		echo "AC29 violation: provider-token pattern matched in test output."; \
 		echo "Re-run locally with verbose grep to identify the leaking test:"; \
 		echo "  go test -v -count=1 ./... 2>&1 | grep -E 'sk-[a-zA-Z0-9_\\-]{20,}|AIza[A-Za-z0-9\\-_]{20,}|...'"; \

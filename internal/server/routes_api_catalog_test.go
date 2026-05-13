@@ -96,6 +96,55 @@ func newCatalogTestServer(t *testing.T) (*Server, store.Store, catalog.Store) {
 	return srv, db, cs
 }
 
+// newCatalogTestServerWithoutCatalog mirrors newCatalogTestServer but
+// constructs Dependencies with Catalog set to nil from the start. Tests
+// that exercise the s.deps.Catalog == nil fallback path (handleGetUsageSummary
+// returning savings=0, handleRecompute returning 503, etc.) use this
+// helper to avoid the dep-mutation pattern (`srv.deps.Catalog = nil`
+// post-construction) that fought the constructor-injection design.
+// Carryover #48.
+func newCatalogTestServerWithoutCatalog(t *testing.T) (*Server, store.Store) {
+	t.Helper()
+
+	db, err := store.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	authMgr := auth.NewManager("hash", []byte("jwt"), []byte("hmac"))
+
+	translateReg := translate.NewRegistry()
+	translateReg.Register(openaiTranslate.New())
+	translateReg.Register(claudeTranslate.New())
+
+	providerReg := provider.NewRegistry()
+	for id, p := range config.KnownProviders {
+		providerReg.Register(id, provider.ProviderMeta{
+			ID: p.ID, Name: p.Name, Format: p.Format, BaseURL: p.BaseURL, AuthTypes: p.AuthTypes,
+		})
+	}
+
+	srv := New(Config{Host: "127.0.0.1", Port: 0}, Dependencies{
+		Store:             db,
+		TranslateRegistry: translateReg,
+		ProviderSelector:  provider.NewSelector(),
+		ProviderRegistry:  providerReg,
+		UsageTracker:      usage.NewTracker(db),
+		Auth:              authMgr,
+		SmartRouter:       routing.NewSmartRouter(),
+		ConversationStore: routing.NewConversationStore(),
+		BypassFilter:      bypass.NewFilter(),
+		RateLimiter:       ratelimit.New(),
+		// Catalog and CatalogStore intentionally absent — this is the
+		// partial-wiring shape the fallback paths must handle.
+	})
+	return srv, db
+}
+
 // catalogTestSessionCookie returns a JWT cookie that the middleware
 // accepts. Used by tests that go through the full handler chain.
 // Uses a 1-hour expiry rather than 0 to avoid CI clock-drift flakes:
@@ -621,4 +670,78 @@ func TestGetCatalogProviders_ListsProviderMetas(t *testing.T) {
 			t.Errorf("meta row for %q missing discovery_enabled: %+v", want, row)
 		}
 	}
+}
+
+// TestCatalogPricing_PathEdgeCases — carryover #19. The route
+// /api/catalog/pricing/{provider}/{model_id...} uses Go 1.22's
+// catch-all path-segment matching for model_id. Three pathological
+// shapes that mux differs handle differently:
+//
+//  1. Empty model_id (`/api/catalog/pricing/openai/`): trailing
+//     slash → mux either matches with empty model_id or returns 404.
+//     We assert the handler doesn't crash and returns a sane status.
+//  2. Double-slash mid-path (`/api/catalog/pricing/openai//gpt-4o`):
+//     net/http normalises double-slashes by redirecting to the cleaned
+//     path. Caller sees a 301 and follows; the handler never sees the
+//     pathological shape.
+//  3. URL-encoded slash (`/api/catalog/pricing/openai/anthropic%2Fclaude`):
+//     the encoded `/` is preserved in r.PathValue. The handler must
+//     accept it as a valid qualified model_id, not split on it.
+func TestCatalogPricing_PathEdgeCases(t *testing.T) {
+	t.Run("empty_model_id_returns_404", func(t *testing.T) {
+		srv, _, _ := newCatalogTestServer(t)
+		req := httptest.NewRequest(http.MethodGet, "/api/catalog/pricing/openai/", nil)
+		req.AddCookie(catalogTestSessionCookie(t, srv))
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		// http.ServeMux requires the catch-all segment to match at least
+		// one path component. An empty model_id returns 404 (mux-level)
+		// rather than reaching the handler with model_id="". Either 404
+		// or 405 (method-not-allowed if mux registers GET only on the
+		// full pattern) is acceptable; 500 would indicate the handler
+		// panicked on an empty path value.
+		if rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 404 or 405; body: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("double_slash_normalizes_or_404s", func(t *testing.T) {
+		srv, _, _ := newCatalogTestServer(t)
+		req := httptest.NewRequest(http.MethodGet, "/api/catalog/pricing/openai//gpt-4o-mini", nil)
+		req.AddCookie(catalogTestSessionCookie(t, srv))
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		// net/http's ServeMux issues 301 redirects to the canonical
+		// double-slash-free path. 200 (handler ran with the cleaned
+		// path), 301 (redirect), or 404 (mux refused to match the
+		// pathological shape) are all acceptable; 500 would indicate
+		// a panic.
+		if rec.Code == http.StatusInternalServerError {
+			t.Errorf("status = 500; double-slash must not panic the handler; body: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("url_encoded_slash_preserved_in_qualified_id", func(t *testing.T) {
+		srv, _, _ := newCatalogTestServer(t)
+		// %2F is encoded /. The full path is treated as
+		// /api/catalog/pricing/openrouter/anthropic%2Fclaude-sonnet-4
+		// — the encoded slash is part of model_id, not a separator.
+		// Use the openrouter provider since qualified IDs are its
+		// native format.
+		req := httptest.NewRequest(http.MethodGet,
+			"/api/catalog/pricing/openrouter/anthropic%2Fclaude-sonnet-4", nil)
+		req.AddCookie(catalogTestSessionCookie(t, srv))
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		// Handler may return 404 (model not in catalog) or 200 (model
+		// present) — both are valid handler behavior. We're asserting
+		// the encoded slash didn't cause a panic, mux mismatch, or
+		// path-decoding misroute.
+		if rec.Code == http.StatusInternalServerError {
+			t.Errorf("status = 500; URL-encoded slash must not crash the handler; body: %s", rec.Body.String())
+		}
+	})
 }

@@ -32,6 +32,22 @@ func NewSQLiteStore(db *sql.DB) Store {
 // contract verified by TestSetGetProviderMeta_TimestampRoundTrip.
 const timestampLayout = time.RFC3339
 
+// pricingSourcePrecedenceWhere is the WHERE-clause body shared by
+// UpsertPricing and BulkUpsertPricing. It enforces ADR-2 §Conflict
+// resolution for catalog_pricing: user beats everything, seed loses
+// to anything non-seed, and discovery cannot clobber openrouter (the
+// extra rule that distinguishes pricing precedence from models
+// precedence). Twelve-cell behavior is pinned by
+// TestPrecedenceMatrix_Pricing in precedence_matrix_test.go.
+//
+// UpsertModel uses a similar but shorter WHERE (no openrouter rule);
+// it is the only catalog_models writer, so the fragment stays inline
+// at the call site rather than warranting its own constant.
+const pricingSourcePrecedenceWhere = `
+	NOT (catalog_pricing.source = 'user' AND excluded.source != 'user')
+	AND NOT (catalog_pricing.source != 'seed' AND excluded.source = 'seed')
+	AND NOT (catalog_pricing.source = 'openrouter' AND excluded.source = 'discovery')`
+
 // ---------------------------------------------------------------------------
 // Models
 // ---------------------------------------------------------------------------
@@ -176,11 +192,7 @@ func (s *sqliteCatalog) UpsertPricing(ctx context.Context, provider, modelID str
 			thinking_price    = excluded.thinking_price,
 			source            = excluded.source,
 			updated_at        = CURRENT_TIMESTAMP
-		WHERE
-			NOT (catalog_pricing.source = 'user' AND excluded.source != 'user')
-			AND NOT (catalog_pricing.source != 'seed' AND excluded.source = 'seed')
-			AND NOT (catalog_pricing.source = 'openrouter' AND excluded.source = 'discovery')
-	`,
+		WHERE`+pricingSourcePrecedenceWhere,
 		provider, modelID,
 		p.Input, p.Output, p.CacheRead, p.CacheWrite, p.Thinking, p.Source,
 	)
@@ -254,11 +266,7 @@ func (s *sqliteCatalog) BulkUpsertPricing(ctx context.Context, updates []Pricing
 			thinking_price    = excluded.thinking_price,
 			source            = excluded.source,
 			updated_at        = CURRENT_TIMESTAMP
-		WHERE
-			NOT (catalog_pricing.source = 'user' AND excluded.source != 'user')
-			AND NOT (catalog_pricing.source != 'seed' AND excluded.source = 'seed')
-			AND NOT (catalog_pricing.source = 'openrouter' AND excluded.source = 'discovery')
-	`)
+		WHERE`+pricingSourcePrecedenceWhere)
 	if err != nil {
 		return fmt.Errorf("catalog: prepare bulk pricing: %w", err)
 	}

@@ -7,12 +7,17 @@ import {
   getCombos, createCombo, deleteCombo,
   getModels,
   getCatalogModels, putCatalogPricing, deleteCatalogPricing,
+  getProviders,
 } from '../api/client';
 
 const aliases = signal([]);
 const combos = signal([]);
 const availableModels = signal([]); // /api/models (filtered to active connections)
 const catalogModels = signal([]);   // /api/catalog/models (full catalog with source badges)
+// providerMeta keyed by provider id; mirrors providers.jsx's signal but
+// scoped to this page. Carryover #20 — the Reset confirm copy branches
+// on subscription_discoverable, which lives in this map.
+const providerMeta = signal({});
 const providerFilter = signal('all');
 
 // Inline pricing editor state. editingPricing is "<provider>/<model_id>"
@@ -64,9 +69,25 @@ function loadCatalogModels() {
   }).catch(err => {
     // M2.11 review MINOR-3: don't silently swallow catalog fetch
     // errors. An unreachable backend or 500 from the catalog DB
-    // should surface to the operator so they can act.
+    // should surface to the operator so they can act. 401 is the
+    // single exception — the sage:unauthorized event already
+    // navigates the user away; an extra toast would flash before
+    // the redirect (carryover #25).
+    if (err.silent) return;
     addToast('Failed to load catalog: ' + err.message, 'error');
   });
+}
+
+function loadProviderMeta() {
+  // /api/providers carries the subscription_discoverable flag the
+  // Reset confirm copy branches on (carryover #20). Silently no-op
+  // on failure: a missing meta map just falls through to the generic
+  // confirm copy, which is honest about the fallback behavior.
+  getProviders().then(data => {
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      providerMeta.value = data;
+    }
+  }).catch(() => {});
 }
 
 // Models Discovery M2.10 — color-coded source badges so the operator
@@ -93,7 +114,27 @@ function fmtDraftValue(v) {
 }
 
 function startEditPricing(row) {
-  editingPricing.value = row.provider + '/' + row.model_id;
+  // Carryover #22 — pricingDraft is a single global signal, so
+  // starting an edit on a second row while one is open silently
+  // discards the first row's in-progress draft. Confirm before
+  // overwriting. The (modelId !== newModelId) guard skips the prompt
+  // when the user re-clicks Edit on the same row.
+  const newModelId = row.provider + '/' + row.model_id;
+  if (editingPricing.value && editingPricing.value !== newModelId) {
+    if (!confirm(`Unsaved pricing changes on ${editingPricing.value} will be lost. Continue?`)) {
+      return;
+    }
+  }
+  // Carryover #21 — edit+reload race-safety. loadCatalogModels can
+  // fire at any time (toast retry, manual reload). The pricingDraft
+  // is keyed by (provider, model_id) — both stable identifiers — so
+  // a refresh while the user is mid-edit replaces row.input_price
+  // etc. in catalogModels but leaves pricingDraft (and editingPricing)
+  // untouched. The row identity is the same on both sides of the
+  // refresh, so when Save fires, putCatalogPricing addresses the same
+  // (provider, model_id) the user originally clicked. Safe by virtue
+  // of stable composite-key identity, not by mutex or version stamp.
+  editingPricing.value = newModelId;
   pricingDraft.value = {
     input_price: fmtDraftValue(row.input_price),
     output_price: fmtDraftValue(row.output_price),
@@ -142,10 +183,24 @@ function savePricing(row) {
 function resetPricing(row) {
   // DELETE removes the user override; next discovery / openrouter
   // refresh re-populates if one is scheduled. Idempotent. (M2.11
-  // review MINOR-2 — copy refined to be honest about the "if scheduled"
-  // condition: a non-discoverable provider has no refresh cycle and
-  // the row stays at zero pricing until manually re-priced.)
-  if (!confirm(`Remove pricing override for ${row.provider}/${row.model_id}?\nThe row will fall back to seed/discovery/OpenRouter pricing if present, or to $0 if no other source has populated this row.`)) {
+  // review MINOR-2 + carryover #20 — copy branches on the provider's
+  // subscription_discoverable flag because a non-discoverable provider
+  // has no refresh cycle to re-populate the row, and the operator
+  // should know they're committing to a manual re-price.)
+  const meta = providerMeta.value[row.provider];
+  const subscriptionDiscoverable = meta?.subscription_discoverable;
+  let confirmMsg;
+  if (subscriptionDiscoverable === false) {
+    confirmMsg = `Remove pricing override for ${row.provider}/${row.model_id}?\n\n` +
+      `This provider has no automatic refresh cycle. The row will stay at ` +
+      `seed pricing (or $0 if none) until you manually re-price it.`;
+  } else {
+    confirmMsg = `Remove pricing override for ${row.provider}/${row.model_id}?\n\n` +
+      `The row will fall back to seed/discovery/OpenRouter pricing if present, ` +
+      `or to $0 if no other source has populated this row. Next discovery / ` +
+      `OpenRouter refresh may re-populate it.`;
+  }
+  if (!confirm(confirmMsg)) {
     return;
   }
   deleteCatalogPricing(row.provider, row.model_id)
@@ -217,14 +272,15 @@ function handleDeleteCombo(id, name) {
 // PriceInput — narrow numeric input for the inline pricing editor.
 // Accepts decimals (incl. tiny per-token prices like 0.0003). The
 // onChange callback receives the raw string so the caller can decide
-// whether/when to parseFloat.
-function PriceInput({ value, onChange, placeholder }) {
+// whether/when to parseFloat. Carryover #23 — previously accepted a
+// placeholder prop that never displayed (controlled inputs always have
+// a value); dead prop removed.
+function PriceInput({ value, onChange }) {
   return (
     <input
       type="text"
       inputMode="decimal"
       value={value}
-      placeholder={placeholder}
       onInput={e => onChange(e.target.value)}
       style={{
         width: 70, padding: '4px 6px', background: 'var(--bg-2)',
@@ -361,6 +417,7 @@ export function ModelsPage() {
     loadCombos();
     loadModels();
     loadCatalogModels();
+    loadProviderMeta();
   }, []);
 
   return (
@@ -407,9 +464,18 @@ export function ModelsPage() {
             </div>
             <div style={{
               background: 'var(--bg-1)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-lg)', overflow: 'hidden',
+              borderRadius: 'var(--radius-lg)',
+              // Carryover #26 — horizontal scroll on the catalog table.
+              // The dashboard's max-width is 1100px but the 8-column
+              // catalog table (model + source + 5 prices + actions)
+              // can exceed that on a narrow viewport once OpenRouter's
+              // qualified IDs land in the Model column (vendor/model
+              // strings are wider than bare model IDs). overflow-x:
+              // auto keeps the table inside the rounded card frame
+              // without scaling its columns down to unreadable widths.
+              overflow: 'auto',
             }}>
-              <table style={{ width: '100%' }}>
+              <table style={{ width: '100%', minWidth: 720 }}>
                 <thead>
                   <tr style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                     <th style={{ padding: '8px 16px', textAlign: 'left', fontWeight: 500 }}>Model</th>
@@ -456,8 +522,8 @@ export function ModelsPage() {
                             </td>
                             <td style={{ padding: '6px 8px' }}>
                               <div style={{ display: 'flex', gap: 4 }}>
-                                <PriceInput value={pricingDraft.value.cache_read_price} onChange={v => updatePricingDraft('cache_read_price', v)} placeholder="read" />
-                                <PriceInput value={pricingDraft.value.cache_write_price} onChange={v => updatePricingDraft('cache_write_price', v)} placeholder="write" />
+                                <PriceInput value={pricingDraft.value.cache_read_price} onChange={v => updatePricingDraft('cache_read_price', v)} />
+                                <PriceInput value={pricingDraft.value.cache_write_price} onChange={v => updatePricingDraft('cache_write_price', v)} />
                               </div>
                             </td>
                             <td style={{ padding: '10px 16px', fontSize: 11, textAlign: 'right', color: 'var(--text-tertiary)' }}>

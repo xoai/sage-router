@@ -358,6 +358,11 @@ func (s *Server) executeRequestWithCtx(
 		// debounce (5 min) caps wasted lister calls to one per provider per
 		// window. A future per-executor `IsModelNotFound(statusCode, body)`
 		// helper would narrow the trigger; deferred per the M2.7 manifest.
+		// s.deps.CatalogStore == nil short-circuits here (the && in the
+		// guard) BEFORE triggerOnNotFoundDiscovery runs, so the helper
+		// itself does not need a redundant nil check on CatalogStore. A
+		// future maintainer simplifying the dispatch should preserve
+		// this gate to keep the helper's preconditions narrow.
 		if statusCode == http.StatusNotFound && s.deps.Discovery != nil && s.deps.CatalogStore != nil {
 			go s.triggerOnNotFoundDiscovery(providerID, conn)
 		}

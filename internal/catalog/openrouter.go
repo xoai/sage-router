@@ -86,6 +86,20 @@ func (o *OpenRouterRefresher) FetchAndPersist(ctx context.Context) (int, error) 
 	if err != nil {
 		return 0, fmt.Errorf("openrouter: read body: %w", err)
 	}
+	// io.LimitReader silently truncates at the cap. If the upstream
+	// payload grew past 10 MiB, json.Unmarshal will fail downstream
+	// with "unexpected end of JSON input" — an opaque error that's
+	// indistinguishable from a malformed response. Surface the
+	// truncation explicitly so the failure mode is debuggable from
+	// logs alone. The == comparison is safe: a body shorter than the
+	// cap reads its real length; an at-cap body either fits exactly
+	// (rare but possible) or was truncated (the common case for the
+	// diagnostic to fire).
+	if len(body) == openRouterBodyCap {
+		slog.Warn("openrouter response hit body cap; payload may be truncated",
+			"size", len(body),
+			"cap", openRouterBodyCap)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, snippet(body))
 	}
@@ -209,7 +223,12 @@ func parseOpenRouterPricing(body []byte) ([]PricingUpdate, error) {
 	}
 	out := make([]PricingUpdate, 0, len(resp.Data))
 	for _, e := range resp.Data {
-		if e.Pricing == nil {
+		// Entries with no pricing object or no ID are not actionable —
+		// the (provider='openrouter', model_id='') row would collide
+		// across every empty-ID entry, and an upsert without a target
+		// model_id is meaningless. Both are skipped silently; OpenRouter
+		// has never emitted either shape against the vendored fixture.
+		if e.Pricing == nil || e.ID == "" {
 			continue
 		}
 		out = append(out, PricingUpdate{

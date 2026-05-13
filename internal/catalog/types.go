@@ -32,6 +32,21 @@ const (
 	SourceUser       = "user"
 )
 
+// ValidSources returns the canonical catalog source enum values in
+// precedence order (lowest to highest). Exposed so tests can iterate
+// the canonical set from one place — TestPrecedenceMatrix_SourcesAreCanonical
+// asserts the precedence matrix covers every value returned here, so a
+// future fifth source added without matrix coverage fails loudly.
+//
+// IsValidSource MUST agree with ValidSources for any string s:
+// `IsValidSource(s) == slices.Contains(ValidSources(), s)`. The drift
+// is pinned by TestValidSources_AgreesWithIsValidSource.
+//
+// Returns a freshly-allocated slice; callers may mutate it.
+func ValidSources() []string {
+	return []string{SourceSeed, SourceDiscovery, SourceOpenRouter, SourceUser}
+}
+
 // Capability tier constants — kept in sync with config.Tier* so the
 // seed transfer is a straight copy. Lower = more capable.
 const (

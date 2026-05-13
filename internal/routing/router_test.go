@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"sort"
 	"testing"
 )
 
@@ -280,27 +281,31 @@ func TestSmartRoute_Cheap_CachedRatioZero_MatchesTodaysBehavior(t *testing.T) {
 	// the pre-M3.3 InputPrice ascending sort.
 	result := r.Route(StrategyCheap, "", testCandidates)
 
-	// Expected order: gemini-2.5-flash-lite ($0.02), gpt-4.1-nano
-	// ($0.05), gpt-4o-mini and gemini-2.5-flash (tied at $0.15;
-	// stable sort preserves input order so gpt-4o-mini first per
-	// testCandidates declaration), claude-haiku ($1.00),
-	// gpt-4o ($2.50), claude-sonnet-4-6 ($3.00).
-	expected := []string{
-		"gemini-2.5-flash-lite",
-		"gpt-4.1-nano",
-		"gpt-4o-mini",
-		"gemini-2.5-flash",
-		"claude-haiku-4-5-20251001",
-		"gpt-4o",
-		"claude-sonnet-4-6",
-	}
+	// Derive the expected order programmatically from testCandidates'
+	// own InputPrice values (carryover #49). The previous version
+	// hardcoded a 7-element slice that tracked testCandidates'
+	// declaration order; any future add/remove/reorder there would
+	// fail this test as a positional mismatch, not as a real
+	// regression of the AC26b "CachedRatio=0 ranking matches pre-M3.3"
+	// contract. sort.SliceStable on InputPrice mirrors the SmartRouter's
+	// own stable-sort behavior, so tied prices preserve declaration
+	// order in both expected and result (gpt-4o-mini before
+	// gemini-2.5-flash at $0.15).
+	expected := make([]ModelCandidate, len(testCandidates))
+	copy(expected, testCandidates)
+	sort.SliceStable(expected, func(i, j int) bool {
+		return expected[i].InputPrice < expected[j].InputPrice
+	})
+
 	if len(result) != len(expected) {
 		t.Fatalf("len = %d, want %d", len(result), len(expected))
 	}
-	for i, m := range expected {
-		if result[i].Model != m {
-			t.Errorf("position %d: got %q, want %q (AC26b: CachedRatio=0 ranking must match pre-M3.3)",
-				i, result[i].Model, m)
+	for i, exp := range expected {
+		if result[i].Model != exp.Model {
+			t.Errorf("position %d: got %q ($%.2f), want %q ($%.2f) "+
+				"(AC26b: CachedRatio=0 ranking must match InputPrice ascending)",
+				i, result[i].Model, result[i].InputPrice,
+				exp.Model, exp.InputPrice)
 		}
 	}
 }

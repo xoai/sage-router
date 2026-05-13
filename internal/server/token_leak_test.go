@@ -31,12 +31,29 @@ type tokenLeakPattern struct {
 // tokenLeakPatterns is the canonical list of provider credential
 // shapes the project must never log. Wire any new provider here when
 // it adds a new credential format.
+//
+// Pattern evolution (M3 polish):
+//   - #62: extended GitHub coverage to fine-grained PATs (`github_pat_`,
+//     underscores allowed), user-to-server OAuth (`ghu_`), and
+//     server-to-server OAuth (`ghs_`). The classic `ghp_` / `gho_`
+//     patterns remain (no underscores in their bodies).
+//   - #63: dropped `sbp_` — the placeholder didn't match any real
+//     credential format. Real Supabase service keys are JWTs (`eyJ...`),
+//     which would false-positive on every JWT in the repo, so neither
+//     prefix nor JWT pattern is appropriate.
 var tokenLeakPatterns = []tokenLeakPattern{
 	{name: "openai-apikey", regex: regexp.MustCompile(`sk-[a-zA-Z0-9_\-]{20,}`)},
 	{name: "anthropic-apikey", regex: regexp.MustCompile(`sk-ant-[a-zA-Z0-9_\-]{20,}`)},
 	{name: "google-apikey", regex: regexp.MustCompile(`AIza[A-Za-z0-9\-_]{20,}`)},
 	{name: "github-pat", regex: regexp.MustCompile(`ghp_[A-Za-z0-9]{36,}`)},
 	{name: "github-oauth", regex: regexp.MustCompile(`gho_[A-Za-z0-9]{36,}`)},
+	// Fine-grained PATs use underscores in the body (vs. classic `ghp_`
+	// which is alphanumeric only). The 36-char floor matches GitHub's
+	// public documentation and gives the same off-by-one boundary as
+	// `ghp_` for the per-pattern subtests below.
+	{name: "github-fine-grained-pat", regex: regexp.MustCompile(`github_pat_[A-Za-z0-9_]{36,}`)},
+	{name: "github-user-to-server", regex: regexp.MustCompile(`ghu_[A-Za-z0-9]{36,}`)},
+	{name: "github-server-to-server", regex: regexp.MustCompile(`ghs_[A-Za-z0-9]{36,}`)},
 	// `ya29\.` floor raised from `+` to `{40,}` after M3.7 review
 	// (MAJOR-1). Real Google OAuth access tokens are 100+ chars;
 	// the original `+` quantifier false-positived on benign log lines
@@ -44,7 +61,6 @@ var tokenLeakPatterns = []tokenLeakPattern{
 	// the minimum that comfortably exceeds any plausible identifier
 	// while still trapping real credentials.
 	{name: "google-oauth", regex: regexp.MustCompile(`ya29\.[A-Za-z0-9\-_]{40,}`)},
-	{name: "supabase-service", regex: regexp.MustCompile(`sbp_[A-Za-z0-9]{36,}`)},
 }
 
 // TestTokenLeakPatterns_MatchKnownShapes — sanity-check the regex set
@@ -70,8 +86,17 @@ func TestTokenLeakPatterns_MatchKnownShapes(t *testing.T) {
 		{"google-apikey", "AIza" + long, true},
 		{"github-pat", "ghp" + "_" + long, true},
 		{"github-oauth", "gho" + "_" + long, true},
+		{"github-fine-grained-pat", "github" + "_pat_" + long, true},
+		{"github-user-to-server", "ghu" + "_" + long, true},
+		{"github-server-to-server", "ghs" + "_" + long, true},
 		{"google-oauth", "ya29" + "." + long, true},
-		{"supabase-service", "sbp" + "_" + long, true},
+
+		// Carryover #65 — cross-match positive. `sk-ant-...` is a valid
+		// `sk-` + 20 chars, so the openai-apikey pattern intentionally
+		// matches it too. Future tightening of the `sk-` regex that
+		// excluded `sk-ant-` would silently weaken defense-in-depth;
+		// pin the cross-match contract explicitly.
+		{"openai-apikey", "sk" + "-ant-" + long, true},
 
 		// Negatives: short fakes used throughout the test suite must NOT match.
 		{"openai-apikey", "sk-test", false},
@@ -79,6 +104,9 @@ func TestTokenLeakPatterns_MatchKnownShapes(t *testing.T) {
 		{"anthropic-apikey", "sk-ant-test", false},
 		{"google-apikey", "AIza-stub", false},
 		{"github-pat", "ghp_short", false},
+		{"github-fine-grained-pat", "github_pat_short", false},
+		{"github-user-to-server", "ghu_short", false},
+		{"github-server-to-server", "ghs_short", false},
 		{"google-oauth", "ya29", false},
 		// M3.7 review MAJOR-1 follow-up: `ya29.foo` and similar short
 		// suffixes are common in benign log lines (e.g.,
@@ -88,13 +116,31 @@ func TestTokenLeakPatterns_MatchKnownShapes(t *testing.T) {
 		{"google-oauth", "ya29.foo", false},
 		{"google-oauth", "ya29.short-suffix", false},
 		{"google-oauth", "ya29." + strings.Repeat("A", 39), false}, // 1 short of the {40,} floor
-		{"supabase-service", "sbp_short", false},
 
-		// Cross-matches: anthropic samples must NOT match the openai pattern
-		// even though both start with "sk-". The openai pattern intentionally
-		// matches "sk-ant-..." too (since "sk-ant-..." is a valid "sk-..." +
-		// 20 chars), which is the correct behavior — both patterns will fire
-		// and either failure is informative.
+		// Carryover #64 — per-pattern boundary subtests. Each {N,}
+		// quantifier gets `prefix + (N-1) chars` (reject) and
+		// `prefix + N chars` (accept). Catches off-by-one regressions
+		// like a future `{20,}` → `{19,}` change that would currently
+		// slip through because every positive sample above is 40 chars
+		// (over every quantifier's floor).
+		{"openai-apikey", "sk" + "-" + strings.Repeat("A", 19), false}, // 1 short of {20,}
+		{"openai-apikey", "sk" + "-" + strings.Repeat("A", 20), true},  // exactly at floor
+		{"google-apikey", "AIza" + strings.Repeat("A", 19), false},     // 1 short of {20,}
+		{"google-apikey", "AIza" + strings.Repeat("A", 20), true},      // exactly at floor
+		{"github-pat", "ghp" + "_" + strings.Repeat("A", 35), false},   // 1 short of {36,}
+		{"github-pat", "ghp" + "_" + strings.Repeat("A", 36), true},    // exactly at floor
+		{"github-oauth", "gho" + "_" + strings.Repeat("A", 35), false},
+		{"github-oauth", "gho" + "_" + strings.Repeat("A", 36), true},
+		{"github-fine-grained-pat", "github" + "_pat_" + strings.Repeat("A", 35), false},
+		{"github-fine-grained-pat", "github" + "_pat_" + strings.Repeat("A", 36), true},
+		{"github-user-to-server", "ghu" + "_" + strings.Repeat("A", 35), false},
+		{"github-user-to-server", "ghu" + "_" + strings.Repeat("A", 36), true},
+		{"github-server-to-server", "ghs" + "_" + strings.Repeat("A", 35), false},
+		{"github-server-to-server", "ghs" + "_" + strings.Repeat("A", 36), true},
+		// ya29's floor is {40,} (raised in MAJOR-1). The 39-char negative
+		// above already covers this floor's reject case; add the at-floor
+		// accept case here for symmetry.
+		{"google-oauth", "ya29" + "." + strings.Repeat("A", 40), true},
 	}
 	for _, c := range cases {
 		// Look up the regex by name.
@@ -179,8 +225,10 @@ func TestTokenLeakPatterns_MakefileMirrorsGoRegex(t *testing.T) {
 		{"google-apikey", "AIza" + long},
 		{"github-pat", "ghp" + "_" + long},
 		{"github-oauth", "gho" + "_" + long},
+		{"github-fine-grained-pat", "github" + "_pat_" + long},
+		{"github-user-to-server", "ghu" + "_" + long},
+		{"github-server-to-server", "ghs" + "_" + long},
 		{"google-oauth", "ya29" + "." + long},
-		{"supabase-service", "sbp" + "_" + long},
 	}
 	for _, c := range cases {
 		// Find the Go pattern by name (sanity — every patternName here
