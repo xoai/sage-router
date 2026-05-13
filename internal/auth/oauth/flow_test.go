@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -73,13 +74,96 @@ func TestFlow_AuthorizeURL_HasRequiredParams(t *testing.T) {
 			t.Errorf("query[%s] = %q, want %q", k, got, want)
 		}
 	}
-	// Scopes joined with space.
-	if got := q.Get("scope"); got != "openid profile email offline_access" {
-		t.Errorf("scope = %q, want %q", got, "openid profile email offline_access")
+	// Scopes joined with space. Must match the Codex CLI canonical
+	// scope string byte-for-byte — the 4 core OIDC scopes plus the
+	// 2 connectors scopes that OpenAI's authorization server requires
+	// for this client_id (server.rs:495 in openai/codex).
+	const wantScope = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+	if got := q.Get("scope"); got != wantScope {
+		t.Errorf("scope = %q, want %q", got, wantScope)
 	}
-	// Extra param from registry.
-	if got := q.Get("codex_cli_simplified_flow"); got != "true" {
-		t.Errorf("codex_cli_simplified_flow = %q, want true", got)
+	// ExtraAuthParams from the registry, mirroring Codex CLI's
+	// authorize URL (server.rs:504-508). All three are load-bearing:
+	// - codex_cli_simplified_flow: skips an interstitial Codex consent
+	// - id_token_add_organizations: enables the chatgpt_account_id
+	//   claim in the returned id_token (AccountIDClaim path)
+	// - originator: client identifier expected by OpenAI's auth server
+	wantsExtra := map[string]string{
+		"codex_cli_simplified_flow":  "true",
+		"id_token_add_organizations": "true",
+		"originator":                 "codex_cli_rs",
+	}
+	for k, want := range wantsExtra {
+		if got := q.Get(k); got != want {
+			t.Errorf("query[%s] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestFlow_AuthorizeURL_OpenAI_GoldenFixture pins the FULL sorted
+// query-string shape of the OpenAI authorize URL against the canonical
+// Codex CLI form. Any future drift from upstream (added/removed/renamed
+// param, changed scope ordering) fails this test loudly, with a clear
+// side-by-side diff in the error message.
+//
+// This is the preventive control that would have caught the original
+// "Lỗi xác thực" bug — sage-router's authorize URL had drifted from
+// Codex CLI upstream silently, and the only way to discover it was a
+// user-screenshot in production.
+//
+// Update by refreshing the golden string after re-fetching upstream
+// (openai/codex codex-rs/login/src/server.rs) and confirming the new
+// param set is correct.
+func TestFlow_AuthorizeURL_OpenAI_GoldenFixture(t *testing.T) {
+	f, err := NewFlow("openai", "Work")
+	if err != nil {
+		t.Fatalf("NewFlow: %v", err)
+	}
+	const redirectURI = "http://localhost:1455/auth/callback"
+	authURL := f.AuthorizeURL(redirectURI)
+
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// Sorted query params (excluding the dynamic state + code_challenge
+	// which carry per-flow randomness). The remaining params must
+	// match upstream byte-for-byte.
+	got := u.Query()
+	got.Del("state")
+	got.Del("code_challenge")
+
+	// Sort keys for deterministic comparison.
+	var keys []string
+	for k := range got {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	type kv struct{ k, v string }
+	var pairs []kv
+	for _, k := range keys {
+		pairs = append(pairs, kv{k, got.Get(k)})
+	}
+	wantPairs := []kv{
+		{"client_id", "app_EMoamEEZ73f0CkXaXp7hrann"},
+		{"code_challenge_method", "S256"},
+		{"codex_cli_simplified_flow", "true"},
+		{"id_token_add_organizations", "true"},
+		{"originator", "codex_cli_rs"},
+		{"redirect_uri", redirectURI},
+		{"response_type", "code"},
+		{"scope", "openid profile email offline_access api.connectors.read api.connectors.invoke"},
+	}
+	if len(pairs) != len(wantPairs) {
+		t.Fatalf("got %d params (after stripping state+challenge), want %d.\n  got: %+v\n  want: %+v",
+			len(pairs), len(wantPairs), pairs, wantPairs)
+	}
+	for i := range pairs {
+		if pairs[i] != wantPairs[i] {
+			t.Errorf("param %d: got %+v, want %+v", i, pairs[i], wantPairs[i])
+		}
 	}
 }
 

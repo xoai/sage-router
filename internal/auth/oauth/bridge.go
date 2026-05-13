@@ -286,6 +286,23 @@ func (b *Bridge) Health(providerID string) string {
 // CallbackURL returns the redirect_uri the provider should be told to
 // redirect to. Useful in tests where the actual port is OS-assigned; in
 // production this matches the spec-mandated values.
+//
+// Host is hardcoded to "localhost" — NOT the listener's bound IP
+// ("127.0.0.1"). The OS resolves "localhost" to the loopback address
+// via /etc/hosts, so the browser still reaches our listener; but
+// upstream OAuth servers (notably OpenAI's Hydra-based Authorization
+// Server — see codex-rs/login/src/server.rs:57 "Keep in sync with the
+// Codex CLI Hydra redirect URI allow-list") enforce strict redirect_uri
+// matching against a registered allow-list (RFC 6749 §3.1.2.3 +
+// RFC 8252 §7.3). The Codex CLI public client_id has
+// "http://localhost:1455/auth/callback" registered, not the 127.0.0.1
+// form — so the URL string we send must be "localhost". Same convention
+// applies to the Anthropic Claude Code client.
+//
+// listenAddrs[providerID] still uses 127.0.0.1 (the bind address);
+// we only override the host substring of the URL we emit to the
+// provider. Port comes from listenAddrs to support test bridges with
+// OS-assigned ports.
 func (b *Bridge) CallbackURL(providerID string) string {
 	b.mu.RLock()
 	addr, hasAddr := b.listenAddrs[providerID]
@@ -297,7 +314,13 @@ func (b *Bridge) CallbackURL(providerID string) string {
 	if !ok {
 		return ""
 	}
-	return "http://" + addr + cfg.RedirectPath
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Preserve the existing failure-soft contract: empty string
+		// when we cannot build a valid URL. Callers already handle "".
+		return ""
+	}
+	return "http://localhost:" + port + cfg.RedirectPath
 }
 
 // Register adds a Flow to the pending map with the configured TTL. The

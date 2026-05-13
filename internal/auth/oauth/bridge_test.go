@@ -78,11 +78,18 @@ func TestBridge_StartAssignsEphemeralPorts(t *testing.T) {
 	if b.Health("anthropic") != HealthAvailable {
 		t.Errorf("anthropic health = %q, want available", b.Health("anthropic"))
 	}
-	if !strings.HasPrefix(b.CallbackURL("openai"), "http://127.0.0.1:") {
+	// CallbackURL emits "localhost" (not the bound 127.0.0.1) because
+	// OpenAI's Hydra auth server strict-matches against a registered
+	// allow-list keyed on the literal "localhost" form. Same convention
+	// for Anthropic's Claude Code client.
+	if !strings.HasPrefix(b.CallbackURL("openai"), "http://localhost:") {
 		t.Errorf("CallbackURL malformed: %s", b.CallbackURL("openai"))
 	}
 	if !strings.HasSuffix(b.CallbackURL("openai"), "/auth/callback") {
 		t.Errorf("openai CallbackURL must end in /auth/callback; got %s", b.CallbackURL("openai"))
+	}
+	if !strings.HasPrefix(b.CallbackURL("anthropic"), "http://localhost:") {
+		t.Errorf("anthropic CallbackURL malformed: %s", b.CallbackURL("anthropic"))
 	}
 	if !strings.HasSuffix(b.CallbackURL("anthropic"), "/callback") {
 		t.Errorf("anthropic CallbackURL must end in /callback; got %s", b.CallbackURL("anthropic"))

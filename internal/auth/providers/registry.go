@@ -83,9 +83,25 @@ var Providers = map[string]ProviderConfig{
 		AuthorizeURL: "https://auth.openai.com/oauth/authorize",
 		TokenURL:     "https://auth.openai.com/oauth/token",
 		ClientID:     "app_EMoamEEZ73f0CkXaXp7hrann",
-		Scopes:       []string{"openid", "profile", "email", "offline_access"},
+		// Scopes mirror codex-rs/login/src/server.rs:495 verbatim:
+		//   "openid profile email offline_access api.connectors.read api.connectors.invoke"
+		// api.connectors.* are required by OpenAI's authorization server
+		// for this client_id; omitting them caused authorize-time
+		// rejection (visible to the user as "Lỗi xác thực" / auth error).
+		Scopes: []string{"openid", "profile", "email", "offline_access", "api.connectors.read", "api.connectors.invoke"},
+		// ExtraAuthParams mirror codex-rs/login/src/server.rs:504-508:
+		//   codex_cli_simplified_flow=true
+		//   id_token_add_organizations=true   (load-bearing for the
+		//     AccountIDClaim path at line 92 below — without it, the
+		//     id_token lacks the chatgpt_account_id claim)
+		//   originator=codex_cli_rs           (the upstream
+		//     DEFAULT_ORIGINATOR const from codex-rs/login/src/auth/
+		//     default_client.rs:36; required to identify the client
+		//     to OpenAI's authorization server)
 		ExtraAuthParams: map[string]string{
-			"codex_cli_simplified_flow": "true",
+			"codex_cli_simplified_flow":    "true",
+			"id_token_add_organizations":   "true",
+			"originator":                   "codex_cli_rs",
 		},
 		RedirectPort:     1455,
 		RedirectPath:     "/auth/callback",

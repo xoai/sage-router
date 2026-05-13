@@ -121,3 +121,48 @@ func TestPKCEProviders_HaveExpectedRedirectPorts(t *testing.T) {
 		t.Errorf("anthropic RedirectPort = %d, want %d", got, want)
 	}
 }
+
+// TestOpenAI_PKCE_HasCodexCLIAuthShape pins the OpenAI Scopes slice
+// and ExtraAuthParams map byte-for-byte against the Codex CLI canonical
+// shape at openai/codex codex-rs/login/src/server.rs:495,504-512 and
+// codex-rs/login/src/auth/default_client.rs:36 (DEFAULT_ORIGINATOR).
+//
+// Drift protection: if a future careless edit drops a scope or extra
+// param, this test fires before the user ever sees the broken
+// authorize URL. The original "Lỗi xác thực" bug shipped without
+// this assertion — it now exists specifically to prevent recurrence.
+//
+// When refreshing against newer Codex CLI upstream, update both
+// halves of this test AND the registry entry together.
+func TestOpenAI_PKCE_HasCodexCLIAuthShape(t *testing.T) {
+	cfg := Providers["openai"]
+
+	wantScopes := []string{
+		"openid", "profile", "email", "offline_access",
+		"api.connectors.read", "api.connectors.invoke",
+	}
+	if len(cfg.Scopes) != len(wantScopes) {
+		t.Fatalf("Scopes count = %d, want %d (Codex CLI canonical): got=%v want=%v",
+			len(cfg.Scopes), len(wantScopes), cfg.Scopes, wantScopes)
+	}
+	for i, want := range wantScopes {
+		if cfg.Scopes[i] != want {
+			t.Errorf("Scopes[%d] = %q, want %q", i, cfg.Scopes[i], want)
+		}
+	}
+
+	wantExtra := map[string]string{
+		"codex_cli_simplified_flow":  "true",
+		"id_token_add_organizations": "true",
+		"originator":                 "codex_cli_rs",
+	}
+	if len(cfg.ExtraAuthParams) != len(wantExtra) {
+		t.Fatalf("ExtraAuthParams count = %d, want %d: got=%v want=%v",
+			len(cfg.ExtraAuthParams), len(wantExtra), cfg.ExtraAuthParams, wantExtra)
+	}
+	for k, want := range wantExtra {
+		if got := cfg.ExtraAuthParams[k]; got != want {
+			t.Errorf("ExtraAuthParams[%q] = %q, want %q", k, got, want)
+		}
+	}
+}
