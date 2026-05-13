@@ -4,8 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 )
+
+// ErrSettingNotFound is returned (wrapped via %w) by Store.GetSetting
+// when no row exists for the requested key. Callers that need to
+// distinguish "row absent" from "I/O failure" can check via
+// `errors.Is(err, store.ErrSettingNotFound)`. The wrapping message
+// includes the key name for log-side diagnostics; the sentinel
+// guarantees structural matching independent of the message format.
+var ErrSettingNotFound = errors.New("setting not found")
 
 // Store defines the persistence interface for sage-router.
 type Store interface {
@@ -43,7 +52,14 @@ type Store interface {
 	DeleteAPIKey(id string) error
 	GetMonthlySpend(keyID string) (float64, error)
 
-	// Settings (key-value configuration)
+	// Settings (key-value configuration).
+	//
+	// GetSetting returns (value, nil) when the row exists (including
+	// when the stored value is the explicit empty string), and
+	// ("", wrapped ErrSettingNotFound) when the row is missing. Use
+	// `errors.Is(err, ErrSettingNotFound)` to distinguish the absent
+	// case from I/O errors. A non-nil error that does NOT match the
+	// sentinel indicates a real DB problem (driver, schema, transport).
 	GetSetting(key string) (string, error)
 	SetSetting(key, value string) error
 	AllSettings() (map[string]string, error)

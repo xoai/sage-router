@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -243,16 +244,20 @@ func main() {
 	// at web/dashboard/src/pages/providers.jsx surfaces this to operators.
 	settingValue, settingErr := db.GetSetting("openrouter_refresh_enabled")
 	switch {
-	case settingErr != nil:
-		slog.Warn("openrouter_refresh_enabled lookup failed; refresher disabled this boot",
-			"err", settingErr)
-	case settingValue == "":
+	case errors.Is(settingErr, store.ErrSettingNotFound):
 		// Missing setting row — fail-closed (refresher off). Bootstrap
 		// (wireCatalog/M1.11) seeds the row to "true" on first boot, so a
 		// missing row indicates a non-bootstrapped or manually-edited DB.
 		// Surface explicitly so the operator can spot the misconfiguration.
+		//
+		// ORDER MATTERS: this arm MUST precede the generic settingErr != nil
+		// arm because the wrapped not-found error is also non-nil, and
+		// Go switch evaluates top-to-bottom with first-match-wins.
 		slog.Warn("openrouter_refresh_enabled setting absent; refresher disabled this boot",
 			"hint", "wireCatalog seeds this on first boot; re-run bootstrap if expected")
+	case settingErr != nil:
+		slog.Warn("openrouter_refresh_enabled lookup failed; refresher disabled this boot",
+			"err", settingErr)
 	case settingValue == "true":
 		(&catalog.OpenRouterRefresher{
 			Store:    catalogW.Store,

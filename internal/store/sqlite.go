@@ -674,7 +674,11 @@ func (s *sqliteStore) GetSetting(key string) (string, error) {
 	var val string
 	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val)
 	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("setting %q not found", key)
+		// Wrap ErrSettingNotFound so callers can branch on the
+		// absent-row case via errors.Is. The key name is interpolated
+		// for log-side diagnostics; the sentinel guarantees structural
+		// matching regardless of message format.
+		return "", fmt.Errorf("setting %q: %w", key, ErrSettingNotFound)
 	}
 	return val, err
 }
