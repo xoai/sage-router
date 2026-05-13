@@ -3,6 +3,7 @@ import { useEffect } from 'preact/hooks';
 import {
   getOAuthHealth, rebindOAuthPort, startOAuthFlow, getOAuthStatus,
   importSubscription,
+  TOS_GATE_STATUS,
 } from '../api/oauth';
 import { createConnection, detectClaude, getConnections } from '../api/client';
 import { addToast } from './toast';
@@ -75,11 +76,11 @@ function resetState() {
   stopStatusPoll();
 }
 
-// Handle a 412 requires_tos response: stash the message + a retry
-// thunk, then the parent renders the TosModal which calls onAccept →
-// runs retry.
+// Handle a TOS_GATE_STATUS (428) requires_tos response: stash the
+// message + a retry thunk, then the parent renders the TosModal which
+// calls onAccept → runs retry.
 function handleTosGate(res, retry) {
-  if (res.status === 412 && res.data?.requires_tos) {
+  if (res.status === TOS_GATE_STATUS && res.data?.requires_tos) {
     tosPrompt.value = {
       message: res.data.message || 'Subscription terms require acceptance.',
       retry,
@@ -344,7 +345,7 @@ function FlowPending({ state }) {
 //  1. PKCE OAuth (subscription) for OpenAI / Anthropic
 //  2. CLI import for the four subscription providers
 //  3. API key (existing path)
-// Triggers TosModal on first subscription action via the 412 gate.
+// Triggers TosModal on first subscription action via the 428 (TOS_GATE_STATUS) gate.
 export function ConnectionAddModal({ onClose, onAdded }) {
   useEffect(() => {
     startHealthPoll();

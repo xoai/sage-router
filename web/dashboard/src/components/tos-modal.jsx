@@ -2,7 +2,8 @@ import { acceptTOS } from '../api/oauth';
 import { addToast } from './toast';
 
 // TosModal — shown on first subscription action when the backend returns
-// 412 {requires_tos:true, message}. Acceptance is idempotent server-side
+// 428 {requires_tos:true, message} (RFC 6585 PreconditionRequired; see
+// TOS_GATE_STATUS in api/oauth.js). Acceptance is idempotent server-side
 // (AC40) and persists across restarts, so this only appears once per
 // sage-router instance.
 //

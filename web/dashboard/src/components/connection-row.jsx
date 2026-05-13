@@ -3,7 +3,7 @@ import { useEffect } from 'preact/hooks';
 import { StatusDot } from './status-dot';
 import { addToast } from './toast';
 import { testConnection, deleteConnection, updateConnection } from '../api/client';
-import { startOAuthFlow, getOAuthStatus } from '../api/oauth';
+import { startOAuthFlow, getOAuthStatus, TOS_GATE_STATUS } from '../api/oauth';
 
 // "Re-authenticate" → "Switch to API key" is taken when last_error
 // signals provider rejection rather than a transient/refresh failure.
@@ -109,7 +109,7 @@ function SwitchToApiKeyForm({ conn, onDone, onCancel }) {
 // the existing "multiple subscription connections of same provider" model).
 function reauthenticate(provider) {
   startOAuthFlow({ provider, name: '', priority: 0 }).then(res => {
-    if (res.status === 412 && res.data?.requires_tos) {
+    if (res.status === TOS_GATE_STATUS && res.data?.requires_tos) {
       addToast('Open Add Provider to accept the terms first', 'warning');
       return;
     }

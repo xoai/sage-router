@@ -39,8 +39,10 @@ type startFlowResponse struct {
 // Captures the request Origin so the bridge can redirect back after the
 // callback. Returns the authorize URL the dashboard opens in a new tab.
 //
-// TOS gate: returns 412 with {requires_tos: true, message} if the user
-// hasn't acknowledged the subscription-auth TOS.
+// TOS gate: returns 428 (PreconditionRequired) with {requires_tos: true,
+// message} if the user hasn't acknowledged the subscription-auth TOS.
+// Pinned by routes_auth_oauth_test.go:88 and subscription_e2e_test.go:251;
+// the JS dashboard consumes this via TOS_GATE_STATUS in api/oauth.js.
 func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	s.startFlowImpl(w, r, true /* dashboard */)
 }
