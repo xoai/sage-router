@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -27,7 +28,9 @@ import (
 
 const (
 	anthropicAPIVersion    = "2023-06-01"
-	anthropicModelsPath    = "/v1/models"
+	// BaseURL already includes /v1 (config.KnownProviders) — append only the
+	// resource path. See plan 20260514-discovery-url-doubling.
+	anthropicModelsPath    = "/models"
 	anthropicModelsPerPage = 1000 // server max — minimises pagination
 )
 
@@ -62,12 +65,27 @@ type anthropicCapabilitySet struct {
 func listAnthropicModels(ctx context.Context, creds ListerCredentials) ([]Model, error) {
 	url := strings.TrimRight(creds.BaseURL, "/") + anthropicModelsPath +
 		fmt.Sprintf("?limit=%d", anthropicModelsPerPage)
+	slog.Debug("lister: request URL", "provider", "anthropic", "url", url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("lister anthropic: build request: %w", err)
 	}
-	req.Header.Set("x-api-key", creds.APIKey)
+	// Anthropic accepts x-api-key for API-key auth and Authorization:
+	// Bearer for OAuth subscription tokens. Mirrors the executor pattern
+	// at internal/executor/default.go:55-69. If creds.AccessToken is set
+	// it's a subscription connection — use Bearer; otherwise use the
+	// classic x-api-key header.
+	//
+	// R1 (per fix plan): if /v1/models rejects Bearer JWTs (only x-api-key),
+	// this fix is no-worse-than-today (an empty x-api-key 401s the same
+	// way an unauthenticated Bearer would). Follow-up: flip
+	// SubscriptionDiscoverable=false for anthropic if empirically observed.
+	if creds.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+	} else {
+		req.Header.Set("x-api-key", creds.APIKey)
+	}
 	req.Header.Set("anthropic-version", anthropicAPIVersion)
 	for k, v := range creds.ExtraHeaders {
 		req.Header.Set(k, v)

@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // helper creates a fresh idle connection for tests.
@@ -500,5 +501,123 @@ func TestConnectionConsecutiveUses(t *testing.T) {
 	// After MarkSuccess reset + another use, counter should be 1 again.
 	if c.ConsecutiveUses() != 1 {
 		t.Fatalf("after 3rd MarkUsed: expected 1, got %d", c.ConsecutiveUses())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 20260516-connection-runtime-state — snapshot accessor tests.
+// Verify that ModelDenylistSnapshot + ModelLocksSnapshot:
+//   - return an independent copy (mutating the result doesn't affect the conn)
+//   - exclude entries with expired expiries (match the live-filter semantics)
+//   - return a non-nil empty map when there are no active entries
+//   - are race-free under concurrent state transitions
+
+func TestConnection_ModelDenylistSnapshot(t *testing.T) {
+	c := NewConnection("conn-1", "openai", "primary", 0, "subscription")
+
+	// Mix of active + expired entries via the test helper.
+	c.addModelDenylistFor("gpt-5-nano", 1*time.Hour)
+	c.addModelDenylistFor("gpt-4o", 1*time.Hour)
+	c.addModelDenylistFor("expired-model", -1*time.Hour) // already expired
+
+	snap := c.ModelDenylistSnapshot()
+
+	if _, ok := snap["gpt-5-nano"]; !ok {
+		t.Errorf("expected gpt-5-nano in snapshot (active entry)")
+	}
+	if _, ok := snap["gpt-4o"]; !ok {
+		t.Errorf("expected gpt-4o in snapshot (active entry)")
+	}
+	if _, ok := snap["expired-model"]; ok {
+		t.Errorf("expected expired-model NOT in snapshot (expired entry should be excluded)")
+	}
+	if len(snap) != 2 {
+		t.Errorf("expected exactly 2 active entries, got %d: %v", len(snap), snap)
+	}
+
+	// Mutating the snapshot must not affect the connection.
+	delete(snap, "gpt-5-nano")
+	snap["bogus"] = time.Now().Add(1 * time.Hour)
+	snap2 := c.ModelDenylistSnapshot()
+	if _, ok := snap2["gpt-5-nano"]; !ok {
+		t.Errorf("snapshot mutation leaked into connection — gpt-5-nano removed")
+	}
+	if _, ok := snap2["bogus"]; ok {
+		t.Errorf("snapshot mutation leaked into connection — bogus added")
+	}
+}
+
+func TestConnection_ModelLocksSnapshot(t *testing.T) {
+	c := NewConnection("conn-1", "openai", "primary", 0, "subscription")
+	_ = c.MarkUsed()
+	if err := c.MarkRateLimited("gpt-5-nano", 0); err != nil {
+		t.Fatalf("MarkRateLimited: %v", err)
+	}
+
+	snap := c.ModelLocksSnapshot()
+	if expiry, ok := snap["gpt-5-nano"]; !ok {
+		t.Errorf("expected gpt-5-nano in lock snapshot after MarkRateLimited")
+	} else if !time.Now().Before(expiry) {
+		t.Errorf("expected lock expiry in the future, got %v", expiry)
+	}
+
+	// Snapshot is a copy.
+	snap["fake-model"] = time.Now().Add(1 * time.Hour)
+	snap2 := c.ModelLocksSnapshot()
+	if _, ok := snap2["fake-model"]; ok {
+		t.Errorf("snapshot mutation leaked into connection")
+	}
+}
+
+func TestConnection_SnapshotExcludesExpired_Boundary(t *testing.T) {
+	c := NewConnection("conn-1", "openai", "primary", 0, "subscription")
+
+	// Use addModelDenylistFor with explicit TTLs spanning the boundary.
+	// Note: the helper uses time.Now() + ttl, so a negative TTL yields a past expiry.
+	c.addModelDenylistFor("just-expired", -1*time.Nanosecond)
+	c.addModelDenylistFor("barely-active", 1*time.Second)
+
+	snap := c.ModelDenylistSnapshot()
+	if _, ok := snap["just-expired"]; ok {
+		t.Errorf("just-expired entry should be excluded from snapshot")
+	}
+	if _, ok := snap["barely-active"]; !ok {
+		t.Errorf("barely-active entry should be included in snapshot")
+	}
+}
+
+func TestConnection_SnapshotConcurrentWithTransition(t *testing.T) {
+	// go test -race detector confirms no data race between snapshot reads
+	// and state-mutating writes (MarkRateLimited + RecordModelRejection).
+	c := NewConnection("conn-1", "openai", "primary", 0, "subscription")
+	_ = c.MarkUsed()
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			c.RecordModelRejection("model-" + string(rune('a'+i%26)))
+		}
+		close(done)
+	}()
+	for i := 0; i < 200; i++ {
+		_ = c.ModelDenylistSnapshot()
+		_ = c.ModelLocksSnapshot()
+	}
+	<-done
+}
+
+func TestConnection_SnapshotEmptyReturnsNonNil(t *testing.T) {
+	c := NewConnection("conn-1", "openai", "primary", 0, "subscription")
+	// Fresh connection — no denylist or locks.
+	dn := c.ModelDenylistSnapshot()
+	lk := c.ModelLocksSnapshot()
+	if dn == nil {
+		t.Errorf("ModelDenylistSnapshot should return empty non-nil map, got nil")
+	}
+	if lk == nil {
+		t.Errorf("ModelLocksSnapshot should return empty non-nil map, got nil")
+	}
+	if len(dn) != 0 || len(lk) != 0 {
+		t.Errorf("expected empty snapshots, got denylist=%v locks=%v", dn, lk)
 	}
 }

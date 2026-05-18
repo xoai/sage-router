@@ -124,25 +124,51 @@ func TestModelDenylistAcceptsCustomTTL(t *testing.T) {
 
 // AC22: subscription connections are filtered out for models not in their
 // allowlist; api-key connections for the same provider continue to serve.
+// Test target switched from openai to anthropic in cycle
+// 20260517-provider-auth-variants — openai's SubscriptionAllowedModels was
+// removed (M5.10 pulled forward to M2); openai subscription connections
+// now pass-through any model and rely on backend gate at the codex
+// surface. Anthropic still uses the static allowlist.
 func TestCanServeModel_SubscriptionAllowlistEnforced(t *testing.T) {
-	sub := NewConnection("s1", "openai", "Subscription", 0, "subscription")
-	apiKey := NewConnection("a1", "openai", "ApiKey", 0, "apikey")
+	sub := NewConnection("s1", "anthropic", "Subscription", 0, "subscription")
+	apiKey := NewConnection("a1", "anthropic", "ApiKey", 0, "apikey")
 
-	// A model that IS in OpenAI's subscription allowlist (gpt-5).
-	if !sub.CanServeModel("gpt-5") {
-		t.Error("subscription connection should serve gpt-5 (in allowlist)")
+	// A model that IS in Anthropic's subscription allowlist (claude-sonnet-4-x).
+	if !sub.CanServeModel("claude-sonnet-4-6") {
+		t.Error("subscription connection should serve claude-sonnet-4-6 (matches claude-sonnet-4-x wildcard)")
 	}
-	if !apiKey.CanServeModel("gpt-5") {
+	if !apiKey.CanServeModel("claude-sonnet-4-6") {
 		t.Error("apikey connection should always serve any model")
 	}
 
-	// A model that is NOT in OpenAI's subscription allowlist
-	// (gpt-3.5-turbo-instruct, a retired Completions API model).
-	if sub.CanServeModel("gpt-3.5-turbo-instruct") {
-		t.Error("subscription connection should NOT serve gpt-3.5-turbo-instruct (not in allowlist)")
+	// A model that is NOT in Anthropic's subscription allowlist
+	// (claude-2 is a legacy model not exposed via subscription).
+	if sub.CanServeModel("claude-2") {
+		t.Error("subscription connection should NOT serve claude-2 (not in allowlist)")
 	}
-	if !apiKey.CanServeModel("gpt-3.5-turbo-instruct") {
-		t.Error("apikey connection should still serve gpt-3.5-turbo-instruct (no subscription restriction)")
+	if !apiKey.CanServeModel("claude-2") {
+		t.Error("apikey connection should still serve claude-2 (no subscription restriction)")
+	}
+}
+
+// TestCanServeModel_OpenAISubscriptionPassesThroughAllModels — pins the
+// post-M5.10-pulled-forward behavior: openai subscription has no static
+// allowlist; CanServeModel returns true for any model, and the codex
+// backend's per-account whitelist gates the actual resolution. M0.8 live
+// validation evidence: prolite-tier account accepts gpt-5.4, rejects
+// gpt-5.2 — neither was in the previous static allowlist; both should
+// now reach the backend for a clean error.
+func TestCanServeModel_OpenAISubscriptionPassesThroughAllModels(t *testing.T) {
+	sub := NewConnection("s1", "openai", "Subscription", 0, "subscription")
+	// gpt-5.4 — M0-validated working model.
+	if !sub.CanServeModel("gpt-5.4") {
+		t.Error("openai subscription should serve gpt-5.4 (M0-validated; static allowlist removed)")
+	}
+	// gpt-3.5-turbo-instruct — retired model; backend will reject with a
+	// clear error. CanServeModel passes through; the gate is at the
+	// upstream backend, not sage-router.
+	if !sub.CanServeModel("gpt-3.5-turbo-instruct") {
+		t.Error("openai subscription should pass-through any model (backend gates); got CanServeModel=false")
 	}
 }
 

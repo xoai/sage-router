@@ -13,6 +13,12 @@ const (
 	StrategyFast     Strategy = "fast"
 	StrategyCheap    Strategy = "cheap"
 	StrategyBest     Strategy = "best"
+	// StrategyUserOrder preserves the order of candidates passed by the caller.
+	// Pre-sort happens UPSTREAM (server.resolveModel pre-sorts candidates by
+	// the API key's allowed_models position via sortByAllowedModelsOrder); the
+	// sortByStrategy case is a stable-sort no-op that preserves that order.
+	// Cycle 20260516-routing-strategy-ux.
+	StrategyUserOrder Strategy = "user-order"
 )
 
 // ModelCandidate represents a model available for routing.
@@ -67,7 +73,7 @@ func ParseAutoModel(model string) (Strategy, bool) {
 	if strings.HasPrefix(model, "auto:") {
 		s := Strategy(strings.TrimPrefix(model, "auto:"))
 		switch s {
-		case StrategyFast, StrategyCheap, StrategyBest, StrategyBalanced:
+		case StrategyFast, StrategyCheap, StrategyBest, StrategyBalanced, StrategyUserOrder:
 			return s, true
 		}
 		// Unknown strategy, default to balanced
@@ -92,7 +98,11 @@ func (r *SmartRouter) RouteWithConstraints(strategy Strategy, firstMsg string, a
 	// 1. Filter by hard constraints (Layer 2)
 	candidates := FilterByConstraints(available, constraints)
 
-	// 2. Check session affinity
+	// 2. Check session affinity.
+	// AC-H7 (cycle 20260516-routing-strategy-ux): affinity overrides ALL
+	// strategies including user-order. User-order applies on affinity-miss
+	// (first session request OR post-TTL). This preserves the existing
+	// sticky-routing semantic for users who rely on session stability.
 	if r.Affinity != nil && firstMsg != "" {
 		if entry := r.Affinity.Get(firstMsg); entry != nil {
 			return r.buildAffinityList(entry, candidates)
@@ -236,6 +246,13 @@ func sortByStrategy(strategy Strategy, candidates []ModelCandidate) []ModelCandi
 				return a.Tier < b.Tier
 			}
 			return a.InputPrice < b.InputPrice
+		case StrategyUserOrder:
+			// Stable-sort no-op: returning false for all pairs means
+			// sort.SliceStable performs no swaps and input order is
+			// preserved exactly. Cycle 20260516-routing-strategy-ux —
+			// pre-sort by allowed_models position happens upstream in
+			// server.resolveModel (sortByAllowedModelsOrder).
+			return false
 		default:
 			return a.Tier < b.Tier
 		}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -127,9 +128,12 @@ func (o *OpenRouterRefresher) FetchAndPersist(ctx context.Context) (int, error) 
 	// the window acceptable; tightening it to one combined tx is a
 	// future Store-interface change tracked as M2-close carry-over.
 	//
-	// Registry invalidation: any successful UpsertModel mutates the
-	// catalog the Registry caches. Use a defer so partial-write paths
-	// (including the bulk pricing failure) still invalidate.
+	// Registry invalidation: any successful write (model or pricing)
+	// mutates the catalog the Registry caches. Use a defer so partial-
+	// write paths still invalidate. See fix 20260514-pricing-mirror —
+	// Stage 5 below ensures mirror-only refreshes (no new openrouter
+	// model rows; only pricing rows for existing direct-provider rows)
+	// also trip this defer.
 	var anyWritten bool
 	defer func() {
 		if anyWritten && o.Registry != nil {
@@ -137,7 +141,27 @@ func (o *OpenRouterRefresher) FetchAndPersist(ctx context.Context) (int, error) 
 		}
 	}()
 
+	// Stage 1: separate openrouter-namespace entries from mirror
+	// candidates. Only openrouter entries get UpsertModel calls —
+	// mirror candidates target direct-provider catalog_models rows
+	// that already exist (and have richer capability flags from the
+	// direct discovery lister; clobbering with source=openrouter would
+	// zero those out via UPSERT). See fix 20260514-pricing-mirror.
+	var openrouterEntries []PricingUpdate
+	var mirrorCandidates []PricingUpdate
 	for _, u := range updates {
+		if u.Provider == "openrouter" {
+			openrouterEntries = append(openrouterEntries, u)
+		} else {
+			mirrorCandidates = append(mirrorCandidates, u)
+		}
+	}
+
+	// Stage 2: write openrouter model rows. Mirror candidates do NOT
+	// pass through this loop — their direct-provider model rows are
+	// already present via discovery, and writing source=openrouter
+	// there would clobber discovery's capability flags.
+	for _, u := range openrouterEntries {
 		m := Model{
 			Provider: u.Provider,
 			ModelID:  u.ModelID,
@@ -149,11 +173,43 @@ func (o *OpenRouterRefresher) FetchAndPersist(ctx context.Context) (int, error) 
 		anyWritten = true
 	}
 
-	if err := o.Store.BulkUpsertPricing(ctx, updates); err != nil {
+	// Stage 3: resolve mirror candidates against existing
+	// catalog_models rows via normalized-ID matching. Anthropic IDs
+	// need dot→dash + date-suffix strip (see openrouter_normalize.go).
+	// Pre-fetch is one SQL query per refresh.
+	var resolvedMirror []PricingUpdate
+	if len(mirrorCandidates) > 0 {
+		candidateProviders := uniqueProviders(mirrorCandidates)
+		existing, listErr := o.Store.ListModelIDsForProviders(ctx, candidateProviders)
+		if listErr != nil {
+			slog.Warn("openrouter: mirror prefetch failed; skipping mirror writes",
+				"err", listErr, "providers", candidateProviders)
+		} else {
+			resolvedMirror = resolveMirrorCandidates(mirrorCandidates, existing)
+		}
+	}
+
+	// Stage 4: bulk pricing write — openrouter rows + resolved mirror
+	// rows. Both carry source=openrouter; ADR-2 pricing precedence
+	// (user > openrouter > discovery > seed) handles the override
+	// correctly. Mirror rows that don't match (e.g., gemini openrouter
+	// IDs when no gemini connection exists) were filtered out at
+	// Stage 3, so no FK violations here.
+	allPricing := append(openrouterEntries, resolvedMirror...)
+	if err := o.Store.BulkUpsertPricing(ctx, allPricing); err != nil {
 		return 0, fmt.Errorf("openrouter: bulk upsert pricing: %w", err)
 	}
 
-	return len(updates), nil
+	// Stage 5: ensure Registry cache invalidates on mirror-only
+	// refreshes (no openrouter model rows written, but pricing rows
+	// were written for existing direct-provider rows). The defer at
+	// Stage 0 already fires when Stage 2 set anyWritten=true; this
+	// extends the trigger to pricing-only writes too.
+	if len(resolvedMirror) > 0 {
+		anyWritten = true
+	}
+
+	return len(allPricing), nil
 }
 
 // Start spawns a background goroutine that does an initial refresh
@@ -231,18 +287,35 @@ func parseOpenRouterPricing(body []byte) ([]PricingUpdate, error) {
 		if e.Pricing == nil || e.ID == "" {
 			continue
 		}
+		pricing := Pricing{
+			Input:      parseORFloat(e.ID, "prompt", e.Pricing.Prompt),
+			Output:     parseORFloat(e.ID, "completion", e.Pricing.Completion),
+			CacheRead:  parseORFloat(e.ID, "input_cache_read", e.Pricing.InputCacheRead),
+			CacheWrite: parseORFloat(e.ID, "input_cache_write", e.Pricing.InputCacheWrite),
+			Thinking:   parseORFloat(e.ID, "internal_reasoning", e.Pricing.InternalReasoning),
+			Source:     SourceOpenRouter,
+		}
+		// Always emit the openrouter-namespace entry.
 		out = append(out, PricingUpdate{
 			Provider: "openrouter",
 			ModelID:  e.ID,
-			Pricing: Pricing{
-				Input:      parseORFloat(e.ID, "prompt", e.Pricing.Prompt),
-				Output:     parseORFloat(e.ID, "completion", e.Pricing.Completion),
-				CacheRead:  parseORFloat(e.ID, "input_cache_read", e.Pricing.InputCacheRead),
-				CacheWrite: parseORFloat(e.ID, "input_cache_write", e.Pricing.InputCacheWrite),
-				Thinking:   parseORFloat(e.ID, "internal_reasoning", e.Pricing.InternalReasoning),
-				Source:     SourceOpenRouter,
-			},
+			Pricing:  pricing,
 		})
+		// Additionally emit a mirror candidate when the prefix maps to
+		// a sage-router provider key. The candidate's model_id is the
+		// raw bare ID — FetchAndPersist Stage 3 will normalize it and
+		// resolve against existing catalog_models rows. Unknown prefixes
+		// (e.g., meta-llama/*, mistralai/*) are silently skipped — no
+		// direct-provider row to mirror to. See fix 20260514-pricing-mirror.
+		if slash := strings.IndexByte(e.ID, '/'); slash > 0 {
+			if prov, ok := openrouterPrefixToProvider[e.ID[:slash]]; ok {
+				out = append(out, PricingUpdate{
+					Provider: prov,
+					ModelID:  e.ID[slash+1:], // bare ID; normalized in resolveMirrorCandidates
+					Pricing:  pricing,
+				})
+			}
+		}
 	}
 	return out, nil
 }

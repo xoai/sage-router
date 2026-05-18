@@ -1,0 +1,14 @@
+{
+  "source": "openai",
+  "target": "openai",
+  "opts": {
+    "Model": "gpt-4.1-nano",
+    "Provider": "openai",
+    "Stream": false
+  },
+  "body": {
+    "model": "fast-fallback",
+    "messages": [{"role": "user", "content": "hi"}],
+    "stream": false
+  }
+}

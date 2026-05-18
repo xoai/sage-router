@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sage-router/internal/auth"
 	"sage-router/internal/catalog"
 	"sage-router/internal/config"
 	"sage-router/internal/store"
@@ -11,6 +12,16 @@ import (
 // with a fake without standing up a real SQLite database.
 type connectionLister interface {
 	ListConnections(filter store.ConnectionFilter) ([]store.Connection, error)
+}
+
+// credentialLoader is the narrow interface buildCredsLookup needs from
+// AuthStore to surface provider-specific ExtraHeaders (e.g., the
+// ChatGPT-Account-ID header for OpenAI subscription connections).
+// Mirrors *auth.AuthStore.GetCredential's contract — extracted as an
+// interface so credslookup_test.go can pass a fake without spinning up
+// a real auth store.
+type credentialLoader interface {
+	GetCredential(connID string) (*auth.Credential, error)
 }
 
 // buildCredsLookup returns the catalog.CredsLookup function the background
@@ -30,11 +41,19 @@ type connectionLister interface {
 // CRITICAL-1 fix this adapter implements has unit-test coverage on the
 // adapter itself, independent of the goroutine spawned by
 // catalog.StartBackgroundRefresh.
-func buildCredsLookup(lister connectionLister) func(providerID string) (catalog.ListerCredentials, bool) {
-	return func(providerID string) (catalog.ListerCredentials, bool) {
+//
+// authStore is required (not nil-tolerant) so wiring bugs surface at
+// startup rather than masking as silently-empty ExtraHeaders.
+//
+// Returns (creds, authType, ok). The authType is needed by the 24h
+// ticker to dispatch through catalog.DiscoveryListerKey (e.g.,
+// subscription openai → "openai@openrouter-mirror"). See fix
+// 20260514-openrouter-fallback.
+func buildCredsLookup(lister connectionLister, authStore credentialLoader) func(providerID string) (catalog.ListerCredentials, string, bool) {
+	return func(providerID string) (catalog.ListerCredentials, string, bool) {
 		conns, err := lister.ListConnections(store.ConnectionFilter{Provider: providerID})
 		if err != nil || len(conns) == 0 {
-			return catalog.ListerCredentials{}, false
+			return catalog.ListerCredentials{}, "", false
 		}
 		var picked *store.Connection
 		for i := range conns {
@@ -47,16 +66,26 @@ func buildCredsLookup(lister connectionLister) func(providerID string) (catalog.
 			}
 		}
 		if picked == nil {
-			return catalog.ListerCredentials{}, false
+			return catalog.ListerCredentials{}, "", false
 		}
 		provDef, ok := config.KnownProviders[providerID]
 		if !ok {
-			return catalog.ListerCredentials{}, false
+			return catalog.ListerCredentials{}, "", false
 		}
-		return catalog.ListerCredentials{
+		creds := catalog.ListerCredentials{
 			BaseURL:     provDef.BaseURL,
 			APIKey:      picked.APIKey,
 			AccessToken: picked.AccessToken,
-		}, true
+		}
+		// Thread provider-specific ExtraHeaders for subscription connections
+		// (e.g., ChatGPT-Account-ID for openai). Mirrors routes_v1.go:1031-1035
+		// and routes_api.go:buildListerCredentials so the 24h ticker sees the
+		// same auth shape as on-create discovery + chat-completion requests.
+		if picked.AuthType == auth.AuthTypeSubscription {
+			if cred, gerr := authStore.GetCredential(picked.ID); gerr == nil && cred != nil {
+				creds.ExtraHeaders = cred.ExtraHeaders()
+			}
+		}
+		return creds, picked.AuthType, true
 	}
 }

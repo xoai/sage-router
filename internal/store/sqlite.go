@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"sage-router/internal/auth"
@@ -154,6 +155,8 @@ func (s *sqliteStore) Migrate() error {
 // Connections
 // ---------------------------------------------------------------------------
 
+// connCols: exchanged_token column dropped at cycle 20260517-provider-auth-variants
+// M2.6.4 (migration 013). DO NOT re-add — the RFC 8693 exchange chain was wrong-path.
 const connCols = `id, provider, name, auth_type, access_token, refresh_token, api_key, priority, state, expires_at, provider_data, refresh_failures, created_at, updated_at`
 
 func scanConnection(row interface{ Scan(dest ...any) error }) (*Connection, error) {
@@ -272,7 +275,8 @@ func (s *sqliteStore) CreateConnection(c *Connection) error {
 
 	_, err := s.db.Exec(`INSERT INTO connections (`+connCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		c.ID, c.Provider, c.Name, c.AuthType,
-		s.encryptField(c.AccessToken), s.encryptField(c.RefreshToken), s.encryptField(c.APIKey),
+		s.encryptField(c.AccessToken), s.encryptField(c.RefreshToken),
+		s.encryptField(c.APIKey),
 		c.Priority, c.State, expiresAt, providerData,
 		c.RefreshFailures,
 		now, now,
@@ -302,6 +306,7 @@ func (s *sqliteStore) UpdateConnection(id string, updates map[string]any) error 
 	}
 
 	// Encrypt secret fields if present.
+	// (exchanged_token removed in cycle 20260517-provider-auth-variants M2.6.4.)
 	for _, secretCol := range []string{"access_token", "refresh_token", "api_key"} {
 		if v, ok := updates[secretCol]; ok {
 			if str, isStr := v.(string); isStr {
@@ -539,22 +544,55 @@ func scanAPIKey(row interface{ Scan(dest ...any) error }) (*APIKey, error) {
 	return &k, nil
 }
 
-func (s *sqliteStore) ListAPIKeys() ([]APIKey, error) {
-	rows, err := s.db.Query("SELECT " + apiKeyCols + " FROM api_keys ORDER BY created_at DESC")
+// ListAPIKeysPaged returns api_keys rows matching the filter, paginated.
+// Replaces the prior bare-array `ListAPIKeys()`. Cycle
+// 20260516-keys-management-redesign — see store.go APIKeyFilter doc for
+// filter semantics. Reuses the existing `apiKeyCols` (10 columns including
+// `key_hash`) + `scanAPIKey` scanner; KeyHash remains hidden from JSON via
+// the `json:"-"` tag on the struct field.
+func (s *sqliteStore) ListAPIKeysPaged(filter APIKeyFilter) (*APIKeyPage, error) {
+	w := buildAPIKeyFilter(filter)
+
+	var total int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM api_keys"+w.sql(), w.params...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("count api_keys: %w", err)
+	}
+
+	// ORDER BY assembly. SortField + SortDir are pre-validated against
+	// a whitelist at the handler boundary; this layer trusts them. Empty
+	// values fall back to the historical default `created_at DESC`.
+	orderCol := "created_at"
+	if filter.SortField != "" {
+		orderCol = filter.SortField
+	}
+	orderDir := "DESC"
+	if strings.EqualFold(filter.SortDir, "asc") {
+		orderDir = "ASC"
+	}
+	listQ := "SELECT " + apiKeyCols + " FROM api_keys" + w.sql() +
+		" ORDER BY " + orderCol + " " + orderDir
+	if filter.Limit > 0 {
+		listQ += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, filter.Offset)
+	}
+
+	rows, err := s.db.Query(listQ, w.params...)
 	if err != nil {
-		return nil, fmt.Errorf("list api keys: %w", err)
+		return nil, fmt.Errorf("list api_keys: %w", err)
 	}
 	defer rows.Close()
 
-	var out []APIKey
+	items := []APIKey{}
 	for rows.Next() {
 		k, err := scanAPIKey(rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, *k)
+		items = append(items, *k)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return &APIKeyPage{Items: items, Total: total, Limit: filter.Limit, Offset: filter.Offset}, nil
 }
 
 func (s *sqliteStore) GetAPIKeyByHash(keyHash string) (*APIKey, error) {

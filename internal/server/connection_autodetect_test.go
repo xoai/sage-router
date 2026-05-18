@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"sage-router/internal/auth"
 	"sage-router/internal/auth/detect"
+	"sage-router/internal/catalog"
 	"sage-router/internal/store"
 )
 
@@ -54,6 +56,34 @@ func stubCodexHomeForServerTest(t *testing.T) string {
 	// bypass HOME/USERPROFILE stubbing.
 	t.Cleanup(detect.DisableWSLForTesting())
 	return envHome
+}
+
+// makeServerTestJWT crafts a minimal JWT with one claim. Signature
+// is "sig" (unverified — detect/codex doesn't verify, matching the
+// Codex CLI's own trust model on its own id_token).
+func makeServerTestJWT(claim, value string) string {
+	enc := base64.RawURLEncoding.EncodeToString
+	header := enc([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := enc([]byte(fmt.Sprintf(`{%q:%q}`, claim, value)))
+	return header + "." + payload + ".sig"
+}
+
+// writeCodexAuthJSONWithIDToken — variant that includes a valid JWT
+// id_token. Used by the discovery-extra-headers test below.
+func writeCodexAuthJSONWithIDToken(t *testing.T, codexHome, accessToken, refreshToken, idToken string, expiresUnixSec int64) {
+	t.Helper()
+	body := fmt.Sprintf(`{
+		"tokens": {
+			"access_token": %q,
+			"refresh_token": %q,
+			"id_token": %q,
+			"expires_at": %d
+		}
+	}`, accessToken, refreshToken, idToken, expiresUnixSec)
+	path := filepath.Join(codexHome, "auth.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
 }
 
 // writeCodexAuthJSON writes a Codex auth.json fixture at $CODEX_HOME.
@@ -271,6 +301,121 @@ func TestHandleDetectCodex_ReturnsCorrectShape(t *testing.T) {
 	if bytes.Contains(rec.Body.Bytes(), []byte(`"subscription_type"`)) {
 		t.Errorf("response body contains subscription_type field; expected omitempty to drop it. body=%q",
 			rec.Body.Bytes())
+	}
+}
+
+// TestCreateConnection_OpenAI_AutoDetect_PopulatesAccountID — initiative
+// 20260513-openai-discovery. The auto-detect arm must extract
+// chatgpt_account_id from the id_token (via detect.DetectCodex) and
+// stash it in conn.ProviderData so AuthStore.GetCredential later
+// surfaces it as Credential.AccountID → ChatGPT-Account-ID header on
+// downstream /v1/* calls.
+//
+// Without this fix the auto-detect path created subscription connections
+// with empty AccountID, breaking both chat completions (when OpenAI
+// requires the header) and model discovery (lister 401s silently).
+func TestCreateConnection_OpenAI_AutoDetect_PopulatesAccountID(t *testing.T) {
+	codexHome := stubCodexHomeForServerTest(t)
+	future := time.Now().Add(24 * time.Hour).Unix()
+	jwt := makeServerTestJWT("https://api.openai.com/auth.chatgpt_account_id", "acct-from-jwt-789")
+	writeCodexAuthJSONWithIDToken(t, codexHome, "atk-pop", "rtk-pop", jwt, future)
+
+	srv, st, _ := newDiscoveryServer(t, nil)
+
+	code, body := postCreateConnectionWithBody(t, srv, store.Connection{
+		Provider: "openai",
+		Name:     "Codex CLI",
+		AuthType: "auto_detect",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%q", code, body)
+	}
+
+	connID := readBackConnectionID(t, body)
+	stored := readBackConnection(t, st, connID)
+
+	if len(stored.ProviderData) == 0 {
+		t.Fatal("stored.ProviderData is empty — AccountID was not persisted")
+	}
+	var pd struct {
+		AccountID string `json:"account_id"`
+	}
+	if err := json.Unmarshal([]byte(stored.ProviderData), &pd); err != nil {
+		t.Fatalf("unmarshal ProviderData: %v (raw=%q)", err, stored.ProviderData)
+	}
+	if pd.AccountID != "acct-from-jwt-789" {
+		t.Errorf("ProviderData.account_id = %q, want acct-from-jwt-789 (id_token claim)", pd.AccountID)
+	}
+
+	// Round-trip via AuthStore — verifies the persisted JSON shape
+	// matches what auth/store.go:54-93 expects.
+	cred, err := srv.deps.AuthStore.GetCredential(connID)
+	if err != nil {
+		t.Fatalf("AuthStore.GetCredential: %v", err)
+	}
+	if cred == nil {
+		t.Fatal("AuthStore.GetCredential returned nil (no subscription cred for stored row)")
+	}
+	if cred.AccountID != "acct-from-jwt-789" {
+		t.Errorf("Credential.AccountID = %q, want acct-from-jwt-789 (round-trip)", cred.AccountID)
+	}
+	if got := cred.ExtraHeaders()["ChatGPT-Account-ID"]; got != "acct-from-jwt-789" {
+		t.Errorf("ExtraHeaders[ChatGPT-Account-ID] = %q, want acct-from-jwt-789", got)
+	}
+}
+
+// TestCreateConnection_OpenAI_AutoDetect_FiresDiscoveryWithExtraHeaders —
+// end-to-end test for the exact user-reported path: auto-detect →
+// subscription conversion → on-create discovery → lister called with
+// AccessToken + ChatGPT-Account-ID. This is the only test that proves
+// the full chain works; without it, unit tests could pass while the
+// user-visible bug ("only seed models") still ships.
+func TestCreateConnection_OpenAI_AutoDetect_FiresDiscoveryWithExtraHeaders(t *testing.T) {
+	codexHome := stubCodexHomeForServerTest(t)
+	future := time.Now().Add(24 * time.Hour).Unix()
+	jwt := makeServerTestJWT("https://api.openai.com/auth.chatgpt_account_id", "acct-e2e-321")
+	writeCodexAuthJSONWithIDToken(t, codexHome, "atk-e2e", "rtk-e2e", jwt, future)
+
+	lister := &fakeLister{
+		models: []catalog.Model{{Provider: "openai", ModelID: "gpt-test-from-discovery"}},
+	}
+	// auto_detect → subscription (per routes_api.go auto-detect arm) →
+	// dispatches to the openrouter-mirror lister key per
+	// catalog.DiscoveryListerKey (fix 20260514-openrouter-fallback).
+	// Register the fake under that key so the test exercises the
+	// production dispatch path. ExtraHeaders should still flow through.
+	srv, _, _ := newDiscoveryServer(t, map[string]catalog.ModelLister{
+		"openai":                   lister,
+		"openai@codex-subscription": lister,
+	})
+
+	code, body := postCreateConnectionWithBody(t, srv, store.Connection{
+		Provider: "openai",
+		Name:     "Codex CLI",
+		AuthType: "auto_detect",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%q", code, body)
+	}
+
+	// Wait for the fire-and-forget on-create discovery goroutine.
+	waitForListerCalls(t, lister, 1, 2*time.Second)
+
+	got, ok := lister.lastCreds.Load().(catalog.ListerCredentials)
+	if !ok {
+		t.Fatal("lister.lastCreds did not store catalog.ListerCredentials")
+	}
+	if got.AccessToken != "atk-e2e" {
+		t.Errorf("lister received AccessToken = %q, want atk-e2e (subscription token)", got.AccessToken)
+	}
+	if got.APIKey != "" {
+		t.Errorf("lister received APIKey = %q, want empty (subscription connection has no APIKey)", got.APIKey)
+	}
+	if got.ExtraHeaders == nil {
+		t.Fatal("lister received nil ExtraHeaders — ChatGPT-Account-ID was not threaded through")
+	}
+	if h := got.ExtraHeaders["ChatGPT-Account-ID"]; h != "acct-e2e-321" {
+		t.Errorf("lister received ChatGPT-Account-ID = %q, want acct-e2e-321 (from id_token claim)", h)
 	}
 }
 

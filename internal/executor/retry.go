@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"sage-router/pkg/canonical"
 )
 
 // RetryConfig controls the retry behaviour for upstream requests.
@@ -85,6 +87,51 @@ func (r *RetryExecutor) OverrideCapabilities(model string, base Capabilities) Ca
 		return inner.OverrideCapabilities(model, base)
 	}
 	return base
+}
+
+// ---- Variant optional-interface forwarders (cycle 20260517-provider-auth-variants M1.5) ----
+//
+// Memory `fb0b4ef62` rule: wrappers must explicitly declare + delegate
+// optional interfaces. Without these, Go's type assertion on a wrapped
+// *RetryExecutor sees only the outer type, not the wrapped inner, and the
+// route handler's optional-interface helpers return safe defaults for
+// EVERY wrapped executor — masking variant behavior.
+//
+// Each forwarder mirrors the OverrideCapabilities pattern above:
+// declare the method on *RetryExecutor so type-asserting to the
+// interface always succeeds; delegate to the inner if it implements,
+// otherwise return a safe default.
+
+// Format implements Formatted.
+func (r *RetryExecutor) Format() canonical.Format {
+	if inner, ok := r.inner.(Formatted); ok {
+		return inner.Format()
+	}
+	return "" // Empty Format signals "use the provider's natural target format" at the call site.
+}
+
+// NeedsOAuthIdentity implements OAuthIdentified.
+func (r *RetryExecutor) NeedsOAuthIdentity() bool {
+	if inner, ok := r.inner.(OAuthIdentified); ok {
+		return inner.NeedsOAuthIdentity()
+	}
+	return false
+}
+
+// ParseAuthError implements AuthErrorParser.
+func (r *RetryExecutor) ParseAuthError(statusCode int, body []byte) error {
+	if inner, ok := r.inner.(AuthErrorParser); ok {
+		return inner.ParseAuthError(statusCode, body)
+	}
+	return nil
+}
+
+// PreflightCredentials implements PreflightChecker.
+func (r *RetryExecutor) PreflightCredentials(creds *Credentials) error {
+	if inner, ok := r.inner.(PreflightChecker); ok {
+		return inner.PreflightCredentials(creds)
+	}
+	return nil
 }
 
 func (r *RetryExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Result, error) {

@@ -2,9 +2,11 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	crypto_rand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,17 +17,16 @@ import (
 	"time"
 
 	"sage-router/internal/auth"
-	"sage-router/internal/auth/detect"
 	"sage-router/internal/auth/providers"
 	"sage-router/internal/bypass"
 	"sage-router/internal/catalog"
 	"sage-router/internal/config"
 	"sage-router/internal/cost"
 	"sage-router/internal/executor"
-	"sage-router/internal/provider"
 	"sage-router/internal/routing"
 	"sage-router/internal/store"
 	"sage-router/internal/translate"
+	openairesp "sage-router/internal/translate/openai-responses"
 	"sage-router/internal/usage"
 	"sage-router/pkg/canonical"
 	"sage-router/pkg/sse"
@@ -121,8 +122,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		model = "auto:" + authenticatedKey.RoutingStrategy
 	}
 
-	// Resolve provider and model
-	providerID, resolvedModel, isCombo, comboModels := s.resolveModel(r.Context(), model, body)
+	// Resolve provider and model. allowedModels passed for StrategyUserOrder
+	// (cycle 20260516-routing-strategy-ux M3 C1 fold) — empty string when
+	// authenticatedKey is nil (unauth path) silently no-ops the pre-sort.
+	providerID, resolvedModel, isCombo, comboModels := s.resolveModel(r.Context(), model, body, safeAllowedModels(authenticatedKey))
 
 	// ACL check — enforce allowed models (§34)
 	if authenticatedKey != nil && authenticatedKey.AllowedModels != "*" {
@@ -176,40 +179,44 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		apiKeyID = authenticatedKey.ID
 	}
 
-	// Execute with fallback
-	s.executeRequest(w, r, body, sourceFormat, providerID, resolvedModel, stream, conn, nil, requestID, startTime, apiKeyID)
-}
-
-// requestContext carries metadata through the request lifecycle for post-response hooks.
-type requestContext struct {
-	firstMsg    string // first user message (session key)
-	requestBody []byte // raw request body (for conversation store)
-	apiKeyID    string // authenticated API key ID (for usage tracking)
-}
-
-func (s *Server) executeRequest(
-	w http.ResponseWriter, r *http.Request,
-	body []byte,
-	sourceFormat canonical.Format,
-	providerID, model string,
-	stream bool,
-	conn *ConnectionInfo,
-	excludeIDs []string,
-	requestID string,
-	startTime time.Time,
-	apiKeyID string,
-) {
-	// Build request context for post-response hooks
+	// Execute with fallback (M1 α refactor — value-returning; cycle 20260516-routing-strategy-ux).
+	// Internal connection-level fallback handled in executeRequest's inner loop.
 	reqCtx := &requestContext{
 		firstMsg:    extractFirstUserMsg(body),
 		requestBody: body,
 		apiKeyID:    apiKeyID,
 	}
-	s.executeRequestWithCtx(w, r, body, sourceFormat, providerID, model, stream, conn, excludeIDs, requestID, startTime, reqCtx)
+	result, err := s.executeRequest(r.Context(), r, body, sourceFormat, providerID, resolvedModel, stream, conn, nil, requestID, startTime, reqCtx)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("upstream error: %v", err))
+		return
+	}
+	s.forwardResult(w, r, result, sourceFormat, providerID, resolvedModel, stream, requestID, startTime, reqCtx)
 }
 
-func (s *Server) executeRequestWithCtx(
-	w http.ResponseWriter, r *http.Request,
+// requestContext carries metadata through the request lifecycle for post-response hooks.
+type requestContext struct {
+	firstMsg     string // first user message (session key)
+	requestBody  []byte // raw request body (for conversation store)
+	apiKeyID     string // authenticated API key ID (for usage tracking)
+	servedConnID string // SET by executeRequest as the inner connection-level fallback loop progresses; READ by forwardResult for routing-log/usage-track connection attribution. Reflects the connection that actually served (or last-attempted) the request — distinct from the caller's original conn passed in, which may have been excluded mid-loop. Cycle 20260516-routing-strategy-ux M1 α refactor.
+}
+
+// executeRequest sends a request upstream and returns the executor.Result so the
+// CALLER decides whether to forward (handleChatCompletions :180) or advance to the
+// next candidate (handleComboRequest's M2 walk-on-5xx loop at :611-635). Connection-
+// level fallback (multiple connections for the SAME model) happens INSIDE this loop
+// — caller never sees a network-error or retryable-status from a connection that
+// had a healthy peer available. The caller's level of fallback is MODEL-level
+// (combos + auto:*), one layer above.
+//
+// Cycle 20260516-routing-strategy-ux M1 α refactor (per spec v5 + plan v2):
+//   - Returns (*executor.Result, error) instead of writing directly to ResponseWriter.
+//   - Inner connection-level fallback is now a loop (M-v3-4 fold), not recursive self-calls.
+//   - ctx-cancel check between iterations (M-v3-4 fold).
+//   - reqCtx.servedConnID populated before return so forwardResult attributes correctly.
+func (s *Server) executeRequest(
+	ctx context.Context, r *http.Request,
 	body []byte,
 	sourceFormat canonical.Format,
 	providerID, model string,
@@ -219,24 +226,37 @@ func (s *Server) executeRequestWithCtx(
 	requestID string,
 	startTime time.Time,
 	reqCtx *requestContext,
-) {
-	// Determine target format
-	targetFormat := translate.DetectTargetFormat(providerID)
-
-	// Translate request: source → canonical → target
-	canonReq, targetBody, err := s.deps.TranslateRegistry.TranslateRequest(sourceFormat, targetFormat, body, translate.TranslateOpts{
-		Model:    model,
-		Provider: providerID,
-		Stream:   stream,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("translation error: %v", err))
-		return
+) (*executor.Result, error) {
+	if reqCtx == nil {
+		// Defense: callers should always pass a non-nil reqCtx so post-response
+		// hooks (session affinity, conversation store, usage tracking) work.
+		// nil is treated as "no post-response hooks needed" — used by tests.
+		reqCtx = &requestContext{firstMsg: extractFirstUserMsg(body), requestBody: body}
 	}
 
-	// Override model in translated request
-	if canonReq != nil {
-		canonReq.Model = model
+	// Resolve the variant Executor for this (provider, auth_type) FIRST so
+	// formatOf() can ask it for the target wire format. variantExec is also
+	// the source of optional-interface queries throughout the request lifecycle
+	// (Format, NeedsOAuthIdentity, ParseAuthError, PreflightCredentials).
+	// Returns nil only when the Variants registry isn't wired (test fixtures
+	// pre-M1); helpers handle nil-executor by returning safe defaults.
+	variantExec := s.resolveVariantExec(providerID, conn)
+
+	// Determine target format via the variant's Format() method.
+	// Replaces resolveTargetFormat helper that hardcoded openai+subscription
+	// → FormatResponses. M5.2 of cycle 20260517-provider-auth-variants.
+	targetFormat := formatOf(variantExec, providerID)
+
+	// Translate request: source → canonical → target (ONCE — body sent to upstream
+	// is the same regardless of which connection serves it; only translate per-request).
+	canonReq, targetBody, err := s.deps.TranslateRegistry.TranslateRequest(sourceFormat, targetFormat, body, translateOptsFor(variantExec, model, providerID, stream))
+	if err != nil {
+		// Cycle 20260517-provider-auth-variants M2.6.1: ErrToolsUnsupported
+		// synthetic-422 arm REMOVED. M0.8 live evidence + predecessor's
+		// tools_streaming.sse capture confirmed the codex backend ACCEPTS
+		// tools (HTTP 200); the AC-T4 premise was wrong-path. Translation
+		// errors now bubble up to a generic 500.
+		return nil, fmt.Errorf("translation error: %w", err)
 	}
 
 	// Stage ⑤b: Inject cache hints (cost optimization). Pass the chosen
@@ -249,11 +269,12 @@ func (s *Server) executeRequestWithCtx(
 		}
 	}
 	if canonReq != nil && cost.InjectCacheHints(canonReq, providerID, authTypeForCache) {
-		// Re-serialize with cache hints applied
+		// Re-serialize with cache hints applied. translateOptsFor preserves
+		// variant-dependent flags (e.g. EmitOAuthIdentity) across the cache-hint
+		// path — see C1 review-fold for why the inline-literal pattern was
+		// silently broken for anthropic+subscription.
 		if tgt, ok := s.deps.TranslateRegistry.Get(targetFormat); ok {
-			if rewritten, err := tgt.FromCanonical(canonReq, translate.TranslateOpts{
-				Model: model, Provider: providerID, Stream: stream,
-			}); err == nil {
+			if rewritten, err := tgt.FromCanonical(canonReq, translateOptsFor(variantExec, model, providerID, stream)); err == nil {
 				targetBody = rewritten
 			}
 		}
@@ -261,7 +282,10 @@ func (s *Server) executeRequestWithCtx(
 
 	// Stage ④+: Context bridge injection on model switch (ADR §29)
 	if canonReq != nil && s.deps.ConversationStore != nil && s.deps.SmartRouter != nil {
-		firstMsg := extractFirstUserMsg(body)
+		firstMsg := reqCtx.firstMsg
+		if firstMsg == "" {
+			firstMsg = extractFirstUserMsg(body)
+		}
 		if firstMsg != "" {
 			if entry := s.deps.SmartRouter.Affinity.Get(firstMsg); entry != nil {
 				currentModel := providerID + "/" + model
@@ -274,14 +298,14 @@ func (s *Server) executeRequestWithCtx(
 						if bridge != "" {
 							canonReq.System = append([]canonical.SystemBlock{{Text: bridge}}, canonReq.System...)
 							// Mark bridge as active with 3-turn lifecycle
-						entry.BridgeActive = true
-						entry.BridgeTurnsLeft = 3
-						slog.Info("bridge injected", "from", previousModel, "to", currentModel, "tokens", len(bridge)/4)
-							// Re-serialize
+							entry.BridgeActive = true
+							entry.BridgeTurnsLeft = 3
+							slog.Info("bridge injected", "from", previousModel, "to", currentModel, "tokens", len(bridge)/4)
+							// Re-serialize. translateOptsFor preserves variant-dependent
+							// flags (e.g. EmitOAuthIdentity) across the bridge path
+							// — see C1 review-fold.
 							if tgt, ok := s.deps.TranslateRegistry.Get(targetFormat); ok {
-								if rewritten, err := tgt.FromCanonical(canonReq, translate.TranslateOpts{
-									Model: model, Provider: providerID, Stream: stream,
-								}); err == nil {
+								if rewritten, err := tgt.FromCanonical(canonReq, translateOptsFor(variantExec, model, providerID, stream)); err == nil {
 									targetBody = rewritten
 								}
 							}
@@ -292,116 +316,279 @@ func (s *Server) executeRequestWithCtx(
 		}
 	}
 
-	// Get executor
-	exec, ok := s.deps.Executors[providerID]
-	if !ok {
-		exec = s.deps.Executors["default"]
+	// Connection-level fallback LOOP (M-v3-4 fold — was recursive self-calls at
+	// pre-refactor :322 and :378). Each iteration tries one connection; on
+	// network error or retryable status, advances to the next connection for
+	// the SAME model. Returns on success OR exhaustion.
+	if excludeIDs == nil {
+		excludeIDs = []string{}
 	}
-	if exec == nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("no executor for provider %s", providerID))
-		return
+	currentConn := conn
+	if currentConn == nil {
+		return nil, fmt.Errorf("nil connection passed to executeRequest")
 	}
 
-	// Execute upstream call
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
+	for {
+		// M-v3-4 fold: ctx-cancel check between iterations.
+		if err := ctx.Err(); err != nil {
+			reqCtx.servedConnID = currentConn.ID
+			return nil, err
+		}
 
-	result, err := exec.Execute(ctx, &executor.ExecuteRequest{
-		Model:       model,
-		Body:        targetBody,
-		Stream:      stream,
-		Credentials: conn.Credentials,
-		Endpoint:    conn.Endpoint,
-	})
-	if err != nil {
-		slog.Error("upstream error", "provider", providerID, "error", err)
-		s.markConnectionResult(conn.ID, model, 0, nil, err)
-		// Try fallback
-		if excludeIDs == nil {
-			excludeIDs = []string{}
+		// Pick executor via the variant registry first; fall back to the
+		// legacy Executors map for compatibility with test fixtures that
+		// don't wire Variants. Cycle 20260517-provider-auth-variants M5.6
+		// pulled forward to M2 — the variant dispatch is what makes
+		// (openai, subscription) → CodexSubscriptionExecutor route to
+		// chatgpt.com/backend-api/codex/responses; without it the
+		// translator's FormatResponses body shape goes to api.openai.com.
+		// Cycle 20260517-provider-auth-variants M5.6:
+		// Legacy s.deps.Executors[providerID] fallback REMOVED. Variants
+		// is the sole dispatch source post-M2. If no variant resolves,
+		// the wildcard (provider, "") fallback inside Variants.Get
+		// catches; if THAT also misses, the request fails fast (rather
+		// than silently routing to "default" executor which masked the
+		// wiring gap in the pre-rip era).
+		authType := ""
+		if currentConn != nil && currentConn.Credentials != nil {
+			authType = currentConn.Credentials.AuthType
 		}
-		excludeIDs = append(excludeIDs, conn.ID)
-		nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
-		if nextErr == nil {
-			slog.Info("falling back", "provider", providerID, "connection", nextConn.ID)
-			s.executeRequestWithCtx(w, r, body, sourceFormat, providerID, model, stream, nextConn, excludeIDs, requestID, startTime, reqCtx)
-			return
+		// M3 nil-guard (post-ship /review fold): Variants is set by main.go
+		// at boot but a test fixture constructing Dependencies{} without it
+		// would panic at the Get call. Fail fast with a clean error so
+		// future test authors see the wiring gap, not a goroutine panic.
+		if s.deps.Variants == nil {
+			return nil, fmt.Errorf("no Variants registry wired (deps.Variants is nil)")
 		}
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("upstream error: %v", err))
-		return
+		exec, ok := s.deps.Variants.Get(providerID, authType)
+		if !ok || exec == nil {
+			return nil, fmt.Errorf("no executor registered for (provider=%s, auth_type=%s)", providerID, authType)
+		}
+
+		// C1 fix (post-ship /review fold): wire the variant's preflight
+		// BEFORE building/sending the upstream request. When a variant
+		// implements PreflightChecker, it can synchronously reject
+		// connections that lack viable credentials, returning a TYPED
+		// error (e.g., ErrTierMissingScopes) that markConnectionResult
+		// routes through SetLastError + MarkAuthExpired → dashboard's
+		// friendly re-auth banner fires immediately. Without this wiring
+		// the duplicate check inside CodexSubscriptionExecutor.Execute
+		// still gates the HTTP call but produces a generic error → the
+		// connection lands in StateErrored (not AuthExpired), losing the
+		// friendly message and triggering retry semantics where AuthExpired
+		// semantics belong.
+		if preErr := preflightCreds(exec, currentConn.Credentials); preErr != nil {
+			// statusCode=401 routes markConnectionResult through the
+			// AuthExpired branch + parseAuthError (which our variant
+			// returns the same typed error from). The body is nil because
+			// no HTTP call happened — parseAuthError handles nil body.
+			s.markConnectionResult(currentConn.ID, model, 401, nil, nil)
+			// Now set the LastError directly so dashboard surfaces the
+			// friendly variant-supplied message (parseAuthError on a nil
+			// body won't match the pattern; this is the explicit hook).
+			if pc := s.deps.ProviderSelector.ConnectionByID(currentConn.ID); pc != nil {
+				pc.SetLastError(preErr)
+			}
+			excludeIDs = append(excludeIDs, currentConn.ID)
+			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
+			if nextErr != nil {
+				reqCtx.servedConnID = currentConn.ID
+				return nil, preErr
+			}
+			currentConn = nextConn
+			continue
+		}
+
+		// Execute upstream call with per-attempt 5min timeout (preserved from
+		// pre-refactor behavior). The cancel func is bound to one of three
+		// disposition paths below:
+		//   1. Network error → fire cancel directly (result is nil, nothing
+		//      to drain); advance or return.
+		//   2. HTTP error → drain body, close, fire cancel directly; advance
+		//      or wrap respBody into a fresh NopCloser + return.
+		//   3. Success → DO NOT fire cancel here. Stream/forward path must
+		//      drain result.Body lazily; firing cancel now would tear down
+		//      the live upstream connection mid-stream (regression observed
+		//      in production: 1-3 chars then EOF). Cancel ownership is
+		//      transferred to the caller via cancelOnClose wrapper — when
+		//      forwardResult closes the body (after streamResponse or
+		//      forwardResponse drains it), cancel fires too.
+		upstreamCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		result, execErr := exec.Execute(upstreamCtx, &executor.ExecuteRequest{
+			Model:       model,
+			Body:        targetBody,
+			Stream:      stream,
+			Credentials: currentConn.Credentials,
+			Endpoint:    currentConn.Endpoint,
+		})
+
+		// Network/transport error → mark + try next connection.
+		if execErr != nil {
+			cancel() // safe: result is nil, no live stream
+			slog.Error("upstream error", "provider", providerID, "connection", currentConn.ID, "error", execErr)
+			s.markConnectionResult(currentConn.ID, model, 0, nil, execErr)
+			excludeIDs = append(excludeIDs, currentConn.ID)
+			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
+			if nextErr != nil {
+				reqCtx.servedConnID = currentConn.ID
+				return nil, execErr // exhausted — caller decides (M2 may advance to next combo member)
+			}
+			slog.Info("falling back", "provider", providerID, "from", currentConn.ID, "to", nextConn.ID)
+			currentConn = nextConn
+			continue
+		}
+
+		// HTTP-level error (4xx/5xx) → mark + maybe try next connection.
+		if result.StatusCode >= 400 {
+			respBody, _ := io.ReadAll(result.Body)
+			result.Body.Close()
+			cancel() // safe: body fully drained
+			statusCode := result.StatusCode
+			// Mark connection state based on error. Pass respBody so 401/403 can
+			// detect model-level rejections (vs. token-level rejections) and
+			// add the model to the per-connection denylist accordingly.
+			s.markConnectionResult(currentConn.ID, model, statusCode, respBody, nil)
+
+			// Models Discovery M2.7 — on-404 ad-hoc refresh (AC16).
+			// Upstream "model not found" usually means the catalog is stale.
+			// Fire-and-forget; the helper's own gates (backoff + 5-min
+			// debounce) keep request-flood scenarios from hammering /v1/models.
+			if statusCode == http.StatusNotFound && s.deps.Discovery != nil && s.deps.CatalogStore != nil {
+				go s.triggerOnNotFoundDiscovery(providerID, currentConn)
+			}
+
+			// Retryable status → try next connection (connection-level fallback).
+			if executor.IsFallbackEligible(statusCode) {
+				excludeIDs = append(excludeIDs, currentConn.ID)
+				nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
+				if nextErr == nil {
+					slog.Info("falling back on error",
+						"provider", providerID, "from", currentConn.ID, "to", nextConn.ID,
+						"status", statusCode,
+					)
+					currentConn = nextConn
+					continue
+				}
+			}
+
+			// Return error-status Result. respBody is already drained, so wrap
+			// it in a fresh ReadCloser for the caller. Caller (handleComboRequest
+			// after M2 walk fold OR handleChatCompletions's forwardResult) decides
+			// forward-to-client vs advance-to-next-candidate.
+			reqCtx.servedConnID = currentConn.ID
+			return &executor.Result{
+				StatusCode: statusCode,
+				Headers:    result.Headers,
+				Body:       io.NopCloser(bytes.NewReader(respBody)),
+				URL:        result.URL,
+				Latency:    result.Latency,
+			}, nil
+		}
+
+		// Success — return Result for caller to forward via forwardResult.
+		// Transfer upstreamCtx cancel ownership to the body wrapper: when
+		// forwardResult closes the body after streamResponse/forwardResponse
+		// drains the upstream stream, cancel fires too. This prevents the
+		// mid-stream truncation bug observed in production where firing
+		// cancel() before the caller drained the body tore down the live
+		// HTTP connection, delivering only what was already buffered.
+		// markConnectionResult-success happens post-forward in forwardResult
+		// (matches pre-refactor :399 semantics).
+		result.Body = &cancelOnClose{ReadCloser: result.Body, cancel: cancel}
+		reqCtx.servedConnID = currentConn.ID
+		return result, nil
 	}
+}
+
+// cancelOnClose wraps an io.ReadCloser so that calling Close() also fires the
+// associated context.CancelFunc. Used by executeRequest to transfer ownership
+// of the per-attempt timeout context to the caller: caller drains the body
+// (lazily for streaming), then closes — at which point we cancel the upstream
+// context to release the http.Transport resources. Without this, firing cancel
+// immediately after exec.Execute returns would close the live HTTP connection
+// before the caller's stream/forward path drains response chunks, truncating
+// SSE responses to whatever was already buffered (regression: 1-3 chars then
+// EOF, reported 2026-05-16). Cycle 20260516-routing-strategy-ux M1 hotfix.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return err
+}
+
+// forwardResult writes the Result returned by executeRequest to the client's
+// ResponseWriter. Splits to streamResponse or forwardResponse based on stream
+// flag, then markConnectionResult-success on the actual-served connection (read
+// from reqCtx.servedConnID).
+//
+// For result.StatusCode >= 400, forwardResult writes the upstream error body
+// directly (no canonical/target translation — error bodies vary widely and the
+// upstream is the authoritative source for the error message).
+//
+// Cycle 20260516-routing-strategy-ux M1 α refactor.
+func (s *Server) forwardResult(
+	w http.ResponseWriter, r *http.Request,
+	result *executor.Result,
+	sourceFormat canonical.Format,
+	providerID, model string,
+	stream bool,
+	requestID string,
+	startTime time.Time,
+	reqCtx *requestContext,
+) {
+	if reqCtx == nil {
+		reqCtx = &requestContext{}
+	}
+	connID := reqCtx.servedConnID
+
+	// Body lifecycle: caller (this function) owns Close. For success paths
+	// the Body is a cancelOnClose wrapper, so Close also fires the per-attempt
+	// upstream context cancel. Pre-M1 the equivalent `defer result.Body.Close()`
+	// lived at the bottom of executeRequestWithCtx; moving it here matches the
+	// new "caller owns the Body" contract introduced by M1.
 	defer result.Body.Close()
 
-	// Check for error status
 	if result.StatusCode >= 400 {
+		// Forward upstream error body directly to client. Body is already
+		// re-wrapped as NopCloser(bytes.NewReader) inside executeRequest.
 		respBody, _ := io.ReadAll(result.Body)
-		statusCode := result.StatusCode
-
-		// Mark connection state based on error. Pass respBody so 401/403 can
-		// detect model-level rejections (vs. token-level rejections) and
-		// add the model to the per-connection denylist accordingly.
-		s.markConnectionResult(conn.ID, model, statusCode, respBody, nil)
-
-		// Models Discovery M2.7 — on-404 ad-hoc refresh (AC16).
-		// Upstream "model not found" usually means the catalog is stale:
-		// either a new model launched, or the upstream renamed/retired one.
-		// Fire-and-forget a discovery refresh so the next request — and the
-		// dashboard — see the up-to-date list. The helper's own gates
-		// (backoff + 5-min debounce) keep request-flood scenarios from
-		// hammering /v1/models.
-		//
-		// Detection is intentionally over-broad: any upstream 404 triggers
-		// the helper, not just true "model not found" responses. Other 404
-		// causes — Ollama-model-not-pulled, OpenRouter region restriction,
-		// malformed Gemini paths, LM Studio / vLLM path mismatches behind
-		// `default` — will also trigger a refresh that won't help. The
-		// debounce (5 min) caps wasted lister calls to one per provider per
-		// window. A future per-executor `IsModelNotFound(statusCode, body)`
-		// helper would narrow the trigger; deferred per the M2.7 manifest.
-		// s.deps.CatalogStore == nil short-circuits here (the && in the
-		// guard) BEFORE triggerOnNotFoundDiscovery runs, so the helper
-		// itself does not need a redundant nil check on CatalogStore. A
-		// future maintainer simplifying the dispatch should preserve
-		// this gate to keep the helper's preconditions narrow.
-		if statusCode == http.StatusNotFound && s.deps.Discovery != nil && s.deps.CatalogStore != nil {
-			go s.triggerOnNotFoundDiscovery(providerID, conn)
-		}
-
-		// Fallback on retryable errors
-		if executor.IsFallbackEligible(statusCode) {
-			if excludeIDs == nil {
-				excludeIDs = []string{}
-			}
-			excludeIDs = append(excludeIDs, conn.ID)
-			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
-			if nextErr == nil {
-				slog.Info("falling back on error",
-					"provider", providerID,
-					"status", statusCode,
-					"connection", nextConn.ID,
-				)
-				s.executeRequest(w, r, body, sourceFormat, providerID, model, stream, nextConn, excludeIDs, requestID, startTime, reqCtx.apiKeyID)
-				return
-			}
-		}
-
-		// Forward error to client
+		copyRateLimitHeaders(w, result.Headers)
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(statusCode)
+		w.Header().Set("X-Request-ID", requestID)
+		w.WriteHeader(result.StatusCode)
 		w.Write(respBody)
 		return
 	}
 
+	// M5.2 fold: forwardResult only has connID; look up the variant via
+	// the ProviderSelector → connInfo path that formatOf needs. When the
+	// connection isn't registered (race window during create), fall back
+	// to the provider's natural target format.
+	var fwdVariantExec executor.Executor
+	if s.deps.ProviderSelector != nil {
+		if pc := s.deps.ProviderSelector.ConnectionByID(connID); pc != nil && s.deps.Variants != nil {
+			if v, ok := s.deps.Variants.Get(providerID, pc.AuthType); ok {
+				fwdVariantExec = v
+			}
+		}
+	}
+	targetFormat := formatOf(fwdVariantExec, providerID)
 	latencyTTFB := time.Since(startTime)
 
 	if stream {
-		s.streamResponse(w, r, result, sourceFormat, targetFormat, model, requestID, startTime, latencyTTFB, providerID, conn.ID, reqCtx)
+		s.streamResponse(w, r, result, sourceFormat, targetFormat, model, requestID, startTime, latencyTTFB, providerID, connID, reqCtx)
 	} else {
-		s.forwardResponse(w, result, sourceFormat, targetFormat, model, requestID, startTime, latencyTTFB, providerID, conn.ID, reqCtx)
+		s.forwardResponse(w, result, sourceFormat, targetFormat, model, requestID, startTime, latencyTTFB, providerID, connID, reqCtx)
 	}
 
-	// Mark success after response is written
-	s.markConnectionResult(conn.ID, model, result.StatusCode, nil, nil)
+	// Mark success after response is written (preserved from pre-refactor :399).
+	s.markConnectionResult(connID, model, result.StatusCode, nil, nil)
 }
 
 func (s *Server) streamResponse(
@@ -502,6 +689,27 @@ func (s *Server) streamResponse(
 				}
 			}
 		}
+	}
+
+	// M2 fix (post-ship /review fold): surface scanner errors instead
+	// of silently truncating. bufio.Scanner errors when (a) a single
+	// SSE line exceeds the buffer cap (a malicious or buggy upstream
+	// could emit very large events) OR (b) the upstream stream errors
+	// mid-flight. Pre-fix: the for-loop exit silently followed by
+	// WriteDone made the client see a complete-looking response.
+	if serr := scanner.Err(); serr != nil {
+		slog.Error("stream scanner error — emitting client-visible error chunk",
+			"provider", providerID, "connection", connectionID, "err", serr)
+		// Emit an SSE error event the client can detect (matches OpenAI
+		// chat-completions error shape). Don't WriteDone — the [DONE]
+		// terminator implies success.
+		errChunk := []byte(`{"error":{"message":"upstream stream truncated","type":"server_error"}}`)
+		sse.WriteChunk(w, errChunk)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, totalUsage, startTime, "error")
+		return
 	}
 
 	// Write [DONE]
@@ -623,19 +831,104 @@ func (s *Server) handleComboRequest(
 	startTime time.Time,
 	apiKeyID string,
 ) {
+	reqCtx := &requestContext{
+		firstMsg:    extractFirstUserMsg(body),
+		requestBody: body,
+		apiKeyID:    apiKeyID,
+	}
+
+	// Track last 5xx status across walk iterations for the "all exhausted" return
+	// (AC-F12e): when every candidate returns 5xx, propagate the last 5xx to the
+	// client instead of a generic 503.
+	lastWalkStatus := 0
+
 	for _, modelStr := range comboModels {
-		providerID, model, _, _ := s.resolveModel(r.Context(), modelStr, body)
+		// M2.3 fold: ctx-cancel check between candidates — abort walk if client gone.
+		if err := r.Context().Err(); err != nil {
+			slog.Info("combo walk aborted", "reason", "ctx canceled", "error", err)
+			return
+		}
+
+		// M2.4 fold: auto:* recursion guard. A combo member that itself starts
+		// with "auto:" would recursively expand into another smart-route
+		// candidate list. Skip such members to avoid surprising recursion.
+		if strings.HasPrefix(modelStr, "auto:") {
+			slog.Warn("combo skip auto:* member (recursion guard)", "model", modelStr)
+			continue
+		}
+
+		// Combo member resolution: allowedModels="" — combo IS the routing.
+		// Edge case (cycle 20260516-routing-strategy-ux M3 C-plan-3): if
+		// modelStr is "auto:user-order", the pre-sort inside resolveModel
+		// gets allowedModels="" and silently no-ops. The M2.4 auto:* recursion
+		// guard above already skips such members before reaching this call,
+		// so this is defense-in-depth.
+		providerID, model, _, _ := s.resolveModel(r.Context(), modelStr, body, "")
 		conn, _, err := s.selectConnection(providerID, model, nil)
 		if err != nil {
 			slog.Info("combo skip", "model", modelStr, "error", err)
 			continue
 		}
 
-		// Try this combo entry
-		s.executeRequest(w, r, body, sourceFormat, providerID, model, stream, conn, nil, requestID, startTime, apiKeyID)
+		// M1 α refactor — value-returning executeRequest; caller forwards via
+		// forwardResult. M2 extends to walk on 5xx (advance to next combo
+		// member). 4xx still forwards (client error, not "model broken").
+		result, execErr := s.executeRequest(r.Context(), r, body, sourceFormat, providerID, model, stream, conn, nil, requestID, startTime, reqCtx)
+		if execErr != nil {
+			// Network error with exhausted connection-level fallback: advance to
+			// next combo member.
+			slog.Info("combo executor exhausted", "model", modelStr, "error", execErr)
+			continue
+		}
+
+		// M2.2 fold (AC-F9..F12): walk on 5xx — close body explicitly (AC-X6)
+		// to prevent fd leak, then advance to next candidate.
+		if result.StatusCode >= 500 {
+			if result.Body != nil {
+				result.Body.Close() // AC-X6: explicit close before walk-advance.
+			}
+			lastWalkStatus = result.StatusCode
+			slog.Info("combo walk on 5xx", "model", modelStr, "status", result.StatusCode)
+			continue
+		}
+
+		// M5.2 (cycle 20260517-openai-subscription-responses-api):
+		// walk on HTTP 422 ONLY when the body indicates an
+		// `unsupported_feature` (the sentinel error openairesp.Translator
+		// emits when FromCanonical sees Tools — AC-T4). Other 422s (e.g.,
+		// model-not-found, validation errors that ARE the client's fault)
+		// fall through to forwardResult so the client sees the error.
+		// Walking on `unsupported_feature` lets a combo like
+		// [openai/gpt-5, anthropic/claude-3-7] succeed via anthropic for
+		// tool requests when openai+subscription declines them.
+		if result.StatusCode == 422 {
+			body, _ := io.ReadAll(result.Body)
+			result.Body.Close()
+			// Tighter pin than substring-match per reviewer M4-note: an
+			// upstream validation error referencing the field name
+			// "unsupported_feature" would false-walk under a loose
+			// substring. Match the JSON key pattern instead.
+			if bytes.Contains(body, []byte(`"type":"unsupported_feature"`)) {
+				lastWalkStatus = 422
+				slog.Info("combo walk on 422 unsupported_feature", "model", modelStr)
+				continue
+			}
+			// Other 422s: restore body for forwardResult and fall through.
+			result.Body = io.NopCloser(bytes.NewReader(body))
+		}
+
+		// 4xx (client error) and 2xx (success): forward to client and return.
+		// 4xx does NOT advance to next candidate per AC-F12d.
+		s.forwardResult(w, r, result, sourceFormat, providerID, model, stream, requestID, startTime, reqCtx)
 		return
 	}
 
+	// All candidates exhausted. If any returned 5xx, propagate that status
+	// (AC-F12e). Otherwise (selectConnection-failures or auto:* skips), 503.
+	if lastWalkStatus > 0 {
+		writeError(w, lastWalkStatus, fmt.Sprintf("all combo candidates exhausted; last upstream status %d", lastWalkStatus))
+		return
+	}
 	writeError(w, http.StatusServiceUnavailable, "all combo models exhausted")
 }
 
@@ -719,11 +1012,87 @@ type ConnectionInfo struct {
 	Endpoint    string
 }
 
-func (s *Server) resolveModel(ctx context.Context, model string, body []byte) (provider, resolvedModel string, isCombo bool, comboModels []string) {
+// safeAllowedModels extracts the allowed_models string from an *store.APIKey
+// pointer, returning "" for nil. Used by resolveModel callers to pass user-
+// order context without nil-checking inline.
+// Cycle 20260516-routing-strategy-ux M3.
+func safeAllowedModels(key *store.APIKey) string {
+	if key == nil {
+		return ""
+	}
+	return key.AllowedModels
+}
+
+// sortByAllowedModelsOrder rearranges candidates to match the position-order of
+// the API key's allowed_models comma-string. Exact matches beat wildcard matches
+// (AC-F8 — exact "anthropic/claude-x" at position 1 ranks AFTER wildcard
+// "anthropic/*" at position 0 only if claude-x itself isn't claude-x; same-id
+// candidates always rank by their exact-match position). Bare "*" entries are
+// ignored for ordering (they mean "match all", not a position). Candidates not
+// present in allowed_models fall to the end gracefully.
+// Cycle 20260516-routing-strategy-ux M3 (spec L300-340).
+func sortByAllowedModelsOrder(candidates []routing.ModelCandidate, allowedModels string) []routing.ModelCandidate {
+	exactPositions := map[string]int{}
+	wildcardPositions := map[string]int{}
+	for i, entry := range strings.Split(allowedModels, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" || entry == "*" {
+			continue // AC-F7: bare * ignored
+		}
+		if strings.HasSuffix(entry, "/*") {
+			wildcardPositions[strings.TrimSuffix(entry, "/*")] = i
+		} else {
+			exactPositions[entry] = i
+		}
+	}
+	positionForCandidate := func(provider, model string) (int, bool) {
+		// AC-F8: exact match beats wildcard.
+		if pos, ok := exactPositions[provider+"/"+model]; ok {
+			return pos, true
+		}
+		if pos, ok := wildcardPositions[provider]; ok {
+			return pos, true
+		}
+		return 0, false
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		posI, hasI := positionForCandidate(candidates[i].Provider, candidates[i].Model)
+		posJ, hasJ := positionForCandidate(candidates[j].Provider, candidates[j].Model)
+		if hasI && !hasJ {
+			return true
+		}
+		if !hasI && hasJ {
+			return false
+		}
+		if hasI && hasJ {
+			return posI < posJ
+		}
+		return false // both unmatched: preserve input order (AC-F6 graceful fall-to-end)
+	})
+	return candidates
+}
+
+// resolveModel resolves a request's `model` field into a (provider, model) pair
+// or a combo's member list. The allowedModels parameter (added by cycle
+// 20260516-routing-strategy-ux C1 fold) carries the API key's allowed_models
+// comma-string used by StrategyUserOrder to pre-sort smart-route candidates by
+// user position before Route() runs.
+func (s *Server) resolveModel(ctx context.Context, model string, body []byte, allowedModels string) (provider, resolvedModel string, isCombo bool, comboModels []string) {
 	// Check smart routing (auto[:strategy])
 	if strategy, isAuto := routing.ParseAutoModel(model); isAuto && s.deps.SmartRouter != nil {
 		candidates := s.buildSmartCandidates(ctx, strategy)
 		if len(candidates) > 0 {
+			// M3.6 (cycle 20260516-routing-strategy-ux): user-order pre-sort.
+			// No dependency on constraints/firstMsg — apply directly after
+			// buildSmartCandidates so the no-op StrategyUserOrder sortByStrategy
+			// case at routing/router.go preserves this order via stable-sort.
+			// Note: session-affinity hits in RouteWithConstraints below still
+			// override user-order — see AC-H7 in spec.md. User-order applies on
+			// affinity-miss (first session request OR post-TTL).
+			if strategy == routing.StrategyUserOrder && allowedModels != "" {
+				candidates = sortByAllowedModelsOrder(candidates, allowedModels)
+			}
+
 			// Detect request constraints (Layer 2)
 			constraints := detectRequestConstraints(body)
 
@@ -875,6 +1244,23 @@ func (s *Server) buildSmartCandidates(ctx context.Context, strategy routing.Stra
 	// ranking is stable across requests.
 	sampleConn := pickSampleConnByProvider(connections)
 
+	// AC-A6 (C2 fold): build provider → AuthType for the sample
+	// connection. Variant-aware capability resolution at L1229 uses
+	// this to pick (provider, auth_type) → variant Executor — so
+	// CapabilityOverrider on the SUBSCRIPTION variant (e.g.,
+	// ClaudeMaxExecutor's thinking-via-interleaved-beta) overrides
+	// catalog flags correctly when both apikey + subscription
+	// connections exist for the same provider.
+	sampleAuthType := map[string]string{}
+	for _, c := range connections {
+		if c.State == "disabled" {
+			continue
+		}
+		if sampleConn[c.Provider] == c.ID {
+			sampleAuthType[c.Provider] = c.AuthType
+		}
+	}
+
 	// M3.4b post-review fix — memo GetCacheHitRate results by
 	// connID across the catalog iteration. The query input
 	// (connID, lookback) is constant per provider, so without
@@ -919,9 +1305,16 @@ func (s *Server) buildSmartCandidates(ctx context.Context, strategy routing.Stra
 			SupportsTools:    m.Caps.SupportsTools,
 			SupportsThinking: m.Caps.SupportsThinking,
 		}
-		if exec, ok := s.deps.Executors[m.Provider]; ok {
-			if overrider, ok := exec.(executor.CapabilityOverrider); ok {
-				caps = overrider.OverrideCapabilities(m.ModelID, caps)
+		// M5.6 + AC-A6 (C2 fold): variant-keyed capability resolution.
+		// Pick the variant for (provider, sample-conn's auth_type); when
+		// no sample connection exists for this provider, fall back to
+		// wildcard (provider, "") via Variants.Get's built-in fallback.
+		if s.deps.Variants != nil {
+			authType := sampleAuthType[m.Provider]
+			if exec, ok := s.deps.Variants.Get(m.Provider, authType); ok {
+				if overrider, ok := exec.(executor.CapabilityOverrider); ok {
+					caps = overrider.OverrideCapabilities(m.ModelID, caps)
+				}
 			}
 		}
 
@@ -978,8 +1371,13 @@ func (s *Server) buildSmartCandidates(ctx context.Context, strategy routing.Stra
 // selectConnection picks a connection and marks it Active. Returns retryAfterSec > 0
 // when all connections are rate-limited.
 func (s *Server) selectConnection(providerID, model string, excludeIDs []string) (*ConnectionInfo, int, error) {
-	// Pre-selection: recover auto_detect connections stuck in AuthExpired
-	s.recoverAutoDetectConnections(providerID)
+	// Cycle 20260517-provider-auth-variants M5.5 (Q9 + m4 fold):
+	// auto_detect recovery branch REMOVED — auth_type=auto_detect rows
+	// are converted to auth_type=subscription at create time
+	// (routes_api.go:249-251), so the runtime auto_detect surface is
+	// dead code per memory `b51e9198`. The helpers
+	// recoverAutoDetectConnections + resolveAutoDetectCredentials are
+	// likewise deleted below.
 
 	result, err := s.deps.ProviderSelector.Select(providerID, model, excludeIDs)
 	if err != nil {
@@ -1021,6 +1419,17 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 		APIKey:       storedConn.APIKey,
 	}
 
+	// Cycle 20260517-provider-auth-variants M2.6.1 + M5.3: the
+	// ExchangedToken-empty preflight branch was REMOVED. Variant
+	// dispatch now routes (openai, subscription) to
+	// CodexSubscriptionExecutor which:
+	//   - uses Credentials.AccessToken (the PKCE access_token) directly
+	//   - implements PreflightChecker — empty AccessToken → ErrTierMissingScopes
+	// The variant's preflight is invoked by routes_v1.go via
+	// `preflightCreds(variantExec, creds)` (the helper added at M1.6).
+	// Pre-rip behavior was tied to api.openai.com/v1/responses (wrong-path
+	// per memory `f32bbc73`).
+
 	// For subscription connections, also pull through AuthStore so we
 	// pick up provider_data → AccountID → ExtraHeaders (specifically
 	// the ChatGPT-Account-ID header DefaultExecutor injects when
@@ -1034,61 +1443,18 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 		}
 	}
 
-	// For auto_detect connections, resolve credentials from the filesystem at request time.
-	// The store doesn't hold the actual token — it's read fresh each time.
-	if storedConn.AuthType == "auto_detect" {
-		freshCreds := s.resolveAutoDetectCredentials(storedConn.Provider)
-		if freshCreds != nil {
-			creds.AccessToken = freshCreds.AccessToken
-			creds.AuthType = "subscription" // canonical AuthType after M3.7 drops legacy "oauth" support.
-		} else {
-			conn.MarkSuccess() // release back to idle
-			return nil, 0, fmt.Errorf("auto_detect credentials unavailable for %s", storedConn.Provider)
-		}
-	}
+	// Cycle 20260517-provider-auth-variants M5.5 (Q9 + m4 fold):
+	// auto_detect request-time filesystem-read branch REMOVED. The
+	// dashboard's auto-detect flow converts auth_type=auto_detect to
+	// auth_type=subscription at create time (routes_api.go:249-251) and
+	// stores the tokens encrypted in DB; no live filesystem read needed
+	// at request time. Per memory `b51e9198`, the request-time branch
+	// was dead code for dashboard-created connections.
 
 	return &ConnectionInfo{
 		ID:          conn.ID,
 		Credentials: creds,
 	}, 0, nil
-}
-
-// recoverAutoDetectConnections checks if any auto_detect connections for the given provider
-// are stuck in AuthExpired and resets them if fresh credentials are available.
-func (s *Server) recoverAutoDetectConnections(providerID string) {
-	conns := s.deps.ProviderSelector.AllConnections(providerID)
-	for _, c := range conns {
-		if c.AuthType == "auto_detect" && c.State() == provider.StateAuthExpired {
-			// Check if fresh credentials are available
-			freshCreds := s.resolveAutoDetectCredentials(providerID)
-			if freshCreds != nil {
-				if err := c.ResetCooldown(); err == nil {
-					slog.Info("auto_detect connection recovered", "provider", providerID, "connection", c.ID)
-				}
-			}
-		}
-	}
-}
-
-// resolveAutoDetectCredentials reads credentials from the filesystem for auto_detect connections.
-func (s *Server) resolveAutoDetectCredentials(provider string) *executor.Credentials {
-	switch provider {
-	case "anthropic":
-		_, creds := detect.DetectClaude()
-		if creds == nil || creds.AccessToken == "" {
-			return nil
-		}
-		if creds.ExpiresAt.Before(time.Now()) {
-			slog.Warn("auto_detect credentials expired", "provider", provider, "expires_at", creds.ExpiresAt)
-			return nil
-		}
-		return &executor.Credentials{
-			AuthType:    "subscription", // canonical AuthType after M3.7 drops legacy "oauth" support.
-			AccessToken: creds.AccessToken,
-		}
-	default:
-		return nil
-	}
 }
 
 // markConnectionResult transitions the connection state based on the upstream outcome.
@@ -1131,6 +1497,22 @@ func (s *Server) markConnectionResult(connID, model string, statusCode int, resp
 			// clean.
 			terr = conn.MarkSuccess()
 		} else {
+			// Cycle 20260517-provider-auth-variants M5.4: variant-aware
+			// tier-error discrimination. The variant's ParseAuthError
+			// inspects the response body and returns a typed error (e.g.,
+			// ErrTierMissingScopes) when it matches a known pattern.
+			// Replaces the inline `bytes.Contains(respBody, "Missing scopes")`
+			// sniff that hardcoded the openai+subscription error string.
+			if s.deps.Variants != nil {
+				connInfo := s.deps.ProviderSelector.ConnectionByID(connID)
+				if connInfo != nil {
+					if variantExec, ok := s.deps.Variants.Get(connInfo.Provider, connInfo.AuthType); ok {
+						if friendlyErr := parseAuthError(variantExec, statusCode, respBody); friendlyErr != nil {
+							conn.SetLastError(friendlyErr)
+						}
+					}
+				}
+			}
 			terr = conn.MarkAuthExpired()
 			conn.InvalidateCredential()
 		}
@@ -1538,7 +1920,182 @@ func translateResponseBody(body []byte, from, to canonical.Format, model string)
 	if from == canonical.FormatOpenAI && to == canonical.FormatClaude {
 		return openaiResponseToClaude(body, model)
 	}
+	if from == canonical.FormatResponses && to == canonical.FormatOpenAI {
+		return responsesResponseToOpenAI(body, model)
+	}
 	return body, nil
+}
+
+// responsesResponseToOpenAI translates a /v1/responses upstream non-streaming
+// body into OpenAI chat-completions shape so the client (e.g., Continue) sees
+// the familiar `choices[].message.content` envelope. Uses
+// openairesp.ParseUpstreamResponse for assistant-text + usage extraction
+// (the translator owns the wire-shape knowledge); this function just
+// re-serializes into the chat-completions wrapper.
+//
+// If ParseUpstreamResponse returns openairesp.ErrTierMissingScopes, we
+// re-emit the body as a chat-completions error with the friendly message
+// so clients display something actionable.
+func responsesResponseToOpenAI(body []byte, model string) ([]byte, error) {
+	text, usage, err := openairesp.ParseUpstreamResponse(body)
+	if err != nil {
+		// Surface tier-error in chat-completions-shaped error envelope.
+		// Clients that recognise OpenAI's error shape (Continue, openai-python)
+		// will render `error.message` directly.
+		msg := err.Error()
+		if errors.Is(err, openairesp.ErrTierMissingScopes) {
+			msg = openairesp.ErrTierMissingScopes.Error()
+		}
+		return json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": msg,
+				"type":    "invalid_request_error",
+				"code":    "openai_subscription_responses",
+			},
+		})
+	}
+	resp := map[string]any{
+		"id":     "chatcmpl-from-responses",
+		"object": "chat.completion",
+		"model":  model,
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": text,
+			},
+			"finish_reason": "stop",
+		}},
+	}
+	if usage != nil {
+		resp["usage"] = map[string]any{
+			"prompt_tokens":     usage.PromptTokens,
+			"completion_tokens": usage.CompletionTokens,
+			"total_tokens":      usage.TotalTokens,
+		}
+	}
+	return json.Marshal(resp)
+}
+
+// Cycle 20260517-provider-auth-variants M5.2:
+// resolveTargetFormat + resolveTargetFormatByConnID helpers DELETED.
+// Their hardcoded openai+subscription → FormatResponses logic moved
+// into CodexSubscriptionExecutor.Format(); callers now invoke
+// formatOf(variantExec, providerID) at the two former call sites
+// (executeRequest L244 + forwardResult L539).
+
+// ---- Variant optional-interface helpers (M1.6 of cycle 20260517-provider-auth-variants) ----
+//
+// These free functions are the single-point queries the route handler uses
+// to fetch per-variant behavior from a chosen variant Executor. Type-assert
+// against the optional interfaces declared in internal/executor/executor.go
+// (Formatted, OAuthIdentified, AuthErrorParser, PreflightChecker); fall
+// through to safe defaults when the variant doesn't implement them.
+//
+// memory `fb0b4ef62` rule: RetryExecutor wrapper declares each forwarder
+// method, so type-assertions on a wrapped executor always succeed — the
+// forwarders return safe defaults if the inner doesn't opt in.
+//
+// Implementing variants today:
+//   - Formatted        : CodexSubscriptionExecutor (M2) + ClaudeMaxExecutor (M3) + future variants.
+//   - OAuthIdentified  : ClaudeMaxExecutor (M3) only — claude.ai OAuth tokens are
+//                        scoped for Claude Code and the translator must identify accordingly.
+//   - AuthErrorParser  : CodexSubscriptionExecutor (M2) + maybe ClaudeMaxExecutor (M3 live).
+//   - PreflightChecker : CodexSubscriptionExecutor (M2) — empty access_token short-circuits.
+
+// formatOf returns the variant's target wire format if it implements
+// Formatted; otherwise falls back to the provider's natural target format
+// via translate.DetectTargetFormat. Replaces resolveTargetFormat /
+// resolveTargetFormatByConnID at M5.2.
+func formatOf(e executor.Executor, providerID string) canonical.Format {
+	if f, ok := e.(executor.Formatted); ok {
+		if got := f.Format(); got != "" {
+			return got
+		}
+	}
+	return translate.DetectTargetFormat(providerID)
+}
+
+// needsOAuthIdentity returns whether the chosen variant's translator must
+// prepend an OAuth-identity system block (currently only claude+subscription
+// via ClaudeMaxExecutor at M3).
+func needsOAuthIdentity(e executor.Executor) bool {
+	if o, ok := e.(executor.OAuthIdentified); ok {
+		return o.NeedsOAuthIdentity()
+	}
+	return false
+}
+
+// parseAuthError lets the variant translate provider-specific auth-error
+// response bodies into typed Go errors (e.g., ErrTierMissingScopes). Replaces
+// the inline `bytes.Contains(respBody, ...)` sniff at routes_v1.go:1452-1454
+// when M5.4 lifts it.
+func parseAuthError(e executor.Executor, statusCode int, body []byte) error {
+	if p, ok := e.(executor.AuthErrorParser); ok {
+		return p.ParseAuthError(statusCode, body)
+	}
+	return nil
+}
+
+// preflightCreds lets the variant reject a connection that lacks viable
+// credentials BEFORE the upstream HTTP call. Replaces the inline preflight
+// at routes_v1.go:1314-1334 when M5.3 lifts it.
+func preflightCreds(e executor.Executor, creds *executor.Credentials) error {
+	if p, ok := e.(executor.PreflightChecker); ok {
+		return p.PreflightCredentials(creds)
+	}
+	return nil
+}
+
+// translateOptsFor builds the TranslateOpts the variant Executor needs.
+// MUST be called at EVERY FromCanonical / TranslateRequest call site so
+// variant-dependent flags (currently EmitOAuthIdentity for ClaudeMax)
+// survive re-serialization in the cache-hint + context-bridge paths.
+//
+// Review-fold C1 of the holistic /review at 2026-05-17: without this
+// helper, cache-hint or bridge re-serialization silently drops the
+// OAuth-identity block from anthropic+subscription requests because the
+// inline `translate.TranslateOpts{Model, Provider, Stream}` literals at
+// those sites didn't carry the flag.
+func translateOptsFor(e executor.Executor, model, providerID string, stream bool) translate.TranslateOpts {
+	return translate.TranslateOpts{
+		Model:             model,
+		Provider:          providerID,
+		Stream:            stream,
+		EmitOAuthIdentity: needsOAuthIdentity(e),
+	}
+}
+
+// resolveVariantExec picks the variant Executor for the chosen connection.
+// Returns nil if (a) Variants registry isn't wired (test fixtures pre-M1),
+// or (b) the variant isn't registered for (providerID, conn.AuthType).
+//
+// The route handler uses the returned executor ONLY to query optional
+// interfaces (Format, NeedsOAuthIdentity, ParseAuthError, PreflightChecker)
+// via the helpers above. The actual upstream Execute call still goes through
+// s.deps.Executors[providerID] in M1; M5.6 migrates the dispatch site to
+// also use Variants.Get.
+//
+// Logs the resolution at slog.Debug level for observability (m-R2
+// review-fold) — gives ops a way to see which variant ran each request
+// without adding a per-request structured field.
+func (s *Server) resolveVariantExec(providerID string, conn *ConnectionInfo) executor.Executor {
+	if s.deps.Variants == nil {
+		return nil
+	}
+	authType := ""
+	if conn != nil && conn.Credentials != nil {
+		authType = conn.Credentials.AuthType
+	}
+	exec, ok := s.deps.Variants.Get(providerID, authType)
+	if !ok {
+		return nil
+	}
+	slog.Debug("variant resolved",
+		"provider", providerID,
+		"auth_type", authType,
+		"executor", fmt.Sprintf("%T", exec))
+	return exec
 }
 
 func claudeResponseToOpenAI(body []byte, model string) ([]byte, error) {

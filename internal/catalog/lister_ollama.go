@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -27,7 +28,10 @@ type ollamaTagEntry struct {
 }
 
 func listOllamaModels(ctx context.Context, creds ListerCredentials) ([]Model, error) {
-	url := strings.TrimRight(creds.BaseURL, "/") + "/api/tags"
+	// BaseURL already includes /api (config.KnownProviders); append
+	// only the resource. See plan 20260514-discovery-url-doubling.
+	url := strings.TrimRight(creds.BaseURL, "/") + "/tags"
+	slog.Debug("lister: request URL", "provider", "ollama", "url", url)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("lister ollama: build request: %w", err)

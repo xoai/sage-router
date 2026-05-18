@@ -97,6 +97,20 @@ func (c *Connection) LastError() error {
 	return c.lastError
 }
 
+// SetLastError records an error message on the connection WITHOUT changing
+// state. Used by paths that want to surface an actionable message to the
+// dashboard alongside (and BEFORE) a state-transitioning Mark* call —
+// e.g., tier-error 401 detection in routes_v1.go::markConnectionResult
+// where the friendly text "ChatGPT subscription doesn't include API access"
+// is set before MarkAuthExpired transitions the state. Mark* methods that
+// already set lastError will overwrite this, which is the right semantics
+// (later transitions know more than earlier ones).
+func (c *Connection) SetLastError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastError = err
+}
+
 // transitionLocked moves the connection to a new state if the transition is valid.
 // CALLER MUST HOLD c.mu (write lock). The trailing "Locked" suffix is the lock-
 // discipline convention used elsewhere in the codebase. Errors are
@@ -400,4 +414,47 @@ func (c *Connection) addModelDenylistFor(model string, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.modelDenylist[model] = time.Now().Add(ttl)
+}
+
+// ModelDenylistSnapshot returns an independent copy of the active per-model
+// denylist entries — those whose expiry has not yet passed. Mutating the
+// returned map does NOT affect the connection. Used by the dashboard's
+// /api/connections projection to surface in-memory filter state that would
+// otherwise be invisible (the connection appears "green" in DB state while
+// silently refusing specific models). Cycle 20260516-connection-runtime-state.
+//
+// Filter semantics match CanServeModel at the call site: an entry is "active"
+// when now.Before(expiry). Returns an empty (non-nil) map when no entries
+// are active, for consistent JSON wire shape.
+func (c *Connection) ModelDenylistSnapshot() map[string]time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	now := time.Now()
+	out := make(map[string]time.Time, len(c.modelDenylist))
+	for model, expiry := range c.modelDenylist {
+		if now.Before(expiry) {
+			out[model] = expiry
+		}
+	}
+	return out
+}
+
+// ModelLocksSnapshot returns an independent copy of the active per-model
+// rate-limit locks — those whose expiry has not yet passed. Mutating the
+// returned map does NOT affect the connection.
+//
+// Filter semantics match isAvailableLocked at the call site: a lock is
+// "active" when now.Before(expiry). Returns an empty (non-nil) map when no
+// locks are active. Cycle 20260516-connection-runtime-state.
+func (c *Connection) ModelLocksSnapshot() map[string]time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	now := time.Now()
+	out := make(map[string]time.Time, len(c.modelLocks))
+	for model, expiry := range c.modelLocks {
+		if now.Before(expiry) {
+			out[model] = expiry
+		}
+	}
+	return out
 }

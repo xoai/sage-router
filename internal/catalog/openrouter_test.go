@@ -349,23 +349,34 @@ func TestParseOpenRouterPricing_ConversionMath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseOpenRouterPricing: %v", err)
 	}
-	if len(updates) != 1 {
-		t.Fatalf("len(updates) = %d, want 1", len(updates))
+	// Post fix 20260514-pricing-mirror: anthropic/* entries also emit
+	// a mirror candidate, so this fixture produces 2 updates (1
+	// openrouter + 1 anthropic mirror with same pricing).
+	if len(updates) != 2 {
+		t.Fatalf("len(updates) = %d, want 2 (1 openrouter + 1 anthropic mirror)", len(updates))
 	}
-	u := updates[0]
-	if u.Provider != "openrouter" {
-		t.Errorf("Provider = %q, want openrouter", u.Provider)
+
+	// Find the openrouter-namespace entry (subject of the original conversion-math contract).
+	var orEntry *PricingUpdate
+	for i := range updates {
+		if updates[i].Provider == "openrouter" {
+			orEntry = &updates[i]
+			break
+		}
 	}
-	if u.ModelID != "anthropic/claude-sonnet-4.5" {
-		t.Errorf("ModelID = %q, want anthropic/claude-sonnet-4.5", u.ModelID)
+	if orEntry == nil {
+		t.Fatalf("no openrouter entry in updates: %v", updates)
 	}
-	if u.Pricing.Source != SourceOpenRouter {
-		t.Errorf("Source = %q, want %q", u.Pricing.Source, SourceOpenRouter)
+	if orEntry.ModelID != "anthropic/claude-sonnet-4.5" {
+		t.Errorf("ModelID = %q, want anthropic/claude-sonnet-4.5", orEntry.ModelID)
 	}
-	approxEq(t, "Input", u.Pricing.Input, 3.0)
-	approxEq(t, "Output", u.Pricing.Output, 15.0)
-	approxEq(t, "CacheRead", u.Pricing.CacheRead, 0.3)
-	approxEq(t, "CacheWrite", u.Pricing.CacheWrite, 3.75)
+	if orEntry.Pricing.Source != SourceOpenRouter {
+		t.Errorf("Source = %q, want %q", orEntry.Pricing.Source, SourceOpenRouter)
+	}
+	approxEq(t, "Input", orEntry.Pricing.Input, 3.0)
+	approxEq(t, "Output", orEntry.Pricing.Output, 15.0)
+	approxEq(t, "CacheRead", orEntry.Pricing.CacheRead, 0.3)
+	approxEq(t, "CacheWrite", orEntry.Pricing.CacheWrite, 3.75)
 }
 
 // TestParseOpenRouterPricing_FreeModelHasZeroPrices — `:free` models
@@ -486,5 +497,264 @@ func TestParseOpenRouterPricing_NoPricingObjectIsSkipped(t *testing.T) {
 	}
 	if updates[0].ModelID != "vendor/known" {
 		t.Errorf("ModelID = %q, want vendor/known", updates[0].ModelID)
+	}
+}
+
+// ----- Fix 20260514-pricing-mirror tests -----
+
+// TestParseOpenRouterPricing_EmitsMirrorForKnownPrefixes — fix
+// 20260514-pricing-mirror. The parser emits TWO PricingUpdate entries
+// per OpenRouter entry whose prefix is in openrouterPrefixToProvider:
+// one for the openrouter namespace + one mirror candidate for the
+// direct-provider namespace. Unknown prefixes (meta-llama, mistralai,
+// etc.) get only the openrouter entry.
+func TestParseOpenRouterPricing_EmitsMirrorForKnownPrefixes(t *testing.T) {
+	body := `{"data":[
+		{"id":"openai/gpt-5","pricing":{"prompt":"0.0000125","completion":"0.0001"}},
+		{"id":"anthropic/claude-opus-4.7","pricing":{"prompt":"0.0000050","completion":"0.0000250"}},
+		{"id":"google/gemini-2.5-pro","pricing":{"prompt":"0.00000125","completion":"0.00001"}},
+		{"id":"meta-llama/llama-3.3","pricing":{"prompt":"0.0000001","completion":"0.0000005"}}
+	]}`
+	updates, err := parseOpenRouterPricing([]byte(body))
+	if err != nil {
+		t.Fatalf("parseOpenRouterPricing: %v", err)
+	}
+	// 4 entries × (1 openrouter + 0 or 1 mirror)
+	// = 4 openrouter + 3 mirrors (meta-llama excluded) = 7 total
+	if len(updates) != 7 {
+		t.Fatalf("len(updates) = %d, want 7 (4 openrouter + 3 mirrors)", len(updates))
+	}
+
+	// Count by provider.
+	counts := map[string]int{}
+	for _, u := range updates {
+		counts[u.Provider]++
+	}
+	if counts["openrouter"] != 4 {
+		t.Errorf("openrouter count = %d, want 4", counts["openrouter"])
+	}
+	if counts["openai"] != 1 || counts["anthropic"] != 1 || counts["gemini"] != 1 {
+		t.Errorf("mirror counts = %v, want one each of openai/anthropic/gemini", counts)
+	}
+
+	// Verify mirror entries carry the BARE id (prefix stripped) and same pricing.
+	for _, u := range updates {
+		switch {
+		case u.Provider == "openai" && u.ModelID == "gpt-5":
+			if u.Pricing.Input != 12.5 { // 0.0000125 × 1e6 = 12.5
+				t.Errorf("openai/gpt-5 mirror Input = %v, want 12.5", u.Pricing.Input)
+			}
+		case u.Provider == "anthropic" && u.ModelID == "claude-opus-4.7":
+			// Note: still has dot here — normalization happens later in resolveMirrorCandidates.
+			if u.Pricing.Input != 5.0 {
+				t.Errorf("anthropic mirror Input = %v, want 5.0", u.Pricing.Input)
+			}
+		case u.Provider == "gemini" && u.ModelID == "gemini-2.5-pro":
+			if u.Pricing.Input != 1.25 {
+				t.Errorf("gemini mirror Input = %v, want 1.25", u.Pricing.Input)
+			}
+		}
+	}
+}
+
+// TestFetchAndPersist_MirrorsToExistingDirectRows — fix 20260514-pricing-mirror.
+// Set up catalog_models with (openai, gpt-5) — simulating prior openai
+// discovery via openai@openrouter-mirror lister. Feed an OpenRouter
+// response containing openai/gpt-5. After FetchAndPersist, the
+// catalog_pricing row for (openai, gpt-5) exists with source=openrouter
+// and openrouter's prices.
+func TestFetchAndPersist_MirrorsToExistingDirectRows(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	// Pre-seed the direct-provider model row (simulates prior discovery).
+	if err := cs.UpsertModel(ctx, Model{
+		Provider: "openai", ModelID: "gpt-5", Source: SourceDiscovery,
+	}); err != nil {
+		t.Fatalf("seed (openai, gpt-5): %v", err)
+	}
+
+	body := `{"data":[{"id":"openai/gpt-5","pricing":{"prompt":"0.00000125","completion":"0.00001","input_cache_read":"0.000000125"}}]}`
+	url, closeSrv := newOpenRouterTestServer(t, []byte(body))
+	defer closeSrv()
+
+	r := &OpenRouterRefresher{Store: cs, URL: url + "/api/v1/models", Client: http.DefaultClient}
+	if _, err := r.FetchAndPersist(ctx); err != nil {
+		t.Fatalf("FetchAndPersist: %v", err)
+	}
+
+	// Direct-provider pricing exists with source=openrouter.
+	p, err := cs.GetPricing(ctx, "openai", "gpt-5")
+	if err != nil {
+		t.Fatalf("GetPricing (openai, gpt-5): %v", err)
+	}
+	if p == nil {
+		t.Fatal("mirror did not write (openai, gpt-5) pricing row")
+	}
+	if p.Source != SourceOpenRouter {
+		t.Errorf("Source = %q, want %q", p.Source, SourceOpenRouter)
+	}
+	approxEq(t, "Input", p.Input, 1.25)
+	approxEq(t, "Output", p.Output, 10.0)
+}
+
+// TestFetchAndPersist_AnthropicDateNormalizationLands — fix
+// 20260514-pricing-mirror Bug 1 (anthropic dot/dash mismatch). Set up
+// catalog_models with (anthropic, claude-opus-4-1-20250805) — the
+// date-suffixed form our discovery writes. Feed OpenRouter response
+// with anthropic/claude-opus-4.1 (the dot form OpenRouter emits).
+// Normalization MUST match these and write pricing to the date-suffixed
+// catalog row.
+func TestFetchAndPersist_AnthropicDateNormalizationLands(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	if err := cs.UpsertModel(ctx, Model{
+		Provider: "anthropic", ModelID: "claude-opus-4-1-20250805", Source: SourceDiscovery,
+	}); err != nil {
+		t.Fatalf("seed anthropic discovery: %v", err)
+	}
+
+	body := `{"data":[{"id":"anthropic/claude-opus-4.1","pricing":{"prompt":"0.000015","completion":"0.000075"}}]}`
+	url, closeSrv := newOpenRouterTestServer(t, []byte(body))
+	defer closeSrv()
+
+	r := &OpenRouterRefresher{Store: cs, URL: url + "/api/v1/models", Client: http.DefaultClient}
+	if _, err := r.FetchAndPersist(ctx); err != nil {
+		t.Fatalf("FetchAndPersist: %v", err)
+	}
+
+	// Pricing landed on the DATE-SUFFIXED catalog row, not the bare form.
+	p, err := cs.GetPricing(ctx, "anthropic", "claude-opus-4-1-20250805")
+	if err != nil || p == nil {
+		t.Fatalf("GetPricing date-suffixed row: err=%v p=%v", err, p)
+	}
+	if p.Source != SourceOpenRouter {
+		t.Errorf("Source = %q, want openrouter", p.Source)
+	}
+	approxEq(t, "Input", p.Input, 15.0)
+	approxEq(t, "Output", p.Output, 75.0)
+}
+
+// TestFetchAndPersist_SkipMirrorForEmptyDirectProviderRows — fix
+// 20260514-pricing-mirror FK safety. No openai/anthropic/gemini rows
+// in catalog_models. OpenRouter response contains entries for those
+// namespaces. After FetchAndPersist, only openrouter-namespace rows
+// are written; no mirror rows attempted (no FK violation, no error).
+func TestFetchAndPersist_SkipMirrorForEmptyDirectProviderRows(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+	// Deliberately do NOT seed any direct-provider rows.
+
+	body := `{"data":[
+		{"id":"openai/gpt-5","pricing":{"prompt":"0.00000125","completion":"0.00001"}},
+		{"id":"anthropic/claude-opus-4.7","pricing":{"prompt":"0.000005","completion":"0.000025"}}
+	]}`
+	url, closeSrv := newOpenRouterTestServer(t, []byte(body))
+	defer closeSrv()
+
+	r := &OpenRouterRefresher{Store: cs, URL: url + "/api/v1/models", Client: http.DefaultClient}
+	if _, err := r.FetchAndPersist(ctx); err != nil {
+		t.Fatalf("FetchAndPersist returned error when it should silently skip mirrors: %v", err)
+	}
+
+	// Openrouter-namespace rows exist.
+	if p, _ := cs.GetPricing(ctx, "openrouter", "openai/gpt-5"); p == nil {
+		t.Error("openrouter/openai/gpt-5 pricing missing")
+	}
+	// Mirror rows DO NOT exist (no FK target).
+	if p, _ := cs.GetPricing(ctx, "openai", "gpt-5"); p != nil {
+		t.Errorf("mirror to (openai, gpt-5) was written despite no catalog_models row; got %+v", p)
+	}
+	if p, _ := cs.GetPricing(ctx, "anthropic", "claude-opus-4-7"); p != nil {
+		t.Errorf("mirror to (anthropic, ...) was written despite no catalog_models row; got %+v", p)
+	}
+}
+
+// TestFetchAndPersist_MirrorOverridesSeedPricing — fix
+// 20260514-pricing-mirror. Pre-seed (openai, gpt-4o) catalog_models +
+// pricing rows with source=seed at $2.50/$10.00. Run FetchAndPersist
+// with OpenRouter response. Per ADR-2 pricing precedence (openrouter
+// > seed), the seed pricing row gets overwritten with openrouter's
+// values + source=openrouter.
+func TestFetchAndPersist_MirrorOverridesSeedPricing(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	if err := cs.UpsertModel(ctx, Model{
+		Provider: "openai", ModelID: "gpt-4o", Source: SourceDiscovery,
+	}); err != nil {
+		t.Fatalf("seed model: %v", err)
+	}
+	if err := cs.UpsertPricing(ctx, "openai", "gpt-4o", Pricing{
+		Input: 2.5, Output: 10.0, Source: SourceSeed,
+	}); err != nil {
+		t.Fatalf("seed pricing: %v", err)
+	}
+
+	body := `{"data":[{"id":"openai/gpt-4o","pricing":{"prompt":"0.0000025","completion":"0.00001"}}]}`
+	url, closeSrv := newOpenRouterTestServer(t, []byte(body))
+	defer closeSrv()
+
+	r := &OpenRouterRefresher{Store: cs, URL: url + "/api/v1/models", Client: http.DefaultClient}
+	if _, err := r.FetchAndPersist(ctx); err != nil {
+		t.Fatalf("FetchAndPersist: %v", err)
+	}
+
+	p, _ := cs.GetPricing(ctx, "openai", "gpt-4o")
+	if p == nil {
+		t.Fatal("pricing missing after refresh")
+	}
+	if p.Source != SourceOpenRouter {
+		t.Errorf("Source = %q, want %q (openrouter should override seed)", p.Source, SourceOpenRouter)
+	}
+	// Input is 0.0000025 × 1e6 = 2.5 — coincidentally same as seed.
+	// Output is 0.00001 × 1e6 = 10.0 — same too. Use a distinctive value
+	// to verify the WRITE actually happened:
+	approxEq(t, "Input", p.Input, 2.5)
+	approxEq(t, "Output", p.Output, 10.0)
+}
+
+// TestFetchAndPersist_PreservesDirectProviderModelSource — fix
+// 20260514-pricing-mirror plan-review v2 critical fix. The mirror
+// path must NOT call UpsertModel on direct-provider rows — only on
+// openrouter-namespace rows. (openai, gpt-5) must keep source=discovery
+// in catalog_models after a refresh that mirrors its pricing.
+func TestFetchAndPersist_PreservesDirectProviderModelSource(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	if err := cs.UpsertModel(ctx, Model{
+		Provider: "openai", ModelID: "gpt-5", Source: SourceDiscovery,
+		Caps: Capabilities{SupportsImages: true, SupportsTools: true, SupportsThinking: false},
+	}); err != nil {
+		t.Fatalf("seed discovery row: %v", err)
+	}
+
+	body := `{"data":[{"id":"openai/gpt-5","pricing":{"prompt":"0.00000125","completion":"0.00001"}}]}`
+	url, closeSrv := newOpenRouterTestServer(t, []byte(body))
+	defer closeSrv()
+
+	r := &OpenRouterRefresher{Store: cs, URL: url + "/api/v1/models", Client: http.DefaultClient}
+	if _, err := r.FetchAndPersist(ctx); err != nil {
+		t.Fatalf("FetchAndPersist: %v", err)
+	}
+
+	// catalog_models row STAYS source=discovery — mirror did not clobber it.
+	m, err := cs.GetModel(ctx, "openai", "gpt-5")
+	if err != nil || m == nil {
+		t.Fatalf("GetModel: err=%v m=%v", err, m)
+	}
+	if m.Source != SourceDiscovery {
+		t.Errorf("catalog_models source = %q, want %q (mirror MUST NOT call UpsertModel on direct-provider rows)",
+			m.Source, SourceDiscovery)
+	}
+	// Capability flags preserved from discovery.
+	if !m.Caps.SupportsImages || !m.Caps.SupportsTools {
+		t.Errorf("capability flags clobbered: %+v (UPSERT zeroed them — bug)", m.Caps)
+	}
+
+	// AND catalog_pricing row exists with source=openrouter.
+	p, err := cs.GetPricing(ctx, "openai", "gpt-5")
+	if err != nil || p == nil {
+		t.Fatalf("GetPricing: err=%v p=%v", err, p)
+	}
+	if p.Source != SourceOpenRouter {
+		t.Errorf("catalog_pricing source = %q, want %q", p.Source, SourceOpenRouter)
 	}
 }

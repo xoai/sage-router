@@ -244,3 +244,8 @@ func TestConnection_RefreshFailuresColumnRoundTrip(t *testing.T) {
 		t.Errorf("JSON should include refresh_failures; got %s", b)
 	}
 }
+
+
+// 3 ExchangedToken roundtrip + encryption tests deleted in cycle
+// 20260517-provider-auth-variants M2.6.6 — migration 013 drops the
+// exchanged_token column entirely (RFC 8693 chain was wrong-path).

@@ -48,7 +48,12 @@ type Dependencies struct {
 	TranslateRegistry  *translate.Registry
 	ProviderSelector   *provider.Selector
 	ProviderRegistry   *provider.Registry
-	Executors          map[string]executor.Executor
+	// Cycle 20260517-provider-auth-variants M5.6: legacy provider-keyed
+	// Executors map REMOVED. All upstream dispatch now goes through
+	// Variants.Get(provider, auth_type), which carries the wildcard
+	// fallback `(provider, "")` for providers that don't yet split
+	// per-auth-type (gemini, github-copilot, openrouter, ollama, default).
+	Variants *executor.Variants
 	UsageTracker       *usage.Tracker
 	Auth               *auth.Manager
 	OpenAIAuth         *oauth.OpenAIAuth // legacy device-code; returns 410 after M2 deprecation

@@ -232,6 +232,45 @@ export function ConnectionRow({ conn, onChanged }) {
               {conn.refresh_failures}× refresh fail
             </span>
           )}
+          {/* Cycle 20260516-connection-runtime-state: surface Selector runtime
+              view so the dashboard can detect DB-vs-runtime drift + show
+              per-model filter state that's otherwise invisible. All chips
+              guard on field presence so old-server responses render as today. */}
+          {conn.runtime_state && conn.runtime_state !== conn.state && (
+            <span style={{
+              fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--status-yellow)',
+              whiteSpace: 'nowrap',
+            }}
+            title={`Selector runtime state differs from DB. DB: ${conn.state} / Runtime: ${conn.runtime_state}. This usually means a transition (rate-limit, error, refresh) hasn't been persisted to the DB yet — common after crash/restart, or for in-flight requests. The Selector uses the runtime value for routing decisions.`}>
+              Runtime: {conn.runtime_state}
+            </span>
+          )}
+          {conn.model_denylist && Object.keys(conn.model_denylist).length > 0 && (
+            <span style={{
+              fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--status-red)',
+              whiteSpace: 'nowrap',
+            }}
+            title={`Models denylisted on this connection (1h TTL after a 401/403 model rejection):\n${
+              Object.entries(conn.model_denylist)
+                .map(([model, expiry]) => `${model} → expires ${new Date(expiry).toLocaleTimeString()}`)
+                .join('\n')
+            }\n\nRequests for these models will refuse this connection until the entry expires.`}>
+              🚫 {Object.keys(conn.model_denylist).length} denylisted
+            </span>
+          )}
+          {conn.model_locks && Object.keys(conn.model_locks).length > 0 && (
+            <span style={{
+              fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--status-yellow)',
+              whiteSpace: 'nowrap',
+            }}
+            title={`Models rate-limited on this connection (set after a 429 with backoff cooldown):\n${
+              Object.entries(conn.model_locks)
+                .map(([model, expiry]) => `${model} → unlocks ${new Date(expiry).toLocaleTimeString()}`)
+                .join('\n')
+            }\n\nRequests for these models will refuse this connection until the lock expires.`}>
+              ⏳ {Object.keys(conn.model_locks).length} rate-limited
+            </span>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           {degraded && isSubscription && (

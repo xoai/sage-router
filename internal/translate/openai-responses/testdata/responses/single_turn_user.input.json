@@ -1,0 +1,18 @@
+{
+  "model": "gpt-4o",
+  "instructions": "You are a helpful assistant.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "What is 2+2?"
+        }
+      ]
+    }
+  ],
+  "stream": true,
+  "store": false
+}

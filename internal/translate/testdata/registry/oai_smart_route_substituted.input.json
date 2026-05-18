@@ -1,0 +1,13 @@
+{
+  "source": "openai",
+  "target": "claude",
+  "opts": {
+    "Model": "claude-haiku-4-5-20251001",
+    "Provider": "anthropic",
+    "Stream": false
+  },
+  "body": {
+    "model": "auto:cheapest",
+    "messages": [{"role": "user", "content": "hi"}]
+  }
+}

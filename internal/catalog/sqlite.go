@@ -465,3 +465,57 @@ func parseTimestamp(s string) time.Time {
 	}
 	return time.Time{}
 }
+
+// ListModelIDsForProviders returns all catalog_models.model_id values
+// for the given provider keys, grouped by provider. Used by the
+// OpenRouter refresher's mirror-pricing path (fix 20260514-pricing-mirror)
+// to resolve OpenRouter IDs against existing direct-provider rows.
+//
+// Portable SQL: single-column IN with dynamic placeholders. Avoids the
+// modernc.org/sqlite portability concerns of multi-column tuple-IN.
+//
+// Absent providers (e.g., querying for "ollama" when no ollama rows
+// exist) yield an empty slice in the returned map — NOT an error.
+// Callers can rely on `out[provider]` being non-nil for every provider
+// they passed in.
+func (s *sqliteCatalog) ListModelIDsForProviders(
+	ctx context.Context, providers []string,
+) (map[string][]string, error) {
+	if len(providers) == 0 {
+		return map[string][]string{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(providers))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, len(providers))
+	for i, p := range providers {
+		args[i] = p
+	}
+	query := fmt.Sprintf(
+		`SELECT provider, model_id FROM catalog_models WHERE provider IN (%s)`,
+		placeholders,
+	)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ListModelIDsForProviders: query: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string][]string, len(providers))
+	for rows.Next() {
+		var p, m string
+		if err := rows.Scan(&p, &m); err != nil {
+			return nil, fmt.Errorf("ListModelIDsForProviders: scan: %w", err)
+		}
+		out[p] = append(out[p], m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListModelIDsForProviders: rows: %w", err)
+	}
+	// Ensure absent providers yield non-nil empty slices so callers
+	// can use `out[p]` without a nil check.
+	for _, p := range providers {
+		if _, ok := out[p]; !ok {
+			out[p] = []string{}
+		}
+	}
+	return out, nil
+}

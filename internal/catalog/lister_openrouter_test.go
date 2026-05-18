@@ -96,3 +96,31 @@ func TestListOpenRouterModels_HTTPErrorIsPropagated(t *testing.T) {
 		t.Errorf("error missing 502: %v", err)
 	}
 }
+
+// TestListOpenRouterModels_ProductionShapeBaseURL — initiative
+// 20260514-discovery-url-doubling §8. Asserts path is correctly
+// composed when BaseURL ends in /api/v1 (the production shape per
+// config.KnownProviders["openrouter"].BaseURL).
+func TestListOpenRouterModels_ProductionShapeBaseURL(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(openrouterModelsResponse))
+	}))
+	defer srv.Close()
+
+	models, err := listOpenRouterModels(context.Background(), ListerCredentials{
+		BaseURL: srv.URL + "/api/v1",
+		APIKey:  "sk-or-prodshape",
+	})
+	if err != nil {
+		t.Fatalf("listOpenRouterModels: %v", err)
+	}
+	if gotPath != "/api/v1/models" {
+		t.Errorf("path = %q, want /api/v1/models (BaseURL already has /api/v1)", gotPath)
+	}
+	if len(models) == 0 {
+		t.Error("expected non-empty model list")
+	}
+}

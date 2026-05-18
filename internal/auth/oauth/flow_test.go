@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -183,6 +184,12 @@ func TestFlow_Exchange_HappyPath(t *testing.T) {
 	// Mock token endpoint: returns a well-formed token response when called
 	// with the expected form fields. We verify the request body shape AND
 	// the returned TokenResponse.
+	//
+	// NOTE: OpenAI provider auto-chains into ExchangeForAPIKey after the
+	// authorization_code grant (RequiresAPIKeyExchange=true). The handler
+	// below differentiates by grant_type and only records the first
+	// (auth-code) form for assertion. The chained token-exchange call is
+	// covered separately by TestFlow_Exchange_AutoChainsAPIKeyExchange_OpenAI.
 	var gotForm url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -192,16 +199,27 @@ func TestFlow_Exchange_HappyPath(t *testing.T) {
 			t.Errorf("Content-Type = %q, want form", ct)
 		}
 		body, _ := io.ReadAll(r.Body)
-		gotForm, _ = url.ParseQuery(string(body))
+		form, _ := url.ParseQuery(string(body))
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
-			"access_token": "atk-abc",
-			"refresh_token": "rtk-xyz",
-			"id_token": "jwt-blob",
-			"expires_in": 3600,
-			"token_type": "Bearer"
-		}`))
+		switch form.Get("grant_type") {
+		case "authorization_code":
+			gotForm = form
+			_, _ = w.Write([]byte(`{
+				"access_token": "atk-abc",
+				"refresh_token": "rtk-xyz",
+				"id_token": "jwt-blob",
+				"expires_in": 3600,
+				"token_type": "Bearer"
+			}`))
+		case "urn:ietf:params:oauth:grant-type:token-exchange":
+			// Auto-chained step for openai. Return any non-empty access_token —
+			// the assertions in this test only inspect the auth-code form.
+			_, _ = w.Write([]byte(`{"access_token":"exchanged-for-test"}`))
+		default:
+			t.Errorf("unexpected grant_type=%q", form.Get("grant_type"))
+			w.WriteHeader(http.StatusBadRequest)
+		}
 	}))
 	defer srv.Close()
 
@@ -243,6 +261,117 @@ func TestFlow_Exchange_HappyPath(t *testing.T) {
 	}
 	if resp.ExpiresIn != 3600 {
 		t.Errorf("ExpiresIn = %d, want 3600", resp.ExpiresIn)
+	}
+}
+
+// TestFlow_Exchange_AnthropicSendsJSON pins the Anthropic-specific token
+// exchange contract: platform.claude.com/v1/oauth/token requires
+// Content-Type: application/json with a JSON body, not the RFC 6749
+// default form-urlencoded shape used by OpenAI.
+//
+// Root cause for this fix (M0.8 of cycle 20260517-provider-auth-variants):
+// PKCE login was failing with `oauth bridge: exchange failed → provider
+// returned 400: {"error":{"type":"invalid_request_error","message":
+// "Invalid request format"}}` (request_id req_011Cb86cWhWMtdUsmAK4cLRc).
+// Live curl + opencode-anthropic-auth plugin source comparison showed
+// the plugin (which works) sends JSON; sage-router was sending form-encoded.
+//
+// Field set mirrors the plugin's auth.ts::exchangeCode (verbatim):
+//   code, state, grant_type, client_id, redirect_uri, code_verifier
+// `state` is the only addition over the OpenAI form body — defensive,
+// matching the plugin's body shape.
+func TestFlow_Exchange_AnthropicSendsJSON(t *testing.T) {
+	var gotContentType string
+	var gotBody map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		gotContentType = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("body is not JSON: %v (raw=%s)", err, body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"access_token": "anthropic-atk",
+			"refresh_token": "anthropic-rtk",
+			"expires_in": 3600,
+			"token_type": "Bearer"
+		}`))
+	}))
+	defer srv.Close()
+
+	f, err := NewFlow("anthropic", "Claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.tokenURL = srv.URL
+
+	resp, err := f.Exchange(context.Background(), "the-code", "http://localhost:53692/callback")
+	if err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+
+	if !strings.HasPrefix(gotContentType, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", gotContentType)
+	}
+
+	// The 6 fields the plugin sends, verbatim.
+	wantBody := map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          "the-code",
+		"state":         f.State,
+		"client_id":     "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		"redirect_uri":  "http://localhost:53692/callback",
+		"code_verifier": f.Verifier,
+	}
+	if len(gotBody) != len(wantBody) {
+		t.Errorf("body field count = %d, want %d (got=%v)", len(gotBody), len(wantBody), gotBody)
+	}
+	for k, v := range wantBody {
+		if got := gotBody[k]; got != v {
+			t.Errorf("body[%s] = %q, want %q", k, got, v)
+		}
+	}
+
+	if resp.AccessToken != "anthropic-atk" {
+		t.Errorf("AccessToken = %q, want anthropic-atk", resp.AccessToken)
+	}
+	if resp.RefreshToken != "anthropic-rtk" {
+		t.Errorf("RefreshToken = %q, want anthropic-rtk", resp.RefreshToken)
+	}
+}
+
+// TestFlow_Exchange_OpenAISendsForm is a regression pin for the existing
+// form-encoded path on the OpenAI exchange. Pairs with the JSON test
+// above so a future refactor that flips OpenAI's TokenRequestFormat
+// fails loudly here, not silently in production.
+func TestFlow_Exchange_OpenAISendsForm(t *testing.T) {
+	var gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		w.Header().Set("Content-Type", "application/json")
+		// Handle both grant types — the auth-code branch + the chained
+		// token-exchange that OpenAI's RequiresAPIKeyExchange triggers.
+		body, _ := io.ReadAll(r.Body)
+		form, _ := url.ParseQuery(string(body))
+		switch form.Get("grant_type") {
+		case "authorization_code":
+			_, _ = w.Write([]byte(`{"access_token":"atk","refresh_token":"rtk","id_token":"jwt","expires_in":3600}`))
+		case "urn:ietf:params:oauth:grant-type:token-exchange":
+			_, _ = w.Write([]byte(`{"access_token":"exchanged"}`))
+		}
+	}))
+	defer srv.Close()
+
+	f, _ := NewFlow("openai", "Work")
+	f.tokenURL = srv.URL
+	if _, err := f.Exchange(context.Background(), "the-code", "http://localhost:1455/auth/callback"); err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+	if !strings.HasPrefix(gotContentType, "application/x-www-form-urlencoded") {
+		t.Errorf("openai Content-Type = %q, want form-urlencoded (regression)", gotContentType)
 	}
 }
 
@@ -332,3 +461,10 @@ func TestExtractIDTokenClaim_MalformedJWT(t *testing.T) {
 func b64u(s string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(s))
 }
+
+
+// 6 token-exchange + auto-chain tests deleted in cycle
+// 20260517-provider-auth-variants M2.6.6 — Flow.ExchangeForAPIKey,
+// Flow.Exchange auto-chain, TokenResponse.ExchangedToken, and the
+// ToCredential ExchangedToken pass-through were all removed at M2.6.2
+// + M2.6.3 (the RFC 8693 chain was wrong-path per memory `f32bbc73`).

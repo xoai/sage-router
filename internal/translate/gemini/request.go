@@ -114,6 +114,15 @@ func (t *Translator) ToCanonical(body []byte, opts translate.TranslateOpts) (*ca
 	}
 
 	// Use model from opts if body didn't have it (Gemini model is usually in URL path).
+	//
+	// Reachable-but-redundant note (cycle 20260515-chat-routing-fix AC-X4):
+	// Registry.TranslateRequest now applies opts.Model authoritatively AFTER
+	// ToCanonical returns, so for normal callers (routes_v1.go:227) the
+	// canonical req.Model is overwritten by opts.Model regardless of what
+	// this fallback does. Kept as defense-in-depth for hypothetical future
+	// callers that bypass the registry layer OR pass a body with no model
+	// AND no opts.Model — in which case the canonical's empty Model would
+	// surface as the actual bug (caller responsibility).
 	if req.Model == "" && opts.Model != "" {
 		req.Model = opts.Model
 	}

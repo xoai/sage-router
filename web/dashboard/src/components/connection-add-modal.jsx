@@ -1,4 +1,4 @@
-import { signal, computed } from '@preact/signals';
+import { signal } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
 import {
   getOAuthHealth, rebindOAuthPort, startOAuthFlow, getOAuthStatus,
@@ -12,10 +12,15 @@ import { TosModal } from './tos-modal';
 // PKCE providers — only these expose a "Login with subscription" button
 // because they have a working interactive OAuth flow with a localhost
 // redirect bridge. Gemini and Copilot are import-only.
-const PKCE_PROVIDERS = new Set(['openai', 'anthropic']);
-
-// Providers that have a CLI credential file we know how to import.
-const IMPORT_PROVIDERS = new Set(['openai', 'anthropic', 'gemini', 'github-copilot']);
+//
+// In-cycle scope cut (20260517-provider-auth-variants): anthropic
+// subscription UI is hidden pending M3 (ClaudeMaxExecutor) ship. The
+// PKCE flow is technically fixed by M0.8 (form→JSON token exchange,
+// commit pending) but the executor still routes anthropic+subscription
+// through the apikey-shape ClaudeExecutor which doesn't work for
+// claude.ai consumer tokens. Re-add 'anthropic' to this Set once
+// M3 ships the variant Executor. See .sage/work/20260517-provider-auth-variants/.
+const PKCE_PROVIDERS = new Set(['openai']);
 
 // All providers we render in the dropdown. Order matches the spec
 // (subscription-capable first, then API-key-only).
@@ -28,11 +33,42 @@ const PROVIDER_OPTIONS = [
   { id: 'ollama',         label: 'Ollama' },
 ];
 
+// Per-provider section-header text for the "import / subscription"
+// region. Anthropic and OpenAI have actual subscription tiers; Gemini
+// and Copilot import from a local CLI's OAuth credentials but have no
+// subscription tier — naming reflects that (spec B1/B4).
+const SUBSCRIPTION_HEADER = {
+  'anthropic':      'Use your subscription',
+  'openai':         'Use your subscription',
+  'gemini':         'Use your CLI credentials',
+  'github-copilot': 'Use your CLI credentials',
+};
+
+// Per-provider one-click button for non-PKCE providers (gemini, copilot).
+// PKCE providers (openai, anthropic) use auto-detect cards with disclosure
+// instead — they live under the same "use your subscription" section but
+// render via Claude/CodexAutoDetectCard, not OneClickImportButton.
+const CLI_IMPORT_BUTTON_LABEL = {
+  'gemini':           'Use Gemini CLI credentials',
+  'github-copilot':   'Import Copilot credentials',
+};
+
+// Default credential paths. Used as informational hints on cards/buttons
+// (AC-2 sub-letter b). Detect API returns only {found, subscription_type}
+// today — backend doesn't echo the matched path — so this is a typical
+// default, not the actually-resolved path. WSL+Windows users may have a
+// different layout, but the detect succeeds either way.
+const CLI_CREDENTIAL_PATH = {
+  'anthropic':        '~/.claude/.credentials.json',
+  'openai':           '~/.codex/auth.json',
+  'gemini':           '~/.gemini/oauth_creds.json',
+  'github-copilot':   '~/.copilot/settings.json',
+};
+
 // Module-level signals — mirror the providers.jsx pattern.
 const provider = signal('anthropic');
 const label = signal('');
 const apiKey = signal('');
-const importPath = signal('');
 const claudeDetect = signal(null);
 const claudeDisclosure = signal(false);
 // Codex CLI auto-detect parallels Claude's. The duplicated card needs
@@ -74,7 +110,6 @@ function resetState() {
   provider.value = 'anthropic';
   label.value = '';
   apiKey.value = '';
-  importPath.value = '';
   claudeDetect.value = null;
   claudeDisclosure.value = false;
   codexDetect.value = null;
@@ -154,35 +189,36 @@ function pollFlowStatus(state) {
   statusTimer = setInterval(tick, 2000);
 }
 
+// doImport — one-click default-path import for gemini and copilot.
+// The custom-path UI was removed in 20260514-add-provider-ux (out of
+// scope; CLI `auth import --provider X --path ...` covers power users).
+// Backend uses the provider's default credential location when `path`
+// is omitted from the request body (api/oauth.js:64-67).
 function doImport(canonicalProvider) {
-  const run = () => {
-    pendingAction.value = true;
-    importSubscription({
-      provider: canonicalProvider,
-      name: label.value.trim(),
-      priority: 0,
-      path: importPath.value.trim() || undefined,
-    }).then(res => {
-      pendingAction.value = false;
-      if (handleTosGate(res, () => doImport(canonicalProvider))) return;
-      if (res.status === 404) {
-        const msg = res.data?.error || 'credential file not found';
-        const hint = res.data?.hint ? '\n' + res.data.hint : '';
-        addToast(msg + hint, 'error');
-        return;
-      }
-      if (!res.ok) {
-        addToast(res.data?.error || res.data?.message || `import failed (${res.status})`, 'error');
-        return;
-      }
-      addToast('Subscription imported', 'success');
-      window.dispatchEvent(new CustomEvent('sage:connection-added'));
-    }).catch(err => {
-      pendingAction.value = false;
-      addToast('Could not import: ' + err.message, 'error');
-    });
-  };
-  run();
+  pendingAction.value = true;
+  importSubscription({
+    provider: canonicalProvider,
+    name: label.value.trim(),
+    priority: 0,
+  }).then(res => {
+    pendingAction.value = false;
+    if (handleTosGate(res, () => doImport(canonicalProvider))) return;
+    if (res.status === 404) {
+      const msg = res.data?.error || 'credential file not found';
+      const hint = res.data?.hint ? '\n' + res.data.hint : '';
+      addToast(msg + hint, 'error');
+      return;
+    }
+    if (!res.ok) {
+      addToast(res.data?.error || res.data?.message || `import failed (${res.status})`, 'error');
+      return;
+    }
+    addToast('Subscription imported', 'success');
+    window.dispatchEvent(new CustomEvent('sage:connection-added'));
+  }).catch(err => {
+    pendingAction.value = false;
+    addToast('Could not import: ' + err.message, 'error');
+  });
 }
 
 function doApiKey(canonicalProvider) {
@@ -310,14 +346,139 @@ function SubscriptionLoginButton({ canonical }) {
   );
 }
 
-function ImportFromCLIButton({ canonical }) {
+// ClaudeAutoDetectCard — anthropic auto-detect with security disclosure.
+// The trust checkbox is the AC-2 exception: auto-detect reads another
+// tool's credential file, so the disclosure is load-bearing security UX,
+// not modal-design noise.
+function ClaudeAutoDetectCard() {
+  const detected = claudeDetect.value;
+  return (
+    <div style={{
+      marginBottom: 'var(--space-md)', padding: 'var(--space-md)',
+      background: 'var(--bg-2)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-md)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <span style={{ color: 'var(--status-green)', fontSize: 14 }}>&#10003;</span>
+        <span style={{ fontSize: 13, fontWeight: 500 }}>Claude Code detected</span>
+        {detected.subscription_type && (
+          <span style={{
+            fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)',
+            background: 'var(--bg-3)', padding: '2px 6px', borderRadius: 'var(--radius-sm)',
+          }}>
+            {detected.subscription_type}
+          </span>
+        )}
+      </div>
+      <div style={{
+        fontSize: 11, color: 'var(--text-tertiary)',
+        fontFamily: 'var(--font-mono)', marginBottom: 8,
+      }}>
+        {CLI_CREDENTIAL_PATH.anthropic}
+      </div>
+      <label style={{
+        display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 11,
+        color: 'var(--text-secondary)', cursor: 'pointer', lineHeight: 1.4,
+      }}>
+        <input
+          type="checkbox"
+          checked={claudeDisclosure.value}
+          onChange={e => { claudeDisclosure.value = e.target.checked; }}
+          style={{ marginTop: 2 }}
+        />
+        <span>
+          I understand this uses Claude Code credentials. Anthropic's TOS restricts OAuth
+          tokens to Claude Code and Claude.ai. Anthropic does not officially support this.
+        </span>
+      </label>
+      <button
+        disabled={!claudeDisclosure.value || pendingAction.value}
+        onClick={doClaudeAutoDetect}
+        style={{
+          width: '100%', marginTop: 'var(--space-md)', padding: '6px 14px',
+          fontSize: 12, fontWeight: 500, color: 'var(--text-primary)',
+          background: claudeDisclosure.value ? 'var(--accent)' : 'var(--bg-3)',
+          borderRadius: 'var(--radius-md)',
+          cursor: claudeDisclosure.value ? 'pointer' : 'not-allowed',
+          opacity: claudeDisclosure.value ? 1 : 0.5,
+        }}
+      >
+        Connect with Claude Code
+      </button>
+    </div>
+  );
+}
+
+// CodexAutoDetectCard — openai parallel of ClaudeAutoDetectCard.
+// Initiative 20260513-openai-autodetect. Codex's auth.json has no tier
+// field today so the badge usually doesn't render.
+function CodexAutoDetectCard() {
+  const detected = codexDetect.value;
+  return (
+    <div style={{
+      marginBottom: 'var(--space-md)', padding: 'var(--space-md)',
+      background: 'var(--bg-2)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-md)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <span style={{ color: 'var(--status-green)', fontSize: 14 }}>&#10003;</span>
+        <span style={{ fontSize: 13, fontWeight: 500 }}>Codex CLI detected</span>
+        {detected.subscription_type && (
+          <span style={{
+            fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)',
+            background: 'var(--bg-3)', padding: '2px 6px', borderRadius: 'var(--radius-sm)',
+          }}>
+            {detected.subscription_type}
+          </span>
+        )}
+      </div>
+      <div style={{
+        fontSize: 11, color: 'var(--text-tertiary)',
+        fontFamily: 'var(--font-mono)', marginBottom: 8,
+      }}>
+        {CLI_CREDENTIAL_PATH.openai}
+      </div>
+      <label style={{
+        display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 11,
+        color: 'var(--text-secondary)', cursor: 'pointer', lineHeight: 1.4,
+      }}>
+        <input
+          type="checkbox"
+          checked={codexDisclosure.value}
+          onChange={e => { codexDisclosure.value = e.target.checked; }}
+          style={{ marginTop: 2 }}
+        />
+        <span>
+          I understand this uses Codex CLI credentials. OpenAI's TOS restricts OAuth
+          tokens to Codex CLI and ChatGPT. OpenAI does not officially support this.
+        </span>
+      </label>
+      <button
+        disabled={!codexDisclosure.value || pendingAction.value}
+        onClick={doCodexAutoDetect}
+        style={{
+          width: '100%', marginTop: 'var(--space-md)', padding: '6px 14px',
+          fontSize: 12, fontWeight: 500, color: 'var(--text-primary)',
+          background: codexDisclosure.value ? 'var(--accent)' : 'var(--bg-3)',
+          borderRadius: 'var(--radius-md)',
+          cursor: codexDisclosure.value ? 'pointer' : 'not-allowed',
+          opacity: codexDisclosure.value ? 1 : 0.5,
+        }}
+      >
+        Connect with Codex CLI
+      </button>
+    </div>
+  );
+}
+
+// OneClickImportButton — non-PKCE providers (gemini, copilot). One
+// click imports OAuth credentials from the CLI's default path. No
+// disclosure checkbox: these are the user's own CLI credentials,
+// trust model = same as the API key they'd paste.
+function OneClickImportButton({ canonical }) {
   const busy = pendingAction.value;
-  const expectedPath = {
-    openai: '~/.codex/auth.json',
-    anthropic: '~/.claude/.credentials.json',
-    gemini: '~/.gemini/oauth_creds.json',
-    'github-copilot': '~/.config/github-copilot/hosts.json',
-  }[canonical] || 'CLI credential file';
+  const text = CLI_IMPORT_BUTTON_LABEL[canonical] || 'Use CLI credentials';
+  const hint = CLI_CREDENTIAL_PATH[canonical] || '';
   return (
     <div style={{ marginBottom: 'var(--space-md)' }}>
       <button
@@ -331,11 +492,79 @@ function ImportFromCLIButton({ canonical }) {
           opacity: busy ? 0.6 : 1, textAlign: 'left',
         }}
       >
-        Import from local CLI
-        <span style={{ fontSize: 11, color: 'var(--text-tertiary)', marginLeft: 8, fontFamily: 'var(--font-mono)' }}>
-          {expectedPath}
-        </span>
+        {text}
+        {hint && (
+          <span style={{ fontSize: 11, color: 'var(--text-tertiary)', marginLeft: 8, fontFamily: 'var(--font-mono)' }}>
+            {hint}
+          </span>
+        )}
       </button>
+    </div>
+  );
+}
+
+// ApiKeyInput — paste-key form with IME-safe Enter-to-submit (AC-11).
+// East Asian IMEs commit composition candidates on Enter; we must NOT
+// fire submit during composition (keyCode === 229 covers older browsers,
+// isComposing covers modern). Plan-review M3.
+function ApiKeyInput({ canSubmit, onSubmit }) {
+  return (
+    <div style={{ marginBottom: 'var(--space-md)' }}>
+      <label style={{ display: 'block', fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 4 }}>
+        API Key
+      </label>
+      <input
+        type="password"
+        placeholder="sk-..."
+        value={apiKey.value}
+        onInput={e => { apiKey.value = e.target.value; }}
+        onKeyDown={e => {
+          if (e.isComposing || e.keyCode === 229) return;
+          if (e.key === 'Enter' && canSubmit) {
+            e.preventDefault();
+            onSubmit();
+          }
+        }}
+        style={{
+          width: '100%', padding: '8px 10px', background: 'var(--bg-2)',
+          border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
+          color: 'var(--text-primary)', fontSize: 13, fontFamily: 'var(--font-mono)',
+        }}
+      />
+    </div>
+  );
+}
+
+// Footer — Cancel always; primary "Add provider" only on api-key path.
+// AC-3 (primary submits api-key form), AC-4 (disabled on empty field).
+function Footer({ showPrimary, primaryDisabled, onPrimary, onCancel }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 'var(--space-md)' }}>
+      <button
+        onClick={onCancel}
+        style={{
+          padding: '6px 14px', fontSize: 13, color: 'var(--text-secondary)',
+          background: 'var(--bg-2)', border: '1px solid var(--border)',
+          borderRadius: 'var(--radius-md)', cursor: 'pointer',
+        }}
+      >
+        Cancel
+      </button>
+      {showPrimary && (
+        <button
+          onClick={onPrimary}
+          disabled={primaryDisabled}
+          style={{
+            padding: '6px 14px', fontSize: 13, color: 'var(--text-primary)',
+            background: 'var(--accent)', borderRadius: 'var(--radius-md)',
+            border: 'none',
+            cursor: primaryDisabled ? 'not-allowed' : 'pointer', fontWeight: 500,
+            opacity: primaryDisabled ? 0.6 : 1,
+          }}
+        >
+          Add provider
+        </button>
+      )}
     </div>
   );
 }
@@ -371,11 +600,14 @@ function FlowPending({ state }) {
   );
 }
 
-// ConnectionAddModal — full add-provider flow. Wraps three paths:
-//  1. PKCE OAuth (subscription) for OpenAI / Anthropic
-//  2. CLI import for the four subscription providers
-//  3. API key (existing path)
-// Triggers TosModal on first subscription action via the 428 (TOS_GATE_STATUS) gate.
+// ConnectionAddModal — full add-provider flow. Three entry paths:
+//  1. PKCE OAuth (subscription) for OpenAI / Anthropic — imperative button
+//  2. CLI auto-detect / one-click import for the four subscription
+//     providers — imperative button (with disclosure for PKCE pair)
+//  3. API key (declarative form, primary CTA at footer)
+// 20260514-add-provider-ux redesigned the render structure: the primary
+// CTA at the footer applies ONLY to the API-key path. Subscription paths
+// fire on their own buttons. Triggers TosModal via the 428 gate.
 export function ConnectionAddModal({ onClose, onAdded }) {
   useEffect(() => {
     startHealthPoll();
@@ -389,13 +621,8 @@ export function ConnectionAddModal({ onClose, onAdded }) {
     // the same provider. Currently vacuous: the backend converts
     // auth_type=auto_detect to auth_type=subscription at create time
     // (routes_api.go:251,272), so no row ever persists as auto_detect.
-    // We keep the keying parallel to the Claude pattern for forward
-    // compatibility AND to preserve AC-AD-6b's coexistence semantics:
-    // a user with an imported subscription connection + Codex CLI
-    // installed locally SHOULD still see the auto-detect card.
     // Suppression is keyed on auth_type=auto_detect specifically —
-    // NOT "any openai/anthropic connection exists" — so this stays
-    // correct if the backend ever stops the create-time conversion.
+    // forward-compat if the backend ever stops the create-time conversion.
     Promise.all([detectClaude(), detectCodex(), getConnections()]).then(([detectClaude_, detectCodex_, conns]) => {
       const claudeAlready = Array.isArray(conns) && conns.some(
         c => c.provider === 'anthropic' && c.auth_type === 'auto_detect'
@@ -425,19 +652,43 @@ export function ConnectionAddModal({ onClose, onAdded }) {
 
   const canonical = provider.value;
   const showPkce = PKCE_PROVIDERS.has(canonical);
-  const showImport = IMPORT_PROVIDERS.has(canonical);
   const showApiKey = canonical !== 'github-copilot'; // Copilot has no API-key path
-  const showAutoDetect = canonical === 'anthropic'
-    && claudeDetect.value?.found
-    && !claudeDetect.value._alreadyConnected;
+  // In-cycle scope cut (20260517-provider-auth-variants): hide the
+  // anthropic Claude-Code auto-detect card until M3 ships the
+  // ClaudeMaxExecutor variant. Flip back to:
+  //   canonical === 'anthropic' && claudeDetect.value?.found
+  //     && !claudeDetect.value._alreadyConnected
+  // when M3 ships.
+  const showAutoDetect = false;
   const showCodexAutoDetect = canonical === 'openai'
     && codexDetect.value?.found
     && !codexDetect.value._alreadyConnected;
+  // One-click default-path import for non-PKCE providers. PKCE providers
+  // use auto-detect with disclosure (AC-2 exception).
+  const showOneClickImport = canonical === 'gemini' || canonical === 'github-copilot';
+  // Subscription/credentials section appears when ANY one-click
+  // alternative to API key is available for this provider.
+  const showSubscriptionSection = showPkce || showAutoDetect || showCodexAutoDetect || showOneClickImport;
+  // API-key submit gate: AC-4 (disabled when empty) AND AC-1/AC-2/AC-3
+  // not in progress.
+  const canSubmitApiKey = apiKey.value.trim().length > 0 && !pendingAction.value;
+
+  const pending = flowState.value?.status === 'pending';
+  const handleClose = () => { onClose(); resetState(); };
+  const sectionHeader = text => (
+    <div style={{
+      fontSize: 11, fontWeight: 600, color: 'var(--text-tertiary)',
+      textTransform: 'uppercase', letterSpacing: '0.06em',
+      marginBottom: 8, marginTop: 'var(--space-sm)',
+    }}>
+      {text}
+    </div>
+  );
 
   return (
     <>
       <div
-        onClick={() => { onClose(); resetState(); }}
+        onClick={handleClose}
         style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
           backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center',
@@ -462,7 +713,19 @@ export function ConnectionAddModal({ onClose, onAdded }) {
             </label>
             <select
               value={canonical}
-              onChange={e => { provider.value = e.target.value; }}
+              onChange={e => {
+                provider.value = e.target.value;
+                // Clear in-progress form state on provider switch (AC-10a:
+                // "resets form state appropriately"). The trust-disclosure
+                // checkboxes (AC-2 / AC-9) are load-bearing security UX —
+                // a fresh consent is required after switching providers,
+                // not a sticky check from before. Also clear the API-key
+                // field so a key pasted for one provider doesn't get
+                // submitted against another. Label persists (AC-10b).
+                apiKey.value = '';
+                claudeDisclosure.value = false;
+                codexDisclosure.value = false;
+              }}
               style={{
                 width: '100%', padding: '8px 10px', background: 'var(--bg-2)',
                 border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
@@ -492,199 +755,38 @@ export function ConnectionAddModal({ onClose, onAdded }) {
             />
           </div>
 
-          {/* Active OAuth flow */}
-          {flowState.value?.status === 'pending' && (
-            <FlowPending state={flowState.value} />
-          )}
+          {/* Active OAuth flow replaces everything else (AC-7, AC-10c) */}
+          {pending && <FlowPending state={flowState.value} />}
 
-          {/* Subscription section */}
-          {(showPkce || showImport) && !flowState.value && (
+          {/* Subscription / CLI credentials section (AC-1, AC-2, AC-6) */}
+          {!pending && showSubscriptionSection && (
             <>
-              <div style={{
-                fontSize: 11, fontWeight: 600, color: 'var(--text-tertiary)',
-                textTransform: 'uppercase', letterSpacing: '0.06em',
-                marginBottom: 8, marginTop: 'var(--space-sm)',
-              }}>
-                Subscription
-              </div>
+              {sectionHeader(SUBSCRIPTION_HEADER[canonical])}
               {showPkce && <SubscriptionLoginButton canonical={canonical} />}
-              {showImport && <ImportFromCLIButton canonical={canonical} />}
+              {showAutoDetect && <ClaudeAutoDetectCard />}
+              {showCodexAutoDetect && <CodexAutoDetectCard />}
+              {showOneClickImport && <OneClickImportButton canonical={canonical} />}
             </>
           )}
 
-          {/* Claude auto-detect (legacy convenience) */}
-          {showAutoDetect && (
-            <div style={{
-              marginBottom: 'var(--space-md)', padding: 'var(--space-md)',
-              background: 'var(--bg-2)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-md)',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                <span style={{ color: 'var(--status-green)', fontSize: 14 }}>&#10003;</span>
-                <span style={{ fontSize: 13, fontWeight: 500 }}>Claude Code detected</span>
-                {claudeDetect.value.subscription_type && (
-                  <span style={{
-                    fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)',
-                    background: 'var(--bg-3)', padding: '2px 6px', borderRadius: 'var(--radius-sm)',
-                  }}>
-                    {claudeDetect.value.subscription_type}
-                  </span>
-                )}
-              </div>
-              <label style={{
-                display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 11,
-                color: 'var(--text-secondary)', cursor: 'pointer', lineHeight: 1.4,
-              }}>
-                <input
-                  type="checkbox"
-                  checked={claudeDisclosure.value}
-                  onChange={e => { claudeDisclosure.value = e.target.checked; }}
-                  style={{ marginTop: 2 }}
-                />
-                <span>
-                  I understand this uses Claude Code credentials. Anthropic's TOS restricts OAuth
-                  tokens to Claude Code and Claude.ai. Anthropic does not officially support this.
-                </span>
-              </label>
-              <button
-                disabled={!claudeDisclosure.value || pendingAction.value}
-                onClick={doClaudeAutoDetect}
-                style={{
-                  width: '100%', marginTop: 'var(--space-md)', padding: '6px 14px',
-                  fontSize: 12, fontWeight: 500, color: 'var(--text-primary)',
-                  background: claudeDisclosure.value ? 'var(--accent)' : 'var(--bg-3)',
-                  borderRadius: 'var(--radius-md)',
-                  cursor: claudeDisclosure.value ? 'pointer' : 'not-allowed',
-                  opacity: claudeDisclosure.value ? 1 : 0.5,
-                }}
-              >
-                Connect with Claude Code (auto-detect)
-              </button>
-            </div>
-          )}
-
-          {/* Codex CLI auto-detect — initiative 20260513-openai-autodetect.
-              Parallel to the Claude card above. Codex's auth.json has no
-              tier field today so the badge usually doesn't render. */}
-          {showCodexAutoDetect && (
-            <div style={{
-              marginBottom: 'var(--space-md)', padding: 'var(--space-md)',
-              background: 'var(--bg-2)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-md)',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                <span style={{ color: 'var(--status-green)', fontSize: 14 }}>&#10003;</span>
-                <span style={{ fontSize: 13, fontWeight: 500 }}>Codex CLI detected</span>
-                {codexDetect.value.subscription_type && (
-                  <span style={{
-                    fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)',
-                    background: 'var(--bg-3)', padding: '2px 6px', borderRadius: 'var(--radius-sm)',
-                  }}>
-                    {codexDetect.value.subscription_type}
-                  </span>
-                )}
-              </div>
-              <label style={{
-                display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 11,
-                color: 'var(--text-secondary)', cursor: 'pointer', lineHeight: 1.4,
-              }}>
-                <input
-                  type="checkbox"
-                  checked={codexDisclosure.value}
-                  onChange={e => { codexDisclosure.value = e.target.checked; }}
-                  style={{ marginTop: 2 }}
-                />
-                <span>
-                  I understand this uses Codex CLI credentials. OpenAI's TOS restricts OAuth
-                  tokens to Codex CLI and ChatGPT. OpenAI does not officially support this.
-                </span>
-              </label>
-              <button
-                disabled={!codexDisclosure.value || pendingAction.value}
-                onClick={doCodexAutoDetect}
-                style={{
-                  width: '100%', marginTop: 'var(--space-md)', padding: '6px 14px',
-                  fontSize: 12, fontWeight: 500, color: 'var(--text-primary)',
-                  background: codexDisclosure.value ? 'var(--accent)' : 'var(--bg-3)',
-                  borderRadius: 'var(--radius-md)',
-                  cursor: codexDisclosure.value ? 'pointer' : 'not-allowed',
-                  opacity: codexDisclosure.value ? 1 : 0.5,
-                }}
-              >
-                Connect with Codex CLI (auto-detect)
-              </button>
-            </div>
-          )}
-
-          {/* API key fallback */}
-          {showApiKey && !flowState.value && (
+          {/* API-key form (AC-3, AC-5, AC-6) */}
+          {!pending && showApiKey && (
             <>
-              {(showPkce || showImport || showAutoDetect || showCodexAutoDetect) && (
-                <div style={{
-                  fontSize: 11, color: 'var(--text-tertiary)', textAlign: 'center',
-                  margin: 'var(--space-md) 0',
-                }}>
-                  — or use an API key —
-                </div>
-              )}
-              <div style={{ marginBottom: 'var(--space-md)' }}>
-                <label style={{ display: 'block', fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 4 }}>
-                  API Key
-                </label>
-                <input
-                  type="password"
-                  placeholder="sk-..."
-                  value={apiKey.value}
-                  onInput={e => { apiKey.value = e.target.value; }}
-                  style={{
-                    width: '100%', padding: '8px 10px', background: 'var(--bg-2)',
-                    border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
-                    color: 'var(--text-primary)', fontSize: 13, fontFamily: 'var(--font-mono)',
-                  }}
-                />
-              </div>
-              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-                <button
-                  onClick={() => { onClose(); resetState(); }}
-                  style={{
-                    padding: '6px 14px', fontSize: 13, color: 'var(--text-secondary)',
-                    background: 'var(--bg-2)', border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                  }}
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={() => doApiKey(canonical)}
-                  disabled={pendingAction.value}
-                  style={{
-                    padding: '6px 14px', fontSize: 13, color: 'var(--text-primary)',
-                    background: 'var(--accent)', borderRadius: 'var(--radius-md)',
-                    cursor: pendingAction.value ? 'not-allowed' : 'pointer', fontWeight: 500,
-                    opacity: pendingAction.value ? 0.6 : 1,
-                  }}
-                >
-                  Add API Key
-                </button>
-              </div>
+              {showSubscriptionSection && sectionHeader('Or use an API key')}
+              <ApiKeyInput
+                canSubmit={canSubmitApiKey}
+                onSubmit={() => doApiKey(canonical)}
+              />
             </>
           )}
 
-          {/* Cancel-only footer for active flow / copilot-no-apikey case */}
-          {(flowState.value || !showApiKey) && (
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 'var(--space-md)' }}>
-              <button
-                onClick={() => { onClose(); resetState(); }}
-                style={{
-                  padding: '6px 14px', fontSize: 13, color: 'var(--text-secondary)',
-                  background: 'var(--bg-2)', border: '1px solid var(--border)',
-                  borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                }}
-              >
-                Close
-              </button>
-            </div>
-          )}
+          {/* Footer: primary CTA only on api-key path; Cancel always */}
+          <Footer
+            showPrimary={!pending && showApiKey}
+            primaryDisabled={!canSubmitApiKey}
+            onPrimary={() => doApiKey(canonical)}
+            onCancel={handleClose}
+          />
         </div>
       </div>
 

@@ -1,0 +1,28 @@
+{
+  "id": "resp_synthetic_single_turn_001",
+  "object": "response",
+  "created_at": 1779004800,
+  "status": "completed",
+  "model": "gpt-4o",
+  "instructions": "You are a helpful assistant.",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_synthetic_001",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "2 + 2 equals 4."
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 18,
+    "output_tokens": 9,
+    "total_tokens": 27
+  },
+  "metadata": {}
+}

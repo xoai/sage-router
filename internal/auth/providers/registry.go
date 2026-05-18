@@ -63,6 +63,33 @@ type ProviderConfig struct {
 
 	// Refresh-token endpoint. For Copilot this is the gh→copilot exchange.
 	RefreshURL string
+
+	// RequiresAPIKeyExchange field removed in cycle 20260517-provider-auth-variants
+	// M2.6.3. The exchange chain was wrong-path (memory `f32bbc73`).
+
+	// TokenRequestFormat selects the wire shape for the authorization-code
+	// grant POST. RFC 6749 §4.1.3 default is "form" (application/x-www-form-
+	// urlencoded). Anthropic's platform.claude.com/v1/oauth/token is JSON-only
+	// — sending form-encoded returns 400 "Invalid request format". Verified
+	// against opencode-anthropic-auth plugin source (src/auth.ts::exchangeCode
+	// uses Content-Type: application/json). See M0.8 of cycle
+	// 20260517-provider-auth-variants for the diagnostic that surfaced this.
+	//
+	// Values:
+	//   ""     — equivalent to "form" (default, no migration needed for openai/etc.)
+	//   "form" — application/x-www-form-urlencoded (RFC 6749 default)
+	//   "json" — application/json (Anthropic's platform.claude.com)
+	TokenRequestFormat string
+
+	// RefreshTokenFormat controls the body shape for the REFRESH grant
+	// path specifically. Distinct from TokenRequestFormat (initial PKCE
+	// Exchange) because some providers split shapes between phases:
+	// OpenAI's codex CLI uses form-encoded for Exchange but JSON for
+	// Refresh (per codex-rs `login/src/auth/manager.rs`). Empty value
+	// falls back to TokenRequestFormat for backward compatibility with
+	// providers (Anthropic) whose endpoint accepts the same shape for
+	// both phases. Cycle 20260517-provider-auth-variants M2 e2e fold.
+	RefreshTokenFormat string
 }
 
 // Providers is the static registry, keyed by canonical provider ID.
@@ -108,14 +135,31 @@ var Providers = map[string]ProviderConfig{
 		AccountIDClaim:   "https://api.openai.com/auth.chatgpt_account_id",
 		ImportPath:       "~/.codex/auth.json",
 		ImportPathEnvVar: "CODEX_HOME",
-		RefreshURL:       "https://auth.openai.com/oauth/token",
-		SubscriptionAllowedModels: []string{
-			// ChatGPT Plus/Pro accessible models (as of 2026-05).
-			"gpt-5", "gpt-5-mini", "gpt-5-nano",
-			"gpt-4o", "gpt-4o-mini",
-			"gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
-			"o3", "o3-mini", "o4-mini",
-		},
+		RefreshURL: "https://auth.openai.com/oauth/token",
+		// Codex CLI uses DIFFERENT body shapes per endpoint phase:
+		//   - Initial PKCE Exchange (codex-rs `login/src/server.rs::exchange_code_for_tokens`):
+		//     form-encoded. sage-router default — TokenRequestFormat unset.
+		//   - Refresh grant (codex-rs `login/src/auth/manager.rs`): JSON.
+		// So OpenAI has TokenRequestFormat unset (form) AND
+		// RefreshTokenFormat="json". Anthropic uses JSON for BOTH endpoints
+		// (same platform.claude.com/v1/oauth/token URL — see registry entry below).
+		// Cycle 20260517-provider-auth-variants M2 e2e fold — surfaced
+		// when the user asked "are you sure refresh works?". Error envelope
+		// is also non-RFC (chat-completions wrapper with codes
+		// refresh_token_expired|reused|invalidated); handled by
+		// refresh/oauth_form.go::normalizeError per memory `bf614108`
+		// public-client OAuth parity rule.
+		RefreshTokenFormat: "json",
+		// Cycle 20260517-provider-auth-variants M2.6.3: RequiresAPIKeyExchange
+		// removed. CodexSubscriptionExecutor uses PKCE access_token directly
+		// against chatgpt.com/backend-api/codex/responses.
+		//
+		// SubscriptionAllowedModels removed (M5.10 pulled forward to M2 —
+		// M0.8 E2E test showed the static list rejected gpt-5.4 which the
+		// codex backend DOES accept). The per-account whitelist is now
+		// determined at backend gate time; sage-router passes through.
+		// Catalog-side hinting comes from openai@codex-subscription lister.
+		// SubscriptionAllowedModels: <nil> — ModelInAllowlist permits any model.
 	},
 	"anthropic": {
 		ID:             "anthropic",
@@ -124,11 +168,27 @@ var Providers = map[string]ProviderConfig{
 		AuthorizeURL:   "https://claude.ai/oauth/authorize",
 		TokenURL:       "https://platform.claude.com/v1/oauth/token",
 		ClientID:       "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-		Scopes:         []string{"org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code"},
+		// Mirror what upstream Claude Code requests today. Verified
+		// 2026-05-14 against a fresh ~/.claude/.credentials.json grant
+		// (subscriptionType=max). Drift from this slice will cause
+		// Anthropic's authorization server to reject the authorize URL
+		// (or grant a narrower token). Order is alphabetical to match
+		// the observed grant. See fix 20260514-claude-oauth-and-detect.
+		Scopes: []string{
+			"user:file_upload",
+			"user:inference",
+			"user:mcp_servers",
+			"user:profile",
+			"user:sessions:claude_code",
+		},
 		RedirectPort:   53692,
 		RedirectPath:   "/callback",
 		ImportPath:     "~/.claude/.credentials.json",
 		RefreshURL:     "https://platform.claude.com/v1/oauth/token",
+		// Anthropic's platform.claude.com/v1/oauth/token requires JSON.
+		// Form-encoded → 400 "Invalid request format" (M0.8 diagnostic
+		// 2026-05-17, request_id req_011Cb86cWhWMtdUsmAK4cLRc).
+		TokenRequestFormat: "json",
 		SubscriptionAllowedModels: []string{
 			"claude-sonnet-4-x",
 			"claude-opus-4-x",

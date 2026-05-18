@@ -256,23 +256,25 @@ func TestBuildSmartCandidates_SubscriptionAllowlistRespected(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	// One subscription connection for openai.
+	// One subscription connection for anthropic — test target switched
+	// from openai in cycle 20260517-provider-auth-variants (openai's
+	// static SubscriptionAllowedModels was removed; backend gates instead).
+	// Anthropic still uses the static allowlist.
 	if err := st.CreateConnection(&store.Connection{
-		ID: "c-sub", Provider: "openai", Name: "openai-sub",
+		ID: "c-sub", Provider: "anthropic", Name: "anthropic-sub",
 		AuthType: "subscription", AccessToken: "sub-token", State: "idle",
 	}); err != nil {
 		t.Fatalf("CreateConnection: %v", err)
 	}
 
 	cs := catalog.NewSQLiteStore(st.DB())
-	// Seed one allowlisted model (gpt-4o is in the openai
-	// subscription allowlist per internal/auth/providers/registry.go)
-	// and one NOT-allowlisted model (a fictional one).
+	// Seed one allowlisted model (claude-sonnet-4-x wildcard matches
+	// claude-sonnet-4-6) and one NOT-allowlisted (claude-2, legacy).
 	for _, m := range []catalog.Model{
-		{Provider: "openai", ModelID: "gpt-4o", Tier: catalog.TierStrong,
-			Pricing: catalog.Pricing{Input: 2.5, Source: catalog.SourceSeed},
+		{Provider: "anthropic", ModelID: "claude-sonnet-4-6", Tier: catalog.TierStrong,
+			Pricing: catalog.Pricing{Input: 3.0, Source: catalog.SourceSeed},
 			Source: catalog.SourceSeed},
-		{Provider: "openai", ModelID: "gpt-4.1-fictional-no-allowlist", Tier: catalog.TierFrontier,
+		{Provider: "anthropic", ModelID: "claude-2", Tier: catalog.TierFrontier,
 			Pricing: catalog.Pricing{Input: 10.0, Source: catalog.SourceSeed},
 			Source: catalog.SourceSeed},
 	} {
@@ -291,20 +293,20 @@ func TestBuildSmartCandidates_SubscriptionAllowlistRespected(t *testing.T) {
 		byModel[c.Model] = c
 	}
 
-	allowlisted, ok := byModel["gpt-4o"]
+	allowlisted, ok := byModel["claude-sonnet-4-6"]
 	if !ok {
-		t.Fatal("missing gpt-4o candidate")
+		t.Fatal("missing claude-sonnet-4-6 candidate")
 	}
 	if !allowlisted.HasSubscriptionConnection {
-		t.Errorf("gpt-4o: HasSubscriptionConnection = false, want true (allowlisted)")
+		t.Errorf("claude-sonnet-4-6: HasSubscriptionConnection = false, want true (allowlisted via claude-sonnet-4-x wildcard)")
 	}
 
-	notAllowlisted, ok := byModel["gpt-4.1-fictional-no-allowlist"]
+	notAllowlisted, ok := byModel["claude-2"]
 	if !ok {
-		t.Fatal("missing gpt-4.1-fictional-no-allowlist candidate")
+		t.Fatal("missing claude-2 candidate")
 	}
 	if notAllowlisted.HasSubscriptionConnection {
-		t.Errorf("gpt-4.1-fictional-no-allowlist: HasSubscriptionConnection = true, want false (NOT in subscription allowlist; AC28)")
+		t.Errorf("claude-2: HasSubscriptionConnection = true, want false (NOT in anthropic subscription allowlist; AC28)")
 	}
 }
 
@@ -404,11 +406,14 @@ func TestBuildSmartCandidates_MixedSubscriptionAndApikey(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	// One apikey + one subscription connection, both for openai.
+	// One apikey + one subscription connection, both for anthropic.
+	// Switched from openai in cycle 20260517-provider-auth-variants —
+	// openai's static SubscriptionAllowedModels was removed; anthropic
+	// still has the static allowlist.
 	for _, c := range []store.Connection{
-		{ID: "c-apikey", Provider: "openai", Name: "openai-key",
+		{ID: "c-apikey", Provider: "anthropic", Name: "anthropic-key",
 			AuthType: "apikey", APIKey: "sk-test", State: "idle"},
-		{ID: "c-sub", Provider: "openai", Name: "openai-sub",
+		{ID: "c-sub", Provider: "anthropic", Name: "anthropic-sub",
 			AuthType: "subscription", AccessToken: "sub-token", State: "idle"},
 	} {
 		if err := st.CreateConnection(&c); err != nil {
@@ -417,12 +422,12 @@ func TestBuildSmartCandidates_MixedSubscriptionAndApikey(t *testing.T) {
 	}
 
 	cs := catalog.NewSQLiteStore(st.DB())
-	// One allowlisted model (gpt-4o) + one not (fictional).
+	// One allowlisted (claude-sonnet-4-x matches via wildcard) + one not.
 	for _, m := range []catalog.Model{
-		{Provider: "openai", ModelID: "gpt-4o", Tier: catalog.TierStrong,
-			Pricing: catalog.Pricing{Input: 2.5, Source: catalog.SourceSeed},
+		{Provider: "anthropic", ModelID: "claude-sonnet-4-6", Tier: catalog.TierStrong,
+			Pricing: catalog.Pricing{Input: 3.0, Source: catalog.SourceSeed},
 			Source: catalog.SourceSeed},
-		{Provider: "openai", ModelID: "gpt-4.1-fictional-no-allowlist", Tier: catalog.TierFrontier,
+		{Provider: "anthropic", ModelID: "claude-2", Tier: catalog.TierFrontier,
 			Pricing: catalog.Pricing{Input: 10.0, Source: catalog.SourceSeed},
 			Source: catalog.SourceSeed},
 	} {
@@ -443,19 +448,19 @@ func TestBuildSmartCandidates_MixedSubscriptionAndApikey(t *testing.T) {
 	}
 
 	// Allowlisted model: subscription applies → HasSubscriptionConnection=true.
-	if c, ok := byModel["gpt-4o"]; !ok {
-		t.Error("gpt-4o candidate missing")
+	if c, ok := byModel["claude-sonnet-4-6"]; !ok {
+		t.Error("claude-sonnet-4-6 candidate missing")
 	} else if !c.HasSubscriptionConnection {
-		t.Errorf("gpt-4o: HasSubscriptionConnection=false, want true (allowlisted + has subscription connection)")
+		t.Errorf("claude-sonnet-4-6: HasSubscriptionConnection=false, want true (allowlisted via claude-sonnet-4-x wildcard + has subscription connection)")
 	}
 
 	// Non-allowlisted model: subscription doesn't apply BUT the
 	// candidate is still emitted via the apikey connection.
 	// HasSubscriptionConnection must be false.
-	if c, ok := byModel["gpt-4.1-fictional-no-allowlist"]; !ok {
-		t.Error("gpt-4.1-fictional-no-allowlist candidate missing — apikey route should still emit it")
+	if c, ok := byModel["claude-2"]; !ok {
+		t.Error("claude-2 candidate missing — apikey route should still emit it")
 	} else if c.HasSubscriptionConnection {
-		t.Errorf("gpt-4.1-fictional-no-allowlist: HasSubscriptionConnection=true, want false (not in allowlist; apikey route only)")
+		t.Errorf("claude-2: HasSubscriptionConnection=true, want false (not in anthropic allowlist; apikey route only)")
 	}
 }
 
@@ -549,12 +554,15 @@ func TestBuildSmartCandidates_CapabilityOverride(t *testing.T) {
 		t.Fatalf("UpsertPricing sibling: %v", err)
 	}
 
+	variants := executor.NewVariants()
+	variants.Register(
+		executor.VariantKey{Provider: "openai", AuthType: ""},
+		&fakeOverrideExecutor{provider: "openai", overrideFor: "gpt-thinking-future", flipThinking: true},
+	)
 	s := &Server{deps: Dependencies{
-		Store:   st,
-		Catalog: catalog.NewRegistry(cs),
-		Executors: map[string]executor.Executor{
-			"openai": &fakeOverrideExecutor{provider: "openai", overrideFor: "gpt-thinking-future", flipThinking: true},
-		},
+		Store:    st,
+		Catalog:  catalog.NewRegistry(cs),
+		Variants: variants,
 	}}
 	got := s.buildSmartCandidates(context.Background(), routing.StrategyBalanced)
 
@@ -621,12 +629,12 @@ func TestBuildSmartCandidates_CapabilityOverride_ThroughRetryWrap(t *testing.T) 
 	inner := &fakeOverrideExecutor{provider: "openai", overrideFor: "gpt-future", flipThinking: true}
 	wrapped := executor.NewRetryExecutor(inner, executor.RetryConfig{})
 
+	variants := executor.NewVariants()
+	variants.Register(executor.VariantKey{Provider: "openai", AuthType: ""}, wrapped)
 	s := &Server{deps: Dependencies{
-		Store:   st,
-		Catalog: catalog.NewRegistry(cs),
-		Executors: map[string]executor.Executor{
-			"openai": wrapped,
-		},
+		Store:    st,
+		Catalog:  catalog.NewRegistry(cs),
+		Variants: variants,
 	}}
 	got := s.buildSmartCandidates(context.Background(), routing.StrategyBalanced)
 	if len(got) != 1 {
@@ -674,12 +682,12 @@ func TestBuildSmartCandidates_CapabilityOverride_ExecutorNotImplementer(t *testi
 		t.Fatalf("UpsertPricing: %v", err)
 	}
 
-	// Executors map intentionally empty — no entry for openai, so the
-	// override path must not blow up.
+	// Variants registry intentionally empty — no entry for openai, so
+	// the override path must short-circuit cleanly without blowing up.
 	s := &Server{deps: Dependencies{
-		Store:     st,
-		Catalog:   catalog.NewRegistry(cs),
-		Executors: map[string]executor.Executor{},
+		Store:    st,
+		Catalog:  catalog.NewRegistry(cs),
+		Variants: executor.NewVariants(),
 	}}
 	got := s.buildSmartCandidates(context.Background(), routing.StrategyBalanced)
 	if len(got) != 1 {

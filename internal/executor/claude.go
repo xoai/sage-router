@@ -55,24 +55,19 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Res
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("anthropic-version", claudeAnthropicVersion)
 
-	// Apply authentication. Claude uses x-api-key for API key auth and
-	// Authorization: Bearer for subscription tokens. Unknown AuthType
-	// values return a loud error rather than a silent best-effort guess —
-	// store-side NormalizeAuthType canonicalizes the value before it ever
-	// reaches the executor (auth/authtype.go + store/sqlite.go scan).
+	// Apply authentication. ClaudeExecutor is the (anthropic, apikey)
+	// variant — uses x-api-key. The (anthropic, subscription) variant
+	// (claude.ai OAuth tokens) is served by ClaudeMaxExecutor (M3); its
+	// branch was removed from this executor at M2.6.1 of cycle
+	// 20260517-provider-auth-variants.
 	if req.Credentials != nil {
 		switch req.Credentials.AuthType {
 		case "apikey":
 			httpReq.Header.Set("x-api-key", req.Credentials.APIKey)
-		case "subscription":
-			httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.AccessToken)
-			for k, v := range req.Credentials.ExtraHeaders {
-				httpReq.Header.Set(k, v)
-			}
 		case "none":
 			// No auth header needed.
 		default:
-			return nil, fmt.Errorf("claude executor: unsupported auth_type %q for connection %s",
+			return nil, fmt.Errorf("claude executor: unsupported auth_type %q for connection %s (anthropic+subscription routes to ClaudeMaxExecutor variant — M3)",
 				req.Credentials.AuthType, req.Credentials.ConnectionID)
 		}
 	}

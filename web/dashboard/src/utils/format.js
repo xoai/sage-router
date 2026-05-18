@@ -38,3 +38,26 @@ export function fmtPrice(v) {
   if (v === 0) return '$0';
   return '$' + (v < 0.1 ? v.toFixed(4) : v.toFixed(2));
 }
+
+// fmtCost — render a usage cost (user-spend) value. Different
+// precision strategy than fmtPrice because per-request costs span
+// many orders of magnitude (sub-cent micro-spend up to monthly
+// totals). Defaults to 4 decimals for sub-cent visibility.
+//   - <NaN/undefined>      → '$0.0000' (defensive zero, not '-')
+//   - n < 0.01             → '$0.XXXX' (sub-cent, 4 decimals)
+//   - 0.01 ≤ n < 1         → '$0.XXX'  (pennies, 3 decimals)
+//   - n ≥ 1                → '$X.XX'   (dollars, 2 decimals)
+//
+// 20260515-cost-savings-display post-review minor #2: consolidates
+// three near-duplicate formatCost/fmt helpers that used to live in
+// cost-cell.jsx, cost-summary.jsx, and overview.jsx. Subtle
+// threshold differences caused the same cost to render differently
+// on a StatCard vs the table cell of the same page — single source
+// of truth here fixes that without behavior surprise (matches
+// overview.jsx's prior thresholds, which were the most permissive).
+export function fmtCost(n) {
+  const v = typeof n === 'number' && !Number.isNaN(n) ? n : 0;
+  if (v >= 1) return '$' + v.toFixed(2);
+  if (v >= 0.01) return '$' + v.toFixed(3);
+  return '$' + v.toFixed(4);
+}

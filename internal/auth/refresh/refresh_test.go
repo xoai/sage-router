@@ -2,6 +2,7 @@ package refresh
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -61,13 +62,22 @@ var formProviderCases = []formProviderCase{
 func TestRefresh_OAuthForm_HappyPath(t *testing.T) {
 	for _, tc := range formProviderCases {
 		t.Run(tc.provider, func(t *testing.T) {
+			// Body shape dispatch: openai uses JSON for refresh (codex-rs
+			// parity), anthropic uses JSON (M0.8 contract), gemini uses
+			// form-encoded (RFC 6749 default). Each branch parses what it
+			// expects; mismatches surface as missing fields.
+			var gotJSON map[string]string
 			var gotForm url.Values
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != http.MethodPost {
 					t.Errorf("method = %s, want POST", r.Method)
 				}
 				body, _ := io.ReadAll(r.Body)
-				gotForm, _ = url.ParseQuery(string(body))
+				if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+					_ = json.Unmarshal(body, &gotJSON)
+				} else {
+					gotForm, _ = url.ParseQuery(string(body))
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.Write([]byte(`{
 					"access_token": "new-atk",
@@ -91,14 +101,21 @@ func TestRefresh_OAuthForm_HappyPath(t *testing.T) {
 				t.Fatalf("Refresh: %v", err)
 			}
 
-			if gotForm.Get("grant_type") != "refresh_token" {
-				t.Errorf("grant_type = %q, want refresh_token", gotForm.Get("grant_type"))
+			// Discriminator helper across the two body shapes.
+			fieldGet := func(k string) string {
+				if gotJSON != nil {
+					return gotJSON[k]
+				}
+				return gotForm.Get(k)
 			}
-			if gotForm.Get("refresh_token") != "old-rtk" {
-				t.Errorf("refresh_token sent = %q, want old-rtk", gotForm.Get("refresh_token"))
+			if fieldGet("grant_type") != "refresh_token" {
+				t.Errorf("grant_type = %q, want refresh_token", fieldGet("grant_type"))
 			}
-			if tc.wantClientID != "" && gotForm.Get("client_id") != tc.wantClientID {
-				t.Errorf("client_id = %q, want %q", gotForm.Get("client_id"), tc.wantClientID)
+			if fieldGet("refresh_token") != "old-rtk" {
+				t.Errorf("refresh_token sent = %q, want old-rtk", fieldGet("refresh_token"))
+			}
+			if tc.wantClientID != "" && fieldGet("client_id") != tc.wantClientID {
+				t.Errorf("client_id = %q, want %q", fieldGet("client_id"), tc.wantClientID)
 			}
 
 			if fresh.AccessToken != "new-atk" {
@@ -276,6 +293,17 @@ func TestRefresh_Copilot_EmptyTokenInResponse(t *testing.T) {
 	}
 }
 
+// ── Cycle 20260517 M2b.7 / C1: refresh chains into RFC 8693 exchange for openai ──
+
+
+// 3 refresh-chain tests removed in cycle 20260517-provider-auth-variants
+// M2.6.6 — TestRefresh_OpenAI_ChainsRFC8693_Exchange,
+// TestRefresh_OpenAI_PreservesExchangedTokenWhenIDTokenMissing, and
+// TestRefresh_OpenAI_PreservesExchangedTokenWhenExchangeFails all pinned
+// the now-removed RFC 8693 token-exchange chain in refreshOpenAI. The
+// chain was wrong-path per memory `f32bbc73`; CodexSubscriptionExecutor
+// uses the PKCE access_token directly so no exchange step is needed.
+
 // strconvI64 avoids importing strconv just for this test (the existing
 // pattern in the rest of this codebase is to keep imports tight).
 func strconvI64(n int64) string {
@@ -298,4 +326,78 @@ func strconvI64(n int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// TestRefresh_OpenAI_SendsJSON — pins the codex-rs canonical refresh
+// contract per cycle 20260517-provider-auth-variants M2 e2e fold:
+// OpenAI's refresh_token grant uses JSON body (NOT form-encoded
+// RFC 6749 default), matching codex-rs `login/src/auth/manager.rs`.
+// Memory `bf614108` public-client OAuth byte-for-byte parity rule.
+func TestRefresh_OpenAI_SendsJSON(t *testing.T) {
+	var gotCT string
+	var gotBody map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCT = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"new","refresh_token":"newrtk","expires_in":3600}`))
+	}))
+	defer srv.Close()
+	withOverride(t, "openai", srv.URL)
+
+	_, err := Refresh(context.Background(), &auth.Credential{
+		Provider:     "openai",
+		ConnectionID: "c1",
+		AccessToken:  "old",
+		RefreshToken: "old-rtk",
+	})
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !strings.HasPrefix(gotCT, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json (codex-rs canonical)", gotCT)
+	}
+	if gotBody["grant_type"] != "refresh_token" {
+		t.Errorf("body.grant_type = %q", gotBody["grant_type"])
+	}
+	if gotBody["refresh_token"] != "old-rtk" {
+		t.Errorf("body.refresh_token = %q", gotBody["refresh_token"])
+	}
+	if gotBody["client_id"] != "app_EMoamEEZ73f0CkXaXp7hrann" {
+		t.Errorf("body.client_id = %q", gotBody["client_id"])
+	}
+}
+
+// TestRefresh_OpenAI_WrappedErrorMapsToInvalidGrant — pins the M2 e2e fold:
+// OpenAI's auth.openai.com returns errors in the chat-completions envelope
+// shape (`{"error":{"code":"refresh_token_expired",...}}`) instead of
+// RFC 6749 §5.2 (`{"error":"invalid_grant"}`). normalizeError must map
+// the three `refresh_token_*` codes to `invalid_grant` so the upstream
+// ErrRefreshTokenRevoked sentinel discrimination still fires.
+func TestRefresh_OpenAI_WrappedErrorMapsToInvalidGrant(t *testing.T) {
+	for _, code := range []string{
+		"refresh_token_expired",
+		"refresh_token_reused",
+		"refresh_token_invalidated",
+	} {
+		t.Run(code, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(401)
+				w.Write([]byte(`{"error":{"message":"go re-auth","type":"invalid_request_error","code":"` + code + `"}}`))
+			}))
+			defer srv.Close()
+			withOverride(t, "openai", srv.URL)
+
+			_, err := Refresh(context.Background(), &auth.Credential{
+				Provider:     "openai",
+				ConnectionID: "c1",
+				RefreshToken: "stale",
+			})
+			if !errors.Is(err, ErrRefreshTokenRevoked) {
+				t.Errorf("err = %v, want wrapping ErrRefreshTokenRevoked (code=%s)", err, code)
+			}
+		})
+	}
 }

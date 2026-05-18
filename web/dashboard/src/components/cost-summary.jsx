@@ -6,17 +6,25 @@
 // `subscription_savings` is computed at query time using current pricing
 // against historical token counts (AC48), so it shifts when pricing
 // changes — the tooltip explains that.
+//
+// Post-review minor #2: uses shared fmtCost from utils/format so the
+// StatCard and the table cell render identical values for the same
+// input (replaces the old local `fmt` helper with subtly different
+// thresholds).
 
-function fmt(n) {
-  const v = typeof n === 'number' ? n : 0;
-  if (v >= 100) return '$' + v.toFixed(2);
-  return '$' + v.toFixed(4);
-}
+import { fmtCost } from '../utils/format';
 
-export function CostSummary({ summary }) {
+// hasSubConn (optional) — when explicitly false, the "Subscription
+// savings" block is hidden entirely (apikey-only users don't see a
+// perpetual $0.0000 nag). When true OR omitted (backward compat),
+// the block always renders, INCLUDING when current-window savings
+// is 0 — surfaces the concept once a subscription connection exists.
+// AC-D1 of 20260515-cost-savings-display (revised per plan-review m7).
+export function CostSummary({ summary, hasSubConn }) {
   if (!summary) return null;
   const apiCost = summary.by_cost_source?.apikey?.cost ?? summary.total_cost ?? 0;
   const savings = summary.subscription_savings ?? 0;
+  const showSavings = hasSubConn !== false;
   return (
     <div style={{ display: 'flex', gap: 'var(--space-xl)' }}>
       <div>
@@ -30,10 +38,10 @@ export function CostSummary({ summary }) {
           fontSize: 20, fontFamily: 'var(--font-mono)', fontWeight: 600,
           color: 'var(--accent)',
         }}>
-          {fmt(apiCost)}
+          {fmtCost(apiCost)}
         </div>
       </div>
-      {savings > 0 && (
+      {showSavings && (
         <div
           title={
             'What your subscription connections would have cost at current API rates ' +
@@ -59,7 +67,7 @@ export function CostSummary({ summary }) {
             fontSize: 20, fontFamily: 'var(--font-mono)', fontWeight: 600,
             color: 'var(--status-green)',
           }}>
-            {fmt(savings)}
+            {fmtCost(savings)}
           </div>
         </div>
       )}

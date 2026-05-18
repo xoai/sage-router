@@ -14,9 +14,12 @@ type Credential struct {
 	ConnectionID string
 	AccessToken  string
 	RefreshToken string
-	ExpiresAt    time.Time
-	AccountID    string         // populated for providers that expose one (e.g., OpenAI's chatgpt_account_id JWT claim)
-	ExtraData    map[string]any // future-proof; provider-specific fields from the token response
+	// Cycle 20260517-provider-auth-variants M2.6.3: ExchangedToken field
+	// removed. The wrong-path RFC 8693 exchange chain (memory `f32bbc73`)
+	// no longer exists; CodexSubscriptionExecutor uses AccessToken directly.
+	ExpiresAt time.Time
+	AccountID      string         // populated for providers that expose one (e.g., OpenAI's chatgpt_account_id JWT claim)
+	ExtraData      map[string]any // future-proof; provider-specific fields from the token response
 }
 
 // ExpiresWithin reports whether the credential will expire within d from now.

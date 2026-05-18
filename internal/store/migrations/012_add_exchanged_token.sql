@@ -1,0 +1,21 @@
+-- 012_add_exchanged_token.sql: persist the RFC 8693 token-exchange product
+-- alongside the PKCE access_token + refresh_token already on the row.
+--
+-- OpenAI subscription (Codex CLI parity, cycle 20260517-openai-subscription-responses-api)
+-- requires a second OAuth step that converts the PKCE id_token into an
+-- "openai-api-key" style access_token carrying api.responses.write. The
+-- exchanged token is stored separately so a refresh that re-runs the
+-- exchange can replace it without touching the connectors-scoped
+-- access_token (still used for the few connectors APIs we may reach
+-- in the future).
+--
+-- NOT NULL DEFAULT '' so existing rows (created before this migration)
+-- read cleanly as empty-string. Empty-string is interpreted by the
+-- executor (M2b.6) as "fall back to access_token" and by the M2b.8
+-- pre-flight as "needs re-auth" for openai+subscription connections.
+--
+-- The value is encrypted at rest by the same store-layer AES-256-GCM
+-- as access_token/refresh_token/api_key — see sqlite.go's
+-- encryptField/decryptField path and the secretCols list in
+-- (UpdateConnection / CreateConnection / decryptConnectionSecrets).
+ALTER TABLE connections ADD COLUMN exchanged_token TEXT NOT NULL DEFAULT '';

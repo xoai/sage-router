@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"sage-router/internal/auth/oauth"
+	"sage-router/internal/auth/providers"
 )
 
 // CodexCredentials holds detected Codex CLI OAuth credentials. Parallel
@@ -16,9 +19,13 @@ import (
 // loop). See `internal/server/routes_api.go:238-260` for the
 // create-time conversion to `auth_type=subscription`.
 type CodexCredentials struct {
-	AccessToken      string
-	RefreshToken     string
+	AccessToken  string
+	RefreshToken string
+	// IDToken field removed in cycle 20260517-provider-auth-variants M2.6.3.
+	// The RFC 8693 token-exchange chain that consumed it was wrong-path
+	// (memory `f32bbc73`); CodexSubscriptionExecutor uses AccessToken directly.
 	ExpiresAt        time.Time
+	AccountID        string // chatgpt_account_id JWT claim from id_token; required for the ChatGPT-Account-ID header on /v1/* subscription calls. Mirrors internal/auth/imports/codex.go:50-55.
 	SubscriptionType string // best-effort; usually empty — Codex auth.json has no tier field today
 }
 
@@ -41,7 +48,13 @@ type codexFile struct {
 		AccessToken  string          `json:"access_token"`
 		RefreshToken string          `json:"refresh_token"`
 		IDToken      string          `json:"id_token,omitempty"`
-		ExpiresAt    json.RawMessage `json:"expires_at,omitempty"`
+		// AccountID is the chatgpt_account_id used by chatgpt.com/backend-api/codex/responses
+		// for the ChatGPT-Account-ID header. M2.6.3 prefers this when present
+		// over the JWT-claim extraction path (codex auth.json carries it
+		// directly — verified at M0.8). Older auth.json formats may have
+		// it only in the id_token; we fall back to extraction in that case.
+		AccountID string          `json:"account_id,omitempty"`
+		ExpiresAt json.RawMessage `json:"expires_at,omitempty"`
 	} `json:"tokens"`
 }
 
@@ -104,12 +117,33 @@ func codexCredPaths() []string {
 // DetectCodex checks for Codex CLI credentials on the local filesystem.
 // Returns a safe result (never exposes tokens) and optionally the full
 // credentials. Mirrors detect.DetectClaude's contract.
+//
+// Two-pass scan: prefer the first NON-expired file across all candidate
+// paths. If every found file is expired, fall back to the first found
+// so the caller can still surface the "expired — refresh" UX. Same
+// pattern as DetectClaude in claude.go; keep aligned. See fix
+// 20260514-claude-oauth-and-detect.
 func DetectCodex() (CodexResult, *CodexCredentials) {
+	var firstFound CodexResult
+	var firstCreds *CodexCredentials
+	haveFound := false
+
 	for _, path := range codexCredPaths() {
 		result, creds := tryReadCodexCredentials(path)
-		if result.Found {
-			return result, creds
+		if !result.Found {
+			continue
 		}
+		if !result.Expired {
+			return result, creds // fresh file wins immediately
+		}
+		if !haveFound {
+			firstFound = result
+			firstCreds = creds
+			haveFound = true
+		}
+	}
+	if haveFound {
+		return firstFound, firstCreds // all expired; return the first
 	}
 	return CodexResult{Found: false}, nil
 }
@@ -142,6 +176,23 @@ func tryReadCodexCredentials(path string) (CodexResult, *CodexCredentials) {
 		AccessToken:  f.Tokens.AccessToken,
 		RefreshToken: f.Tokens.RefreshToken,
 		ExpiresAt:    expiresAt,
+	}
+	// Best-effort AccountID extraction — the ChatGPT-Account-ID header
+	// downstream (executor + listers) needs this for subscription calls.
+	// Codex CLI's auth.json carries `tokens.account_id` directly (verified
+	// M0.8 — see m0-baseline.md Finding 4 evidence), so prefer that over
+	// JWT claim extraction. Cycle 20260517-provider-auth-variants M2.6.3
+	// simplifies the path: no id_token field in CodexCredentials anymore.
+	if f.Tokens.AccountID != "" {
+		full.AccountID = f.Tokens.AccountID
+	} else if f.Tokens.IDToken != "" {
+		// JWT-claim fallback for older Codex auth.json shapes that didn't
+		// include the account_id field directly.
+		if def, ok := providers.Providers["openai"]; ok && def.AccountIDClaim != "" {
+			if id, err := oauth.ExtractIDTokenClaim(f.Tokens.IDToken, def.AccountIDClaim); err == nil {
+				full.AccountID = id
+			}
+		}
 	}
 	return result, full
 }

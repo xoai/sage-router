@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -405,6 +406,32 @@ func (b *Bridge) handleCallback(providerID string) http.HandlerFunc {
 		state := q.Get("state")
 		code := q.Get("code")
 
+		// Surface upstream OAuth errors before the missing-params check.
+		// claude.ai / api.openai.com redirect back here with ?error=<code>
+		// when they reject the authorize URL (scope, redirect_uri,
+		// client_id, etc.). Without this branch, the static "missing
+		// state or code" diagnostic obscures the real cause. See fix
+		// 20260514-claude-oauth-and-detect.
+		//
+		// Cleanup note: when state is non-empty we deliberately do NOT
+		// Consume() the pending flow here — the 10-min sweeper reaps it.
+		// Consuming would make a subsequent legitimate retry from the
+		// same dashboard click fail with "invalid state", and the
+		// upstream rejection already invalidated the authorize step.
+		if upstreamErr := q.Get("error"); upstreamErr != "" {
+			reason := "upstream-error: " + upstreamErr
+			if desc := q.Get("error_description"); desc != "" {
+				reason = reason + " (" + desc + ")"
+			}
+			b.respondError(w, reason)
+			slog.Warn("oauth bridge: upstream returned error",
+				"provider", providerID,
+				"error", upstreamErr,
+				"error_description", q.Get("error_description"),
+				"state_prefix", safePrefix(state))
+			return
+		}
+
 		// Generic 400 for any validation failure — never reveal why
 		// (state mismatch, expired, wrong provider) so an attacker
 		// can't probe the bridge for valid states.
@@ -473,12 +500,53 @@ func (b *Bridge) handleCallback(providerID string) http.HandlerFunc {
 	}
 }
 
-// respondError writes a generic 400 with no information disclosure. The
-// real diagnosis is in the server logs.
-func (b *Bridge) respondError(w http.ResponseWriter, _ string) {
+// respondError writes a generic 400. The diagnostic `reason` is set as
+// an X-Sage-Callback-Reason header (visible in browser devtools but
+// NOT in the user-facing body, preserving the no-info-disclosure
+// posture for attackers who don't have devtools open) AND each caller
+// already logs a structured slog.Warn server-side.
+//
+// SECURITY (header injection): reason may derive from request data
+// (notably `q.Get("error")` from upstream redirects). sanitizeHeaderValue
+// strips CR/LF/NUL + non-printable + caps length to prevent header
+// injection AND log spam. 200 chars is more than enough for any
+// plausible diagnostic key.
+//
+// See fix 20260514-claude-oauth-and-detect.
+func (b *Bridge) respondError(w http.ResponseWriter, reason string) {
+	if reason != "" {
+		sanitized := sanitizeHeaderValue(reason, 200)
+		if sanitized != "" {
+			w.Header().Set("X-Sage-Callback-Reason", sanitized)
+		}
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusBadRequest)
 	fmt.Fprintln(w, "OAuth callback rejected. Please retry from the dashboard or CLI.")
+}
+
+// sanitizeHeaderValue strips characters that would break HTTP header
+// framing (CR/LF/NUL) and caps length. Defensive even though Go's
+// net/http stdlib does sanitize header values internally — explicit
+// is better than implicit when the value derives from external input.
+//
+// Drops non-ASCII silently. The upstream OAuth error CODE is always
+// ASCII per RFC 6749 §4.1.2.1; only localized error_description text
+// loses locale info — acceptable trade-off vs UTF-8 header complexity.
+func sanitizeHeaderValue(s string, maxLen int) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		// Allow printable ASCII only (0x20..0x7e). Drops control
+		// chars (incl. CR/LF/NUL/tab), non-ASCII, and DEL.
+		if r >= 0x20 && r < 0x7f {
+			b.WriteRune(r)
+			if b.Len() >= maxLen {
+				break
+			}
+		}
+	}
+	return b.String()
 }
 
 // runSweeper periodically removes expired pending AND completed flows.

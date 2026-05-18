@@ -1,0 +1,28 @@
+{
+  "id": "resp_synthetic_multi_turn_001",
+  "object": "response",
+  "created_at": 1779004900,
+  "status": "completed",
+  "model": "gpt-4o",
+  "instructions": "You are a helpful assistant.",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_synthetic_002",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Paris has a population of approximately 2.1 million people within the city proper, and around 12 million in the greater metropolitan area."
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 42,
+    "output_tokens": 31,
+    "total_tokens": 73
+  },
+  "metadata": {}
+}

@@ -187,15 +187,20 @@ func TestExecutor404_SubscriptionDiscoverableFalse_Skipped(t *testing.T) {
 		"default": new404Executor("default"),
 	})
 
-	// Subscription-auth connection on openai.
+	// Subscription-auth connection on openai. ExchangedToken populated
+	// so the M2b.8 pre-flight at selectConnection allows the connection
+	// to reach the upstream (the test asserts the upstream 404 path; an
+	// empty exchanged token would short-circuit at pre-flight and skip
+	// the upstream call entirely).
 	conn := &store.Connection{
 		ID:          "conn-openai-sub",
 		Provider:    "openai",
 		Name:        "openai-sub",
 		AuthType:    "subscription",
 		AccessToken: "sub-bearer-token",
-		Priority:    0,
-		State:       "idle",
+		// ExchangedToken removed at M2.6.6 — column dropped via migration 013.
+		Priority: 0,
+		State:    "idle",
 	}
 	if err := db.CreateConnection(conn); err != nil {
 		t.Fatalf("create connection: %v", err)
@@ -320,5 +325,77 @@ func TestExecutor404_RespectsBackoff(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := lister.called.Load(); got != 0 {
 		t.Errorf("lister called %d times during backoff; want 0", got)
+	}
+}
+
+// extraHeadersCapturingLister records the ListerCredentials it received.
+// Unlike countingDiscoveryLister it preserves the creds, so the on-404
+// path's ExtraHeaders threading can be asserted.
+type extraHeadersCapturingLister struct {
+	called    atomic.Int32
+	lastCreds atomic.Value // catalog.ListerCredentials
+}
+
+func (l *extraHeadersCapturingLister) ListModels(_ context.Context, creds catalog.ListerCredentials) ([]catalog.Model, error) {
+	l.called.Add(1)
+	l.lastCreds.Store(creds)
+	return nil, nil
+}
+
+// TestOnNotFoundDiscovery_ThreadsExtraHeaders — initiative
+// 20260513-openai-discovery. The on-404 path at routes_api.go:441-446
+// threads conn.Credentials.ExtraHeaders into ListerCredentials so the
+// 404-triggered discovery refresh sends ChatGPT-Account-ID like the
+// on-create path does. Without this test, a future change to
+// routes_v1.go:1025-1035 (which populates conn.Credentials.ExtraHeaders
+// for subscription connections) could silently break the on-404 path.
+//
+// Exercises triggerOnNotFoundDiscovery directly with a *ConnectionInfo
+// that has pre-populated ExtraHeaders — matches the shape the request-
+// time path builds.
+func TestOnNotFoundDiscovery_ThreadsExtraHeaders(t *testing.T) {
+	srv, db := setupTestServer(t, nil)
+	lister := &extraHeadersCapturingLister{}
+	// Subscription openai on-404 dispatches to the openrouter-mirror
+	// lister key per catalog.DiscoveryListerKey (fix
+	// 20260514-openrouter-fallback). Register the fake under both
+	// keys so the test exercises the production dispatch path while
+	// preserving its ExtraHeaders contract assertion.
+	_, _ = wireDiscoveryOnto(t, srv, db, map[string]catalog.ModelLister{
+		"openai":                   lister,
+		"openai@codex-subscription": lister,
+	})
+
+	conn := &ConnectionInfo{
+		ID: "c-on404-extra-test",
+		Credentials: &executor.Credentials{
+			ConnectionID: "c-on404-extra-test",
+			AuthType:     "subscription",
+			AccessToken:  "oauth-jwt-on404",
+			ExtraHeaders: map[string]string{
+				"ChatGPT-Account-ID": "acct-on404-555",
+			},
+		},
+	}
+
+	// Direct call — bypasses the HTTP path so the assertion is hermetic
+	// against routes_v1's wiring (which is exercised by the AC16
+	// integration test above).
+	srv.triggerOnNotFoundDiscovery("openai", conn)
+
+	waitForCount(t, &lister.called, 1, 2*time.Second)
+
+	got, ok := lister.lastCreds.Load().(catalog.ListerCredentials)
+	if !ok {
+		t.Fatal("lister.lastCreds did not store catalog.ListerCredentials")
+	}
+	if got.AccessToken != "oauth-jwt-on404" {
+		t.Errorf("AccessToken = %q, want oauth-jwt-on404", got.AccessToken)
+	}
+	if got.ExtraHeaders == nil {
+		t.Fatal("ExtraHeaders = nil; on-404 path dropped the headers")
+	}
+	if h := got.ExtraHeaders["ChatGPT-Account-ID"]; h != "acct-on404-555" {
+		t.Errorf("ExtraHeaders[ChatGPT-Account-ID] = %q, want acct-on404-555", h)
 	}
 }

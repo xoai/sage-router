@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
@@ -437,5 +438,97 @@ func TestBridge_CallbackURLParseable(t *testing.T) {
 		if u.Scheme != "http" {
 			t.Errorf("%s scheme = %q, want http", p, u.Scheme)
 		}
+	}
+}
+
+// TestRespondError_SetsXSageCallbackReasonHeader — fix
+// 20260514-claude-oauth-and-detect. respondError used to discard its
+// msg arg (`_ string`); now it surfaces the reason via an
+// X-Sage-Callback-Reason response header. Body stays generic to
+// preserve the no-info-disclosure posture documented in the function.
+func TestRespondError_SetsXSageCallbackReasonHeader(t *testing.T) {
+	b := NewBridgeForTest(&fakeHandler{})
+	rec := httptest.NewRecorder()
+	b.respondError(rec, "test-reason")
+
+	if got := rec.Header().Get("X-Sage-Callback-Reason"); got != "test-reason" {
+		t.Errorf("X-Sage-Callback-Reason = %q, want test-reason", got)
+	}
+	const wantBody = "OAuth callback rejected. Please retry from the dashboard or CLI.\n"
+	if rec.Body.String() != wantBody {
+		t.Errorf("body = %q, want %q (no-info-disclosure: reason must not leak into body)",
+			rec.Body.String(), wantBody)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// TestRespondError_SanitizesHeaderInjection — defense-in-depth. With
+// the upstream-error branch in handleCallback, `reason` derives from
+// request data (?error=...&error_description=...). Strip CRLF and cap
+// length to prevent header injection AND log spam.
+func TestRespondError_SanitizesHeaderInjection(t *testing.T) {
+	b := NewBridgeForTest(&fakeHandler{})
+	rec := httptest.NewRecorder()
+	// Attacker tries to inject a second header via CR+LF.
+	b.respondError(rec, "good\r\nX-Evil: pwned\r\nX-Sage-Callback-Reason: real")
+
+	got := rec.Header().Get("X-Sage-Callback-Reason")
+	if got == "" {
+		t.Fatal("X-Sage-Callback-Reason header missing")
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Errorf("X-Sage-Callback-Reason contains CR/LF: %q", got)
+	}
+	if rec.Header().Get("X-Evil") != "" {
+		t.Errorf("X-Evil header set; header injection succeeded")
+	}
+	// Length cap: pass 500 chars, expect ≤200.
+	rec2 := httptest.NewRecorder()
+	long := strings.Repeat("a", 500)
+	b.respondError(rec2, long)
+	if got := rec2.Header().Get("X-Sage-Callback-Reason"); len(got) > 200 {
+		t.Errorf("X-Sage-Callback-Reason length = %d, want <=200", len(got))
+	}
+}
+
+// TestHandleCallback_SurfacesUpstreamErrorInHeader — fix
+// 20260514-claude-oauth-and-detect M4 (load-bearing). When the
+// upstream OAuth provider redirects back with ?error=... (the most
+// likely failure mode for the original "OAuth callback rejected"
+// bug — scope/redirect_uri rejection at claude.ai or api.openai.com),
+// the X-Sage-Callback-Reason header MUST carry the upstream error
+// code, not just "missing state or code parameter". Without this,
+// the diagnostic header restates the symptom rather than the cause.
+func TestHandleCallback_SurfacesUpstreamErrorInHeader(t *testing.T) {
+	b := NewBridgeForTest(&fakeHandler{})
+	// Simulate Anthropic redirecting back with an upstream error.
+	req := httptest.NewRequest("GET",
+		"/callback?error=invalid_scope&state=xxx-state&error_description=Scope+not+allowed", nil)
+	rec := httptest.NewRecorder()
+
+	// Drive handleCallback directly for the anthropic port. (We can't
+	// hit the live listener here; just invoke the handler.)
+	b.handleCallback("anthropic")(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	got := rec.Header().Get("X-Sage-Callback-Reason")
+	if got == "" {
+		t.Fatal("X-Sage-Callback-Reason header missing — upstream-error branch did not fire")
+	}
+	// Header must include the upstream error code AND the description.
+	if !strings.Contains(got, "invalid_scope") {
+		t.Errorf("X-Sage-Callback-Reason = %q, must contain 'invalid_scope'", got)
+	}
+	if !strings.Contains(got, "Scope not allowed") {
+		t.Errorf("X-Sage-Callback-Reason = %q, must contain error_description 'Scope not allowed'", got)
+	}
+	// Body must remain the generic string (no info disclosure).
+	const wantBody = "OAuth callback rejected. Please retry from the dashboard or CLI.\n"
+	if rec.Body.String() != wantBody {
+		t.Errorf("body = %q, want %q (reason must not leak into body)", rec.Body.String(), wantBody)
 	}
 }

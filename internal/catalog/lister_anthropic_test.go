@@ -90,8 +90,8 @@ func TestListAnthropicModels_ParsesDocumentedShape(t *testing.T) {
 	if gotVersionHeader == "" {
 		t.Error("anthropic-version header missing")
 	}
-	if !strings.HasPrefix(gotPath, "/v1/models") {
-		t.Errorf("path = %q, want prefix /v1/models", gotPath)
+	if gotPath != "/models" {
+		t.Errorf("path = %q, want /models (BaseURL already has /v1; see plan 20260514-discovery-url-doubling)", gotPath)
 	}
 
 	if len(models) != 2 {
@@ -190,6 +190,104 @@ func TestListAnthropicModels_EmptyResponseIsHandled(t *testing.T) {
 	}
 	if len(models) != 0 {
 		t.Errorf("expected empty model list, got %d", len(models))
+	}
+}
+
+// TestListAnthropicModels_UsesBearerWhenAccessTokenSet — subscription
+// connections supply AccessToken; APIKey is empty. The lister must
+// send Authorization: Bearer <jwt> and NOT send the x-api-key header,
+// mirroring the executor's auth-type-aware pattern at default.go:55-69.
+//
+// R1 caveat: if Anthropic /v1/models rejects Bearer JWTs (only
+// x-api-key) in production, the user-visible outcome stays the same
+// as today (401 either way); only the test assertion is affected.
+func TestListAnthropicModels_UsesBearerWhenAccessTokenSet(t *testing.T) {
+	var gotAuth, gotAPIKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(anthropicModelsResponse))
+	}))
+	defer srv.Close()
+
+	_, err := listAnthropicModels(context.Background(), ListerCredentials{
+		BaseURL:     srv.URL,
+		AccessToken: "anthropic-oauth-jwt",
+	})
+	if err != nil {
+		t.Fatalf("listAnthropicModels: %v", err)
+	}
+	if gotAuth != "Bearer anthropic-oauth-jwt" {
+		t.Errorf("Authorization = %q, want Bearer anthropic-oauth-jwt", gotAuth)
+	}
+	if gotAPIKey != "" {
+		t.Errorf("x-api-key = %q, want empty when AccessToken is set (no dual-auth headers)", gotAPIKey)
+	}
+}
+
+// TestListAnthropicModels_UsesAPIKeyHeaderForApiKeyAuth — regression
+// guard. Pre-fix behavior preserved when AccessToken is empty:
+// x-api-key header is sent, no Authorization header.
+func TestListAnthropicModels_UsesAPIKeyHeaderForApiKeyAuth(t *testing.T) {
+	var gotAuth, gotAPIKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(anthropicModelsResponse))
+	}))
+	defer srv.Close()
+
+	_, err := listAnthropicModels(context.Background(), ListerCredentials{
+		BaseURL: srv.URL,
+		APIKey:  "sk-ant-classic-key",
+		// AccessToken empty.
+	})
+	if err != nil {
+		t.Fatalf("listAnthropicModels: %v", err)
+	}
+	if gotAPIKey != "sk-ant-classic-key" {
+		t.Errorf("x-api-key = %q, want sk-ant-classic-key", gotAPIKey)
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty when only APIKey is set", gotAuth)
+	}
+}
+
+// TestListAnthropicModels_ProductionShapeBaseURL_ParsesAndAuths —
+// initiative 20260514-discovery-url-doubling §8. Same intent as the
+// openai counterpart: assert headers + parsing work when BaseURL has
+// the /v1 segment (production shape).
+func TestListAnthropicModels_ProductionShapeBaseURL_ParsesAndAuths(t *testing.T) {
+	var gotPath, gotAPIKey, gotVersion string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAPIKey = r.Header.Get("x-api-key")
+		gotVersion = r.Header.Get("anthropic-version")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(anthropicModelsResponse))
+	}))
+	defer srv.Close()
+
+	models, err := listAnthropicModels(context.Background(), ListerCredentials{
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "sk-ant-prodshape",
+	})
+	if err != nil {
+		t.Fatalf("listAnthropicModels: %v", err)
+	}
+	if gotPath != "/v1/models" {
+		t.Errorf("path = %q, want /v1/models (production-shape URL composition)", gotPath)
+	}
+	if gotAPIKey != "sk-ant-prodshape" {
+		t.Errorf("x-api-key = %q, want sk-ant-prodshape", gotAPIKey)
+	}
+	if gotVersion == "" {
+		t.Error("anthropic-version header missing")
+	}
+	if len(models) == 0 {
+		t.Error("expected non-empty model list from valid response")
 	}
 }
 

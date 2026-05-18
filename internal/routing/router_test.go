@@ -26,6 +26,7 @@ func TestParseAutoModel(t *testing.T) {
 		{"auto:cheap", StrategyCheap, true},
 		{"auto:best", StrategyBest, true},
 		{"auto:balanced", StrategyBalanced, true},
+		{"auto:user-order", StrategyUserOrder, true}, // AC-F1 (cycle 20260516-routing-strategy-ux)
 		{"auto:unknown", StrategyBalanced, true},
 		{"gpt-4o", "", false},
 		{"anthropic/claude-sonnet-4-6", "", false},
@@ -38,6 +39,31 @@ func TestParseAutoModel(t *testing.T) {
 		}
 		if ok && s != tt.strategy {
 			t.Errorf("ParseAutoModel(%q) strategy = %q, want %q", tt.input, s, tt.strategy)
+		}
+	}
+}
+
+// AC-F3 (cycle 20260516-routing-strategy-ux): StrategyUserOrder is a stable
+// no-op in sortByStrategy — sort.SliceStable with a comparator that returns
+// false for all pairs preserves input order. The pre-sort by allowed_models
+// position happens UPSTREAM at routes_v1.go's resolveModel (M3.6) — Route()
+// just preserves whatever order the caller passed in.
+func TestRoute_StrategyUserOrder_NoOp(t *testing.T) {
+	r := NewSmartRouter()
+	// Mimic a pre-sorted-by-user-order list: C, A, B.
+	input := []ModelCandidate{
+		{Provider: "anthropic", Model: "claude-sonnet-4-6", Tier: 1, InputPrice: 3.00},
+		{Provider: "openai", Model: "gpt-4o-mini", Tier: 2, InputPrice: 0.15},
+		{Provider: "openai", Model: "gpt-4.1-nano", Tier: 3, InputPrice: 0.05},
+	}
+	result := r.Route(StrategyUserOrder, "", input)
+	if len(result) != len(input) {
+		t.Fatalf("got %d results, want %d", len(result), len(input))
+	}
+	for i := range input {
+		if result[i].Provider != input[i].Provider || result[i].Model != input[i].Model {
+			t.Errorf("StrategyUserOrder: position %d expected %s/%s, got %s/%s",
+				i, input[i].Provider, input[i].Model, result[i].Provider, result[i].Model)
 		}
 	}
 }

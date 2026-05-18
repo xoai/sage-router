@@ -73,6 +73,15 @@ type Store interface {
 	// last_discovered_at + last_discovery_error per provider; NOT
 	// used to enumerate KnownProviders (those are static — see RC1).
 	ListProviderMetas(ctx context.Context) ([]ProviderMeta, error)
+
+	// ListModelIDsForProviders returns all catalog_models.model_id
+	// values for the given provider keys, grouped by provider. Used
+	// by the OpenRouter refresher's mirror-pricing path to resolve
+	// OpenRouter IDs against existing direct-provider rows via
+	// normalized-ID matching (see openrouter_normalize.go). Absent
+	// providers yield an empty slice in the returned map (not an
+	// error). See fix 20260514-pricing-mirror.
+	ListModelIDsForProviders(ctx context.Context, providers []string) (map[string][]string, error)
 }
 
 // Registry is the read-side fast path the rest of the codebase

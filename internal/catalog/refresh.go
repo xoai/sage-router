@@ -10,15 +10,21 @@ import (
 // uses to obtain a ListerCredentials for a given provider when it
 // doesn't have a specific connection (e.g., on the 24h ticker).
 //
-// Returns (creds, true) when an active connection exists for the
-// provider AND credentials could be assembled; (zero, false) when
-// the provider should be skipped (e.g., no connections registered
-// yet, or all are disabled). The runner does not infer "no creds"
-// as an error — that condition is normal during operation.
+// Returns (creds, authType, true) when an active connection exists
+// for the provider AND credentials could be assembled; (zero, "",
+// false) when the provider should be skipped (e.g., no connections
+// registered yet, or all are disabled). The runner does not infer
+// "no creds" as an error — that condition is normal during operation.
+//
+// authType is needed so DiscoverAll can dispatch through
+// DiscoveryListerKey (e.g., subscription openai routes to the
+// "openai@openrouter-mirror" lister). See fix 20260514-openrouter-fallback.
+// Implementations should pass the auth_type of the picked connection
+// verbatim (e.g., auth.AuthTypeSubscription, auth.AuthTypeApiKey).
 //
 // Wired by main.go (M2.5 production wiring) from the connection
 // table + config.KnownProviders.
-type CredentialsLookup func(provider string) (creds ListerCredentials, ok bool)
+type CredentialsLookup func(provider string) (creds ListerCredentials, authType string, ok bool)
 
 const (
 	defaultRefreshInterval = 24 * time.Hour
@@ -45,14 +51,19 @@ func (d *DiscoveryRunner) DiscoverAll(ctx context.Context, credsFor CredentialsL
 		if !d.ShouldRunForProvider(m, now) {
 			continue
 		}
-		creds, ok := credsFor(m.Provider)
+		creds, authType, ok := credsFor(m.Provider)
 		if !ok {
 			// No connection / no usable creds for this provider right
 			// now. Not an error — operators may not have added a
 			// connection for every provider in the seed.
 			continue
 		}
-		results = append(results, d.DiscoverProvider(ctx, m.Provider, creds))
+		// Dispatch through DiscoveryListerKey: most provider/auth
+		// pairs use the provider's own lister; subscription openai
+		// routes through "openai@openrouter-mirror" because ChatGPT
+		// subscription tokens can't read api.openai.com/v1/models.
+		listerKey := DiscoveryListerKey(m.Provider, authType)
+		results = append(results, d.DiscoverProviderWithLister(ctx, m.Provider, listerKey, creds))
 	}
 	return results
 }

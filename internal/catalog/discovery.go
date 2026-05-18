@@ -137,12 +137,41 @@ func NewDiscoveryRunner(store Store, listers map[string]ModelLister) *DiscoveryR
 // `provider` MUST match a key in Listers. An unknown provider returns
 // a result with Err set — that's a wiring bug worth flagging loudly,
 // not a runtime no-op.
+//
+// Backward-compatible delegation to DiscoverProviderWithLister: same
+// key used for both provider stamping and lister lookup. Callers that
+// need to dispatch to a mirror lister (e.g., subscription connections
+// routed through "openai@openrouter-mirror") should use
+// DiscoverProviderWithLister directly via DiscoveryListerKey.
 func (d *DiscoveryRunner) DiscoverProvider(ctx context.Context, provider string, creds ListerCredentials) DiscoveryResult {
-	lister, ok := d.Listers[provider]
+	return d.DiscoverProviderWithLister(ctx, provider, provider, creds)
+}
+
+// DiscoverProviderWithLister runs the lister registered under listerKey
+// against the given credentials, upserts the results, and updates
+// ProviderMeta keyed by providerKey. Used when discovery uses a
+// fallback/mirror lister whose registry key differs from the provider
+// it populates (e.g., subscription OpenAI routes through
+// "openai@openrouter-mirror" but writes meta + catalog rows against
+// the "openai" provider).
+//
+// providerKey and listerKey are equal for the common case (use
+// DiscoverProvider for that). Splitting them is only needed when the
+// caller has dispatched via DiscoveryListerKey.
+//
+// See fix 20260514-openrouter-fallback for the original design context.
+func (d *DiscoveryRunner) DiscoverProviderWithLister(
+	ctx context.Context, providerKey, listerKey string, creds ListerCredentials,
+) DiscoveryResult {
+	lister, ok := d.Listers[listerKey]
 	if !ok {
+		// Record against providerKey, NOT listerKey — the operator's
+		// mental model is per-provider; reporting against the lister
+		// key would hide the broken provider behind an internal
+		// dispatch name.
 		return DiscoveryResult{
-			Provider: provider,
-			Err:      fmt.Errorf("catalog: no lister registered for provider %q", provider),
+			Provider: providerKey,
+			Err:      fmt.Errorf("catalog: no lister registered for key %q (provider %q)", listerKey, providerKey),
 		}
 	}
 
@@ -158,7 +187,7 @@ func (d *DiscoveryRunner) DiscoverProvider(ctx context.Context, provider string,
 	// Unsupported provider: treat as a contract no-op, not a failure.
 	// Documented in tests as the "permanent state" exclusion.
 	if errors.Is(err, ErrDiscoveryUnsupported) {
-		return DiscoveryResult{Provider: provider}
+		return DiscoveryResult{Provider: providerKey}
 	}
 
 	if err != nil {
@@ -166,16 +195,16 @@ func (d *DiscoveryRunner) DiscoverProvider(ctx context.Context, provider string,
 		// touched (AC14). Best-effort: a store-write error here is
 		// logged but not chained — the upstream error is what the
 		// caller actually cares about.
-		d.recordError(ctx, provider, err.Error())
-		return DiscoveryResult{Provider: provider, Err: err}
+		d.recordError(ctx, providerKey, err.Error())
+		return DiscoveryResult{Provider: providerKey, Err: err}
 	}
 
 	// Empty-list safety (AC14b): success-with-zero-models. Update
 	// ProviderMeta to mark the run AND record the diagnostic note.
 	// DO NOT delete rows.
 	if len(models) == 0 {
-		d.recordSuccess(ctx, provider, "empty model list")
-		return DiscoveryResult{Provider: provider, Empty: true}
+		d.recordSuccess(ctx, providerKey, "empty model list")
+		return DiscoveryResult{Provider: providerKey, Empty: true}
 	}
 
 	// Happy path: stamp SourceDiscovery and upsert.
@@ -188,14 +217,14 @@ func (d *DiscoveryRunner) DiscoverProvider(ctx context.Context, provider string,
 		if err := d.Store.UpsertModel(ctx, m); err != nil {
 			// Persist what we have so far AND record the error. The
 			// caller sees a partial result.
-			d.recordError(ctx, provider, fmt.Sprintf("upsert %s/%s: %v", m.Provider, m.ModelID, err))
-			return DiscoveryResult{Provider: provider, Count: count, Err: err}
+			d.recordError(ctx, providerKey, fmt.Sprintf("upsert %s/%s: %v", m.Provider, m.ModelID, err))
+			return DiscoveryResult{Provider: providerKey, Count: count, Err: err}
 		}
 		count++
 	}
 
-	d.recordSuccess(ctx, provider, "")
-	return DiscoveryResult{Provider: provider, Count: count}
+	d.recordSuccess(ctx, providerKey, "")
+	return DiscoveryResult{Provider: providerKey, Count: count}
 }
 
 // recordSuccess updates ProviderMeta after a successful run. Note
@@ -283,40 +312,53 @@ func (d *DiscoveryRunner) recordError(ctx context.Context, provider, msg string)
 // can take up to Timeout (default 10s) under bad network conditions and
 // must not block the 404 response to the client.
 func (d *DiscoveryRunner) TryDiscoverOnNotFound(ctx context.Context, provider string, creds ListerCredentials) DiscoveryResult {
+	return d.TryDiscoverOnNotFoundWithLister(ctx, provider, provider, creds)
+}
+
+// TryDiscoverOnNotFoundWithLister is the on-404 sibling of
+// DiscoverProviderWithLister. Same gates (debounce + persistent
+// backoff), keyed by providerKey for both the debounce map AND the
+// ProviderMeta lookup. The listerKey is only used for the underlying
+// lister-registry lookup.
+//
+// Keying the debounce map by providerKey (not listerKey) is intentional:
+// we want one debounce per provider, regardless of which lister is
+// fulfilling the request. A subscription openai connection and a
+// (hypothetical) apikey openai connection that both 404 within 5
+// minutes should be debounced as one provider, not two.
+//
+// See fix 20260514-openrouter-fallback.
+func (d *DiscoveryRunner) TryDiscoverOnNotFoundWithLister(
+	ctx context.Context, providerKey, listerKey string, creds ListerCredentials,
+) DiscoveryResult {
 	now := d.Clock()
 
-	// Debounce gate. Held briefly — no Store calls under d.mu.
+	// Debounce gate, keyed by providerKey. Held briefly — no Store
+	// calls under d.mu.
 	d.mu.Lock()
-	if last, ok := d.recentlyDiscovered[provider]; ok && now.Sub(last) < onNotFoundDebounce {
+	if last, ok := d.recentlyDiscovered[providerKey]; ok && now.Sub(last) < onNotFoundDebounce {
 		d.mu.Unlock()
-		return DiscoveryResult{Provider: provider, Skipped: true}
+		return DiscoveryResult{Provider: providerKey, Skipped: true}
 	}
 	d.mu.Unlock()
 
 	// Persistent backoff gate. Reads ProviderMeta straight from the
 	// store — Registry caching doesn't apply to provider_meta state.
-	meta, err := d.Store.GetProviderMeta(ctx, provider)
+	meta, err := d.Store.GetProviderMeta(ctx, providerKey)
 	if err != nil {
-		return DiscoveryResult{Provider: provider, Err: fmt.Errorf("on-404: read ProviderMeta: %w", err)}
+		return DiscoveryResult{Provider: providerKey, Err: fmt.Errorf("on-404: read ProviderMeta: %w", err)}
 	}
-	// Missing meta row → fail-closed skip. Bootstrap seeds meta rows
-	// for every KnownProvider, so a nil result indicates a wiring
-	// gap, not a runtime expected condition. Surface the wiring gap
-	// via slog.Warn — silent skips obscure the fact that on-404
-	// discovery is not running at all for this provider; operators
-	// would otherwise discover it only by absence-of-discovery, which
-	// reads as "everything is fine" until a separate signal contradicts.
 	if meta == nil {
 		slog.Warn("on-404 discovery skipped: no ProviderMeta row",
-			"provider", provider,
+			"provider", providerKey,
 			"hint", "bootstrap seeds meta rows for every KnownProvider; nil indicates wiring gap or post-bootstrap deletion")
-		return DiscoveryResult{Provider: provider, Skipped: true}
+		return DiscoveryResult{Provider: providerKey, Skipped: true}
 	}
 	if !d.ShouldRunForProvider(*meta, now) {
-		return DiscoveryResult{Provider: provider, Skipped: true}
+		return DiscoveryResult{Provider: providerKey, Skipped: true}
 	}
 
-	res := d.DiscoverProvider(ctx, provider, creds)
+	res := d.DiscoverProviderWithLister(ctx, providerKey, listerKey, creds)
 
 	// Stamp the debounce map. Failures count — backoff-state covers
 	// longer windows; the 5-min debounce protects against the same
@@ -325,7 +367,7 @@ func (d *DiscoveryRunner) TryDiscoverOnNotFound(ctx context.Context, provider st
 	if d.recentlyDiscovered == nil {
 		d.recentlyDiscovered = make(map[string]time.Time)
 	}
-	d.recentlyDiscovered[provider] = now
+	d.recentlyDiscovered[providerKey] = now
 	d.mu.Unlock()
 
 	return res

@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -56,6 +57,9 @@ type TokenResponse struct {
 	TokenType    string `json:"token_type,omitempty"`
 	ExpiresIn    int    `json:"expires_in"`
 	Scope        string `json:"scope,omitempty"`
+
+	// ExchangedToken field removed in cycle 20260517-provider-auth-variants
+	// M2.6.2 — RFC 8693 exchange chain was wrong-path (memory `f32bbc73`).
 }
 
 // SetTokenURLForTest overrides the URL Exchange POSTs to. Test-only —
@@ -120,22 +124,51 @@ func (f *Flow) AuthorizeURL(redirectURI string) string {
 }
 
 // Exchange swaps the authorization code received at the callback for tokens.
-// Form-encoded POST to the provider's token endpoint per RFC 6749.
+// Body shape is selected by the provider's TokenRequestFormat:
+//   - "" / "form" (RFC 6749 §4.1.3 default) — application/x-www-form-urlencoded
+//   - "json" — application/json (Anthropic's platform.claude.com)
+//
+// The JSON shape is verified byte-for-byte against the working
+// opencode-anthropic-auth plugin (src/auth.ts::exchangeCode) and pinned
+// by TestFlow_Exchange_AnthropicSendsJSON. See M0.8 of cycle
+// 20260517-provider-auth-variants for the diagnostic that drove this split.
 func (f *Flow) Exchange(ctx context.Context, code, redirectURI string) (*TokenResponse, error) {
 	cfg := providers.Providers[f.Provider]
-	form := url.Values{}
-	form.Set("grant_type", "authorization_code")
-	form.Set("code", code)
-	form.Set("client_id", cfg.ClientID)
-	form.Set("code_verifier", f.Verifier)
-	form.Set("redirect_uri", redirectURI)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.tokenURL,
-		strings.NewReader(form.Encode()))
+	var reqBody io.Reader
+	var contentType string
+	switch cfg.TokenRequestFormat {
+	case "json":
+		payload := map[string]string{
+			"grant_type":    "authorization_code",
+			"code":          code,
+			"state":         f.State,
+			"client_id":     cfg.ClientID,
+			"redirect_uri":  redirectURI,
+			"code_verifier": f.Verifier,
+		}
+		bs, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("oauth exchange: marshal json body: %w", err)
+		}
+		reqBody = bytes.NewReader(bs)
+		contentType = "application/json"
+	default:
+		form := url.Values{}
+		form.Set("grant_type", "authorization_code")
+		form.Set("code", code)
+		form.Set("client_id", cfg.ClientID)
+		form.Set("code_verifier", f.Verifier)
+		form.Set("redirect_uri", redirectURI)
+		reqBody = strings.NewReader(form.Encode())
+		contentType = "application/x-www-form-urlencoded"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.tokenURL, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("oauth exchange: build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -162,13 +195,21 @@ func (f *Flow) Exchange(ctx context.Context, code, redirectURI string) (*TokenRe
 	if tr.AccessToken == "" {
 		return nil, fmt.Errorf("oauth exchange: provider returned 200 but no access_token in body")
 	}
+
+	// Cycle 20260517-provider-auth-variants M2.6.2: RFC 8693 token-exchange
+	// auto-chain REMOVED. The predecessor cycle's exchange path targeted
+	// api.openai.com/v1/responses (unreachable for ChatGPT subscribers per
+	// memory `f32bbc73`). The variant abstraction routes (openai, subscription)
+	// to CodexSubscriptionExecutor which uses the PKCE access_token directly
+	// against chatgpt.com/backend-api/codex/responses — no exchange step.
 	return &tr, nil
 }
 
 // ToCredential builds an auth.Credential from a TokenResponse. expires_at
 // is computed with the 5-minute safety buffer (matches sage-wiki R2). The
 // AccountID claim is extracted from id_token when the provider registry
-// names a JWT claim path; otherwise left empty.
+// names a JWT claim path; otherwise left empty. ExchangedToken plumbing
+// REMOVED in cycle 20260517-provider-auth-variants M2.6.2.
 func (f *Flow) ToCredential(resp *TokenResponse) *auth.Credential {
 	cfg := providers.Providers[f.Provider]
 	cred := &auth.Credential{

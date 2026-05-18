@@ -24,5 +24,6 @@ func refreshGemini(ctx context.Context, cred *auth.Credential) (*auth.Credential
 	// client_id, the user should set it via ExtraData["client_id"] on
 	// import. For now we pass whatever's in the registry (typically
 	// empty for an import-only flow that obtained tokens externally).
-	return refreshViaOAuthForm(ctx, cred, url, cfg.ClientID)
+	newCred, _, err := refreshViaOAuthForm(ctx, cred, url, cfg.ClientID)
+	return newCred, err
 }

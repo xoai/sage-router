@@ -426,3 +426,102 @@ func TestSQLiteStore_ListProviderMetas(t *testing.T) {
 		}
 	}
 }
+
+// TestListModelIDsForProviders_ReturnsCorrectMappings — fix
+// 20260514-pricing-mirror. The new Store method must return all
+// model_ids grouped by provider, for the provided provider list.
+func TestListModelIDsForProviders_ReturnsCorrectMappings(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	// Seed three providers with different model counts.
+	seed := []Model{
+		{Provider: "openai", ModelID: "gpt-5", Source: SourceDiscovery},
+		{Provider: "openai", ModelID: "gpt-4o", Source: SourceDiscovery},
+		{Provider: "anthropic", ModelID: "claude-opus-4-7", Source: SourceDiscovery},
+		{Provider: "gemini", ModelID: "gemini-2.5-pro", Source: SourceSeed},
+	}
+	for _, m := range seed {
+		if err := cs.UpsertModel(ctx, m); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	got, err := cs.ListModelIDsForProviders(ctx, []string{"openai", "anthropic", "gemini"})
+	if err != nil {
+		t.Fatalf("ListModelIDsForProviders: %v", err)
+	}
+
+	if len(got["openai"]) != 2 {
+		t.Errorf("openai count = %d, want 2 (got %v)", len(got["openai"]), got["openai"])
+	}
+	if len(got["anthropic"]) != 1 {
+		t.Errorf("anthropic count = %d, want 1", len(got["anthropic"]))
+	}
+	if len(got["gemini"]) != 1 {
+		t.Errorf("gemini count = %d, want 1", len(got["gemini"]))
+	}
+
+	// Verify the specific IDs are present.
+	openaiSet := make(map[string]bool)
+	for _, m := range got["openai"] {
+		openaiSet[m] = true
+	}
+	if !openaiSet["gpt-5"] || !openaiSet["gpt-4o"] {
+		t.Errorf("openai missing expected IDs: %v", got["openai"])
+	}
+}
+
+// TestListModelIDsForProviders_AbsentProvidersYieldEmptySlice — the
+// returned map must contain a non-nil empty slice for every provider
+// in the input, even those with no catalog rows. Callers should be
+// able to use `result[provider]` without a nil check.
+func TestListModelIDsForProviders_AbsentProvidersYieldEmptySlice(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	// Only seed openai.
+	if err := cs.UpsertModel(ctx, Model{
+		Provider: "openai", ModelID: "gpt-5", Source: SourceDiscovery,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	got, err := cs.ListModelIDsForProviders(ctx, []string{"openai", "anthropic", "gemini", "nonexistent"})
+	if err != nil {
+		t.Fatalf("ListModelIDsForProviders: %v", err)
+	}
+
+	// openai has one row.
+	if len(got["openai"]) != 1 {
+		t.Errorf("openai = %v, want 1 entry", got["openai"])
+	}
+	// Absent providers must be present in the map with empty (NOT nil) slices.
+	for _, p := range []string{"anthropic", "gemini", "nonexistent"} {
+		slice, ok := got[p]
+		if !ok {
+			t.Errorf("provider %q missing from result map; callers expect every input key present", p)
+		}
+		if slice == nil {
+			t.Errorf("provider %q yielded nil slice; want empty slice for safe indexing", p)
+		}
+		if len(slice) != 0 {
+			t.Errorf("provider %q yielded %v, want empty", p, slice)
+		}
+	}
+}
+
+// TestListModelIDsForProviders_EmptyInput — defensive: empty input
+// returns empty map, not error.
+func TestListModelIDsForProviders_EmptyInput(t *testing.T) {
+	cs, _, ctx := freshStore(t)
+
+	got, err := cs.ListModelIDsForProviders(ctx, []string{})
+	if err != nil {
+		t.Fatalf("unexpected error on empty input: %v", err)
+	}
+	if got == nil {
+		t.Fatal("nil map returned; want empty map for safe indexing")
+	}
+	if len(got) != 0 {
+		t.Errorf("len = %d, want 0", len(got))
+	}
+}

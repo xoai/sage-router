@@ -126,3 +126,35 @@ func TestGeminiTier_Heuristic(t *testing.T) {
 		}
 	}
 }
+
+// TestListGeminiModels_ProductionShapeBaseURL — initiative
+// 20260514-discovery-url-doubling §8. Gemini uses ?key= query auth +
+// /v1beta path. Asserts path composition + query string both work
+// when BaseURL ends in /v1beta (production shape).
+func TestListGeminiModels_ProductionShapeBaseURL(t *testing.T) {
+	var gotPath, gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotKey = r.URL.Query().Get("key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(geminiModelsResponse))
+	}))
+	defer srv.Close()
+
+	models, err := listGeminiModels(context.Background(), ListerCredentials{
+		BaseURL: srv.URL + "/v1beta",
+		APIKey:  "AIza-prodshape",
+	})
+	if err != nil {
+		t.Fatalf("listGeminiModels: %v", err)
+	}
+	if gotPath != "/v1beta/models" {
+		t.Errorf("path = %q, want /v1beta/models (BaseURL already has /v1beta)", gotPath)
+	}
+	if gotKey != "AIza-prodshape" {
+		t.Errorf("?key = %q, want AIza-prodshape", gotKey)
+	}
+	if len(models) == 0 {
+		t.Error("expected non-empty model list")
+	}
+}

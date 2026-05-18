@@ -21,6 +21,7 @@ import (
 	"sage-router/internal/translate"
 	claudeTranslate "sage-router/internal/translate/claude"
 	openaiTranslate "sage-router/internal/translate/openai"
+	openaiRespTranslate "sage-router/internal/translate/openai-responses"
 	"sage-router/internal/usage"
 )
 
@@ -70,6 +71,7 @@ func newCatalogTestServer(t *testing.T) (*Server, store.Store, catalog.Store) {
 	translateReg := translate.NewRegistry()
 	translateReg.Register(openaiTranslate.New())
 	translateReg.Register(claudeTranslate.New())
+	translateReg.Register(openaiRespTranslate.New())
 
 	providerReg := provider.NewRegistry()
 	for id, p := range config.KnownProviders {
@@ -120,6 +122,7 @@ func newCatalogTestServerWithoutCatalog(t *testing.T) (*Server, store.Store) {
 	translateReg := translate.NewRegistry()
 	translateReg.Register(openaiTranslate.New())
 	translateReg.Register(claudeTranslate.New())
+	translateReg.Register(openaiRespTranslate.New())
 
 	providerReg := provider.NewRegistry()
 	for id, p := range config.KnownProviders {

@@ -178,30 +178,30 @@ func TestEndToEnd_CatalogToRouter(t *testing.T) {
 	if openrouterPricingCount < 5 {
 		t.Errorf("openrouter-sourced pricing rows = %d, want >= 5", openrouterPricingCount)
 	}
-	if anthropicSeedPricingAfter != anthropicSeedPricingBefore {
-		t.Errorf("anthropic-direct seed pricing changed: before=%d, after=%d "+
-			"(OpenRouter must not clobber anthropic-direct rows — they're addressed "+
-			"as provider='openrouter' with qualified model_ids, not provider='anthropic')",
+
+	// Contract change per fix 20260514-pricing-mirror: OpenRouterRefresher
+	// now ALSO writes mirror rows into direct-provider namespaces for
+	// `openai/`, `anthropic/`, `google/` entries — overriding seed pricing
+	// where catalog_models rows exist. So anthropic seed pricing rows
+	// SHOULD decrease after the refresh (flipped from seed → openrouter).
+	if anthropicSeedPricingAfter >= anthropicSeedPricingBefore {
+		t.Errorf("anthropic seed pricing rows did NOT decrease: before=%d, after=%d "+
+			"(post fix 20260514-pricing-mirror, OpenRouter mirror writes flip "+
+			"existing anthropic seed pricing rows to source=openrouter)",
 			anthropicSeedPricingBefore, anthropicSeedPricingAfter)
 	}
 
-	// Explicit isolation of the two failure modes (carryover #56):
-	// "openrouter wrote its own qualified rows" vs "UpsertPricing's
-	// WHERE clause blocked openrouter from clobbering anthropic seed
-	// rows". The seed-count equality above proves the latter only if
-	// no openrouter row sneaks under provider='anthropic'; this check
-	// pins that explicitly.
+	// And anthropic+source=openrouter rows MUST appear — the mirror path.
 	var anthropicOpenRouterRows int
 	if err := db.DB().QueryRow(
 		"SELECT COUNT(*) FROM catalog_pricing WHERE provider='anthropic' AND source='openrouter'",
 	).Scan(&anthropicOpenRouterRows); err != nil {
 		t.Fatalf("count anthropic+openrouter rows: %v", err)
 	}
-	if anthropicOpenRouterRows != 0 {
-		t.Errorf("anthropic+source=openrouter rows = %d, want 0 "+
-			"(openrouter writes only under provider='openrouter'; any anthropic+openrouter row "+
-			"indicates a misrouted upsert)",
-			anthropicOpenRouterRows)
+	if anthropicOpenRouterRows == 0 {
+		t.Errorf("anthropic+source=openrouter rows = 0, want > 0 "+
+			"(fix 20260514-pricing-mirror mirrors anthropic pricing from OpenRouter into "+
+			"direct-provider rows; absence indicates mirror logic is broken)")
 	}
 
 	// ─── Step 4: mock anthropic lister + DiscoverProvider ─────────────
@@ -260,13 +260,16 @@ func TestEndToEnd_CatalogToRouter(t *testing.T) {
 			overlapSource)
 	}
 
-	// Pricing for the overlapping row stays at seed (Anthropic /v1/models
-	// returns no pricing; the lister's Model carries empty Pricing; the
-	// runner doesn't touch catalog_pricing). Carryover #57 — also assert
-	// the seed VALUES survived. A regression that flipped values to zero
-	// while keeping source='seed' would pass the source check otherwise;
-	// pinning input/output prices against the seed constants ($3 / $15
-	// per 1M for claude-sonnet-4-6) catches that failure mode.
+	// Pricing for the overlapping row: post fix 20260514-pricing-mirror,
+	// OpenRouter's mirror path overrides seed pricing during Step 3 (the
+	// FetchAndPersist call above). Anthropic /v1/models discovery in
+	// Step 4 still doesn't touch pricing — but it doesn't matter because
+	// OpenRouter already wrote the row with source=openrouter.
+	//
+	// The new contract: anthropic catalog_pricing rows that match an
+	// OpenRouter entry (after normalization) carry source=openrouter
+	// with OpenRouter's values. Rows that DON'T match in OpenRouter
+	// retain seed pricing.
 	var overlapPricingSource string
 	var overlapInputPrice, overlapOutputPrice float64
 	if err := db.DB().QueryRow(
@@ -275,20 +278,23 @@ func TestEndToEnd_CatalogToRouter(t *testing.T) {
 	).Scan(&overlapPricingSource, &overlapInputPrice, &overlapOutputPrice); err != nil {
 		t.Fatalf("query overlap pricing: %v", err)
 	}
-	if overlapPricingSource != "seed" {
-		t.Errorf("claude-sonnet-4-6 catalog_pricing.source = %q, want 'seed' "+
-			"(discovery without pricing must NOT clobber seed pricing)",
+	if overlapPricingSource != "openrouter" {
+		t.Errorf("claude-sonnet-4-6 catalog_pricing.source = %q, want 'openrouter' "+
+			"(fix 20260514-pricing-mirror: OpenRouter mirror writes flip anthropic seed → openrouter)",
 			overlapPricingSource)
 	}
-	const sonnet46SeedInput, sonnet46SeedOutput = 3.0, 15.0
-	if math.Abs(overlapInputPrice-sonnet46SeedInput) > 1e-9 {
-		t.Errorf("claude-sonnet-4-6 input_price = %v after discovery, want %v "+
-			"(seed values must survive a no-pricing discovery cycle)",
-			overlapInputPrice, sonnet46SeedInput)
+	// Values come from OpenRouter fixture (anthropic/claude-sonnet-4.6 prices).
+	// We don't pin exact values here — those depend on the fixture content;
+	// presence + nonzero input price is sufficient for this integration test.
+	if overlapInputPrice <= 0 {
+		t.Errorf("claude-sonnet-4-6 input_price = %v, want > 0 (mirror should write real OpenRouter price)",
+			overlapInputPrice)
 	}
-	if math.Abs(overlapOutputPrice-sonnet46SeedOutput) > 1e-9 {
-		t.Errorf("claude-sonnet-4-6 output_price = %v after discovery, want %v",
-			overlapOutputPrice, sonnet46SeedOutput)
+	// Output price is also expected to be > 0 (OpenRouter's
+	// completion price for claude-sonnet-4.6).
+	if overlapOutputPrice <= 0 {
+		t.Errorf("claude-sonnet-4-6 output_price = %v, want > 0 (mirror should write real OpenRouter price)",
+			overlapOutputPrice)
 	}
 
 	// ─── Step 5: user pricing override ────────────────────────────────

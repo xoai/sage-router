@@ -1,12 +1,38 @@
 package detect
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// makeJWTWithClaim crafts a minimal JWT (header.payload.signature) whose
+// payload contains a single claim k=v. Signature is "sig" (unverified —
+// detect/codex never verifies; same trust model as the Codex CLI's own
+// id_token handling).
+func makeJWTWithClaim(t *testing.T, claim, value string) string {
+	t.Helper()
+	enc := base64.RawURLEncoding.EncodeToString
+	header := enc([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := enc([]byte(fmt.Sprintf(`{%q:%q}`, claim, value)))
+	return header + "." + payload + ".sig"
+}
+
+// codexBodyWithIDToken returns a Codex auth.json body string with the given
+// access_token + refresh_token + id_token + expires_at literal.
+func codexBodyWithIDToken(accessToken, refreshToken, idToken, expiresAtRaw string) string {
+	return fmt.Sprintf(`{
+		"tokens": {
+			"access_token": %q,
+			"refresh_token": %q,
+			"id_token": %q,
+			"expires_at": %s
+		}
+	}`, accessToken, refreshToken, idToken, expiresAtRaw)
+}
 
 // stubHomeAndCodexHome stubs every environment + global the codex
 // path-search code reads from, so tests are hermetic against the
@@ -258,6 +284,89 @@ func TestDetectCodex_RefreshTokenPreserved(t *testing.T) {
 	}
 }
 
+// TestDetectCodex_ExposesIDTokenForExchange removed in cycle
+// 20260517-provider-auth-variants M2.6.6 — IDToken field on
+// CodexCredentials was deleted at M2.6.3 (the RFC 8693 exchange chain it
+// fed was wrong-path per memory `f32bbc73`). M2 simplification: codex
+// auth.json's `tokens.account_id` direct field is the new account-ID
+// source (handled by TestDetectCodex_ExtractsAccountIDFromIDToken below
+// for the legacy JWT-claim fallback path).
+
+// TestDetectCodex_ExtractsAccountIDFromIDToken — happy path for the
+// ChatGPT-Account-ID chain. The id_token in Codex's auth.json carries
+// the chatgpt_account_id claim (per registry.go:108); DetectCodex must
+// extract it into CodexCredentials.AccountID so the auto-detect arm
+// can stash it on the connection. Without this, the lister + executor
+// can't send the ChatGPT-Account-ID header on subscription calls.
+func TestDetectCodex_ExtractsAccountIDFromIDToken(t *testing.T) {
+	tmpHome := stubHomeAndCodexHome(t)
+	future := time.Now().Add(24 * time.Hour).Unix()
+	jwt := makeJWTWithClaim(t,
+		"https://api.openai.com/auth.chatgpt_account_id", "acct-test-123")
+	writeCodexFile(t,
+		filepath.Join(tmpHome, ".codex", "auth.json"),
+		codexBodyWithIDToken("atk-with-id", "rtk", jwt, fmt.Sprintf("%d", future)),
+	)
+
+	_, creds := DetectCodex()
+	if creds == nil {
+		t.Fatal("creds = nil")
+	}
+	if creds.AccountID != "acct-test-123" {
+		t.Errorf("AccountID = %q, want acct-test-123 (extracted from id_token claim)",
+			creds.AccountID)
+	}
+}
+
+// TestDetectCodex_MissingIDTokenIsNonFatal — auth.json without an
+// id_token field. Detection still succeeds; AccountID stays empty
+// (best-effort, per the comment in tryReadCodexCredentials).
+func TestDetectCodex_MissingIDTokenIsNonFatal(t *testing.T) {
+	tmpHome := stubHomeAndCodexHome(t)
+	future := time.Now().Add(24 * time.Hour).Unix()
+	// validCodexBody emits id_token: "stub-id-token" which is not a valid
+	// JWT — exercises the "no 3-segment JWT" branch in ExtractIDTokenClaim.
+	writeCodexFile(t,
+		filepath.Join(tmpHome, ".codex", "auth.json"),
+		validCodexBody("atk-no-id", "rtk", fmt.Sprintf("%d", future)),
+	)
+
+	result, creds := DetectCodex()
+	if !result.Found {
+		t.Fatal("Found = false, want true (missing id_token must not fail detection)")
+	}
+	if creds.AccountID != "" {
+		t.Errorf("AccountID = %q, want empty (no extractable claim)", creds.AccountID)
+	}
+}
+
+// TestDetectCodex_MalformedIDTokenIsNonFatal — id_token is present but
+// not a valid JWT (e.g., truncated, garbage). Detection must still
+// succeed with empty AccountID; never panic.
+func TestDetectCodex_MalformedIDTokenIsNonFatal(t *testing.T) {
+	tmpHome := stubHomeAndCodexHome(t)
+	future := time.Now().Add(24 * time.Hour).Unix()
+	writeCodexFile(t,
+		filepath.Join(tmpHome, ".codex", "auth.json"),
+		codexBodyWithIDToken("atk-bad-id", "rtk", "not.a.jwt.with.extra", fmt.Sprintf("%d", future)),
+	)
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("panic on malformed id_token: %v", r)
+			}
+		}()
+		result, creds := DetectCodex()
+		if !result.Found {
+			t.Fatal("Found = false on malformed id_token; want true (best-effort claim extraction)")
+		}
+		if creds.AccountID != "" {
+			t.Errorf("AccountID = %q, want empty (malformed JWT must not extract)", creds.AccountID)
+		}
+	}()
+}
+
 // TestDetectCodex_NeverPanicsOnBadInput — fuzz a few malformed shapes;
 // DetectCodex must not panic.
 func TestDetectCodex_NeverPanicsOnBadInput(t *testing.T) {
@@ -287,5 +396,89 @@ func TestDetectCodex_NeverPanicsOnBadInput(t *testing.T) {
 				t.Errorf("case %d: Found = true on malformed body %q", i, body)
 			}
 		}()
+	}
+}
+
+// TestDetectCodex_PrefersNonExpiredAcrossPaths — fix
+// 20260514-claude-oauth-and-detect Bug 2. When the path-search yields
+// TWO files, one stale + one fresh, the fresh one wins regardless of
+// search order. This is the deterministic multi-path test that locks
+// the two-pass logic against regression. Mirror semantic for claude.go
+// is exercised structurally via the FallsBackToFirstExpired test there.
+//
+// Strategy: use CODEX_HOME to inject a deterministic SECOND candidate
+// path. codexCredPaths() returns [$CODEX_HOME/auth.json,
+// ~/.codex/auth.json, ...] in that order on Linux.
+//   - $CODEX_HOME/auth.json: EXPIRED (path order 1)
+//   - ~/.codex/auth.json: FRESH (path order 2)
+// Pre-fix behavior: first-found wins → returns expired.
+// Post-fix behavior: prefer non-expired → returns fresh.
+func TestDetectCodex_PrefersNonExpiredAcrossPaths(t *testing.T) {
+	tmpHome := stubHomeAndCodexHome(t)
+
+	// Path-order-1 file (CODEX_HOME) — EXPIRED.
+	envHome := t.TempDir()
+	t.Setenv("CODEX_HOME", envHome)
+	past := time.Now().Add(-24 * time.Hour).Unix()
+	writeCodexFile(t,
+		filepath.Join(envHome, "auth.json"),
+		validCodexBody("atk-expired", "rtk-expired", fmt.Sprintf("%d", past)),
+	)
+
+	// Path-order-2 file (~/.codex/auth.json) — FRESH.
+	future := time.Now().Add(24 * time.Hour).Unix()
+	writeCodexFile(t,
+		filepath.Join(tmpHome, ".codex", "auth.json"),
+		validCodexBody("atk-fresh", "rtk-fresh", fmt.Sprintf("%d", future)),
+	)
+
+	result, creds := DetectCodex()
+	if !result.Found {
+		t.Fatal("Found = false, want true")
+	}
+	if result.Expired {
+		t.Errorf("Expired = true, want false (fresh file should win over stale, regardless of path order)")
+	}
+	if creds == nil {
+		t.Fatal("creds = nil")
+	}
+	if creds.AccessToken != "atk-fresh" {
+		t.Errorf("AccessToken = %q, want atk-fresh (the fresh file at path-order-2 must win over the expired file at path-order-1)",
+			creds.AccessToken)
+	}
+}
+
+// TestDetectCodex_FallsBackToFirstExpiredWhenAllExpired — when no
+// non-expired file exists, the fallback path returns the first found
+// file so the "credentials are expired" UX still surfaces. Uses
+// path-order determinism: CODEX_HOME is path-order-1.
+func TestDetectCodex_FallsBackToFirstExpiredWhenAllExpired(t *testing.T) {
+	tmpHome := stubHomeAndCodexHome(t)
+
+	envHome := t.TempDir()
+	t.Setenv("CODEX_HOME", envHome)
+	past := time.Now().Add(-24 * time.Hour).Unix()
+	writeCodexFile(t,
+		filepath.Join(envHome, "auth.json"),
+		validCodexBody("atk-env-expired", "rtk-env", fmt.Sprintf("%d", past)),
+	)
+
+	pastHome := time.Now().Add(-48 * time.Hour).Unix()
+	writeCodexFile(t,
+		filepath.Join(tmpHome, ".codex", "auth.json"),
+		validCodexBody("atk-home-expired", "rtk-home", fmt.Sprintf("%d", pastHome)),
+	)
+
+	result, creds := DetectCodex()
+	if !result.Found {
+		t.Fatal("Found = false, want true (expired file should still surface)")
+	}
+	if !result.Expired {
+		t.Error("Expired = false, want true")
+	}
+	// CODEX_HOME (path-order-1) is the first found; it wins as the
+	// fallback per the two-pass loop's deterministic ordering.
+	if creds == nil || creds.AccessToken != "atk-env-expired" {
+		t.Errorf("AccessToken = %v, want atk-env-expired (CODEX_HOME is path-order-1)", creds)
 	}
 }

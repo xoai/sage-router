@@ -30,6 +30,7 @@ import (
 	claudeTranslate "sage-router/internal/translate/claude"
 	geminiTranslate "sage-router/internal/translate/gemini"
 	openaiTranslate "sage-router/internal/translate/openai"
+	openaiRespTranslate "sage-router/internal/translate/openai-responses"
 	"sage-router/internal/usage"
 	"sage-router/web"
 )
@@ -115,6 +116,7 @@ func main() {
 	translateReg.Register(openaiTranslate.New())
 	translateReg.Register(claudeTranslate.New())
 	translateReg.Register(geminiTranslate.New())
+	translateReg.Register(openaiRespTranslate.New())
 
 	// Initialize provider registry and selector
 	providerReg := provider.NewRegistry()
@@ -142,12 +144,16 @@ func main() {
 	// Initialize executors
 	clientPool := executor.NewClientPool()
 	executors := map[string]executor.Executor{
-		"openai":         executor.NewDefaultExecutor("openai", "https://api.openai.com/v1/chat/completions", clientPool),
+		// Default-executor baseURLs are API ROOTS (per default.go:22 contract).
+		// Bug-fix 20260515-chat-routing-fix AC-B1: previously these strings
+		// included `/chat/completions`, which doubled with the executor's
+		// default endpoint append → e.g., `…/v1/chat/completions/chat/completions`.
+		"openai":         executor.NewDefaultExecutor("openai", "https://api.openai.com/v1", clientPool),
 		"anthropic":      executor.NewClaudeExecutor("https://api.anthropic.com", clientPool),
 		"gemini":         executor.NewGeminiExecutor("https://generativelanguage.googleapis.com/v1beta", clientPool),
 		"github-copilot": executor.NewGitHubCopilotExecutor("https://api.githubcopilot.com", clientPool),
-		"openrouter":     executor.NewDefaultExecutor("openrouter", "https://openrouter.ai/api/v1/chat/completions", clientPool),
-		"ollama":         executor.NewDefaultExecutor("ollama", "http://localhost:11434/v1/chat/completions", clientPool),
+		"openrouter":     executor.NewDefaultExecutor("openrouter", "https://openrouter.ai/api/v1", clientPool),
+		"ollama":         executor.NewDefaultExecutor("ollama", "http://localhost:11434/v1", clientPool),
 		"default":        executor.NewDefaultExecutor("default", "", clientPool),
 	}
 
@@ -156,6 +162,33 @@ func main() {
 	for id, exec := range executors {
 		executors[id] = executor.NewRetryExecutor(exec, retryCfg)
 	}
+
+	// Build the variant dispatch registry alongside the legacy provider-keyed
+	// map. M1.7 of cycle 20260517-provider-auth-variants. Today every entry
+	// from the legacy map is registered as a wildcard `(provider, "")`;
+	// M2.8a registers (openai, subscription) → CodexSubscriptionExecutor
+	// as the first explicit (P, A) entry. M3 will add (anthropic, subscription)
+	// → ClaudeMaxExecutor.
+	//
+	// Variants and Executors coexist during the migration; M5.6 drops the
+	// legacy map once every call site has migrated to Variants.Get. The
+	// route handler's resolveVariantExec already prefers Variants when set.
+	variants := executor.NewVariants()
+	for id, exec := range executors {
+		variants.Register(executor.VariantKey{Provider: id, AuthType: ""}, exec)
+	}
+	// M2.8a (cycle 20260517-provider-auth-variants):
+	// Register CodexSubscriptionExecutor for (openai, subscription). The
+	// variant routes to chatgpt.com/backend-api/codex/responses with the
+	// 5 required headers + uses the PKCE access_token directly (no RFC 8693
+	// exchange). RetryExecutor wrapping is mandatory per memory `fb0b4ef62`
+	// — variant optional-interface methods (Format, ParseAuthError,
+	// PreflightCredentials) are forwarded through the wrap.
+	codexSubExec := executor.NewCodexSubscriptionExecutor(clientPool)
+	variants.Register(
+		executor.VariantKey{Provider: "openai", AuthType: "subscription"},
+		executor.NewRetryExecutor(codexSubExec, retryCfg),
+	)
 
 	// Initialize usage tracker
 	usageTracker := usage.NewTracker(db)
@@ -193,7 +226,11 @@ func main() {
 		TranslateRegistry: translateReg,
 		ProviderSelector:  providerSel,
 		ProviderRegistry:  providerReg,
-		Executors:         executors,
+		// Cycle 20260517-provider-auth-variants M5.6: legacy Executors
+		// map removed from server.Dependencies; Variants is the sole
+		// dispatch source. The `executors` local var above is still
+		// used to wrap each entry in RetryExecutor + register into Variants.
+		Variants: variants,
 		UsageTracker:      usageTracker,
 		Auth:              authMgr,
 		OpenAIAuth:        oauth.NewOpenAIAuth(),
@@ -271,7 +308,7 @@ func main() {
 	// buildCredsLookup is extracted to credslookup.go so the adapter
 	// has direct unit-test coverage independent of the goroutine
 	// catalog.StartBackgroundRefresh spawns (M3 polish item #34).
-	catalog.StartBackgroundRefresh(refreshCtx, catalogW.Discovery, buildCredsLookup(db))
+	catalog.StartBackgroundRefresh(refreshCtx, catalogW.Discovery, buildCredsLookup(db, authStore))
 
 	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("server error", "error", err)

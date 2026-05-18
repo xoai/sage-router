@@ -48,8 +48,8 @@ func TestListOllamaModels_ParsesAndStampsTierFree(t *testing.T) {
 	if gotAuth != "" {
 		t.Errorf("Authorization = %q, want empty (Ollama is local, no auth)", gotAuth)
 	}
-	if !strings.HasPrefix(gotPath, "/api/tags") {
-		t.Errorf("path = %q, want prefix /api/tags", gotPath)
+	if gotPath != "/tags" {
+		t.Errorf("path = %q, want /tags (BaseURL already has /api; see plan 20260514-discovery-url-doubling)", gotPath)
 	}
 
 	if len(models) != 2 {
@@ -96,5 +96,32 @@ func TestListOllamaModels_HTTPErrorIsPropagated(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "500") {
 		t.Errorf("error missing 500: %v", err)
+	}
+}
+
+// TestListOllamaModels_ProductionShapeBaseURL — initiative
+// 20260514-discovery-url-doubling §8. Ollama uses /api/tags (NOT
+// /v1/models). Asserts path composition works when BaseURL ends
+// in /api (production shape).
+func TestListOllamaModels_ProductionShapeBaseURL(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(ollamaTagsResponse))
+	}))
+	defer srv.Close()
+
+	models, err := listOllamaModels(context.Background(), ListerCredentials{
+		BaseURL: srv.URL + "/api",
+	})
+	if err != nil {
+		t.Fatalf("listOllamaModels: %v", err)
+	}
+	if gotPath != "/api/tags" {
+		t.Errorf("path = %q, want /api/tags (BaseURL already has /api)", gotPath)
+	}
+	if len(models) == 0 {
+		t.Error("expected non-empty model list")
 	}
 }

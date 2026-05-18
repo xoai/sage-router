@@ -2,6 +2,8 @@ import { signal } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
 import { useLocation } from 'wouter-preact';
 import { StatusDot } from '../components/status-dot';
+import { CostCell } from '../components/cost-cell';
+import { fmtCost } from '../utils/format';
 import { getStatus, getUsage, getUsageSummary, getConnections, getRoutingSummary } from '../api/client';
 
 const stats = signal(null);
@@ -59,11 +61,10 @@ function formatTokens(n) {
   return String(n);
 }
 
-function formatCost(n) {
-  if (n >= 1) return '$' + n.toFixed(2);
-  if (n >= 0.01) return '$' + n.toFixed(3);
-  return '$' + n.toFixed(4);
-}
+// formatCost was inlined here; post-review minor #2 consolidates to
+// utils/format.js fmtCost so the StatCard and table cells use the
+// same thresholds.
+const formatCost = fmtCost;
 
 function timeAgo(ts) {
   const diff = (Date.now() - new Date(ts).getTime()) / 1000;
@@ -216,7 +217,13 @@ export function OverviewPage() {
         totalConnections: status.total || 0,
         totalRequests: summary.total_requests || 0,
         totalTokens: summary.total_tokens || 0,
-        totalCost: summary.total_cost || 0,
+        // Post-review minor #4: API Cost = apikey-paid cost only.
+        // `summary.total_cost` sums BOTH cost sources (subscription
+        // contributes $0 today so the math accidentally works), but
+        // `summary.by_cost_source.apikey.cost` is strictly correct
+        // and matches the expression CostSummary uses (cost-summary.jsx:24).
+        totalCost: summary.by_cost_source?.apikey?.cost ?? summary.total_cost ?? 0,
+        subscriptionSavings: summary.subscription_savings || 0,
         byProvider: summary.by_provider || {},
       };
 
@@ -228,7 +235,16 @@ export function OverviewPage() {
           provider: r.provider,
           tokens: r.total_tokens || (r.input_tokens + r.output_tokens),
           latency: formatLatency(r.latency),
+          // Preserve fields needed by <CostCell> (AC-B1): cost source
+          // determines the subscription branch; input/output token counts
+          // gate the "(≈ $X)" parenthetical (AC-B2); estimated_api_cost
+          // is the parenthetical value (enriched server-side by
+          // handleGetUsage per AC-B3).
           cost: r.cost || 0,
+          cost_source: r.cost_source || 'apikey',
+          input_tokens: r.input_tokens || 0,
+          output_tokens: r.output_tokens || 0,
+          estimated_api_cost: r.estimated_api_cost || 0,
           status: r.status === 'ok' || r.status === 'success' ? 'ok' : r.status || 'ok',
         }));
 
@@ -272,7 +288,13 @@ export function OverviewPage() {
       {/* Setup guide (shown until first request) */}
       <SetupGuide conns={connections.value} />
 
-      {/* Stat cards */}
+      {/* Stat cards. SAVED card visibility (AC-A3) is gated by the
+          presence of any subscription connection — apikey-only setups
+          hide it entirely to avoid a perpetual $0.0000 nag; users with
+          a subscription connection see the card immediately, even
+          before any requests fire (surfaces the concept). The
+          flex-wrap container handles 4-vs-5 cards naturally — no CSS
+          grid math (R5 resolved). */}
       <div style={{ display: 'flex', gap: 'var(--space-md)', flexWrap: 'wrap', marginBottom: 'var(--space-xl)' }}>
         <StatCard
           label="Connections"
@@ -282,7 +304,14 @@ export function OverviewPage() {
         />
         <StatCard label="Requests" value={(s.totalRequests || 0).toLocaleString()} />
         <StatCard label="Tokens" value={formatTokens(s.totalTokens || 0)} />
-        <StatCard label="Cost" value={formatCost(s.totalCost || 0)} color="var(--accent)" />
+        <StatCard label="API Cost" value={formatCost(s.totalCost || 0)} color="var(--accent)" />
+        {connections.value.some(c => c.auth_type === 'subscription' && c.state !== 'disabled') && (
+          <StatCard
+            label="Saved"
+            value={formatCost(s.subscriptionSavings || 0)}
+            color="var(--status-green)"
+          />
+        )}
       </div>
 
       {/* Per-provider breakdown */}
@@ -378,7 +407,7 @@ export function OverviewPage() {
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{r.model}</td>
                 <td style={{ padding: '10px 16px', fontSize: 13 }}>{r.provider}</td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right' }}>{r.tokens.toLocaleString()}</td>
-                <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right', color: 'var(--accent)' }}>{formatCost(r.cost)}</td>
+                <td style={{ padding: '10px 16px', textAlign: 'right' }}><CostCell row={r} /></td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right' }}>{r.latency}</td>
                 <td style={{ padding: '10px 16px', textAlign: 'center' }}><StatusDot status={r.status} pulse={r.status === 'cooldown'} /></td>
               </tr>

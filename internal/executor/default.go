@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"sage-router/internal/auth"
 )
 
 // DefaultExecutor is a generic, OpenAI-compatible provider executor.
@@ -36,6 +38,13 @@ func (e *DefaultExecutor) Provider() string {
 // Execute implements Executor. It sends the request body to the provider's
 // /chat/completions endpoint (or a custom endpoint when req.Endpoint is set)
 // and returns the raw upstream response.
+//
+// Cycle 20260517-provider-auth-variants M2.6.1: openai+subscription routing
+// + ExchangedToken preference REMOVED from this executor. The variant
+// abstraction now dispatches (openai, subscription) to CodexSubscriptionExecutor
+// which routes to chatgpt.com/backend-api/codex/responses with the PKCE
+// access_token used directly. DefaultExecutor is the (provider, apikey)
+// variant for openai/openrouter/ollama and stays bare /chat/completions.
 func (e *DefaultExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Result, error) {
 	endpoint := req.Endpoint
 	if endpoint == "" {
@@ -54,14 +63,20 @@ func (e *DefaultExecutor) Execute(ctx context.Context, req *ExecuteRequest) (*Re
 	// claude.go comment for the rationale on dropping the legacy fallback.
 	if req.Credentials != nil {
 		switch req.Credentials.AuthType {
-		case "apikey":
+		case auth.AuthTypeAPIKey:
 			httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.APIKey)
-		case "subscription":
+		case auth.AuthTypeSubscription:
+			// PKCE access_token used directly as Bearer. The variant
+			// abstraction (M1+M2) routes openai+subscription to
+			// CodexSubscriptionExecutor instead; this branch survives for
+			// any (provider, subscription) registered against DefaultExecutor
+			// directly (none today, but the wildcard registration in main.go
+			// keeps the branch viable).
 			httpReq.Header.Set("Authorization", "Bearer "+req.Credentials.AccessToken)
 			for k, v := range req.Credentials.ExtraHeaders {
 				httpReq.Header.Set(k, v)
 			}
-		case "none":
+		case auth.AuthTypeNone:
 			// No auth header needed.
 		default:
 			return nil, fmt.Errorf("%s executor: unsupported auth_type %q for connection %s",

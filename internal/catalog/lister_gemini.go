@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -36,7 +37,10 @@ type geminiModelEntry struct {
 }
 
 func listGeminiModels(ctx context.Context, creds ListerCredentials) ([]Model, error) {
-	url := strings.TrimRight(creds.BaseURL, "/") + "/v1beta/models?key=" + creds.APIKey
+	// BaseURL already includes /v1beta (config.KnownProviders);
+	// append only the resource path. See plan 20260514-discovery-url-doubling.
+	url := strings.TrimRight(creds.BaseURL, "/") + "/models?key=" + creds.APIKey
+	slog.Debug("lister: request URL", "provider", "gemini", "url", url)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("lister gemini: build request: %w", err)

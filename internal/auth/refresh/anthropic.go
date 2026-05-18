@@ -13,5 +13,6 @@ func refreshAnthropic(ctx context.Context, cred *auth.Credential) (*auth.Credent
 	if override, ok := tokenURLOverrides["anthropic"]; ok {
 		url = override
 	}
-	return refreshViaOAuthForm(ctx, cred, url, cfg.ClientID)
+	newCred, _, err := refreshViaOAuthForm(ctx, cred, url, cfg.ClientID)
+	return newCred, err
 }

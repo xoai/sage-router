@@ -7,6 +7,7 @@ import { CommandPalette } from './components/command-palette';
 import { OverviewPage } from './pages/overview';
 import { ProvidersPage } from './pages/providers';
 import { ModelsPage } from './pages/models';
+import { KeysPage } from './pages/keys';
 import { UsagePage } from './pages/usage';
 import { SettingsPage } from './pages/settings';
 import { ConnectPage } from './pages/connect';
@@ -53,6 +54,9 @@ function Dashboard() {
         <Route path="/" component={() => <ErrorBoundary><OverviewPage /></ErrorBoundary>} />
         <Route path="/providers" component={() => <ErrorBoundary><ProvidersPage /></ErrorBoundary>} />
         <Route path="/models" component={() => <ErrorBoundary><ModelsPage /></ErrorBoundary>} />
+        {/* path is BARE — Router base="/dashboard" already prefixes.
+            Setting "/dashboard/keys" here would 404 (spec-review M2). */}
+        <Route path="/keys" component={() => <ErrorBoundary><KeysPage /></ErrorBoundary>} />
         <Route path="/usage" component={() => <ErrorBoundary><UsagePage /></ErrorBoundary>} />
         <Route path="/routing" component={() => <ErrorBoundary><RoutingPage /></ErrorBoundary>} />
         <Route path="/settings" component={() => <ErrorBoundary><SettingsPage /></ErrorBoundary>} />

@@ -1,0 +1,14 @@
+{
+  "source": "claude",
+  "target": "claude",
+  "opts": {
+    "Model": "claude-haiku-4-5-20251001",
+    "Provider": "anthropic",
+    "Stream": false
+  },
+  "body": {
+    "model": "anthropic/claude-haiku-4-5-20251001",
+    "max_tokens": 50,
+    "messages": [{"role": "user", "content": "hi"}]
+  }
+}

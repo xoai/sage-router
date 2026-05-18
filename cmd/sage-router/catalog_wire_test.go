@@ -200,3 +200,150 @@ func TestWireCatalog_OpenRouterSettingIsIdempotent(t *testing.T) {
 		t.Errorf("user-toggled setting was clobbered: got %q, want \"false\"", value)
 	}
 }
+
+// TestSelfHeal_ClearsStaleURLDoublingErrors — initiative
+// 20260514-discovery-url-doubling. Seeds a stale "HTTP 404:" row
+// (matching the lister error format from listerStatusError at
+// internal/catalog/listers.go:104), runs wireCatalog, asserts the
+// row is cleared and the one-shot gate is set.
+func TestSelfHeal_ClearsStaleURLDoublingErrors(t *testing.T) {
+	st := freshDB(t)
+	ctx := context.Background()
+
+	// First wireCatalog seeds provider_meta rows but ALSO runs the
+	// self-heal gate (which finds no stale rows on a fresh DB and
+	// marks itself done). To exercise the clearing path, we need
+	// to clear the gate after seed and inject a stale error before
+	// re-running.
+	if _, err := wireCatalog(ctx, st.DB()); err != nil {
+		t.Fatalf("wireCatalog 1: %v", err)
+	}
+
+	// Clear the gate so a second wireCatalog will actually scan.
+	if _, err := st.DB().ExecContext(ctx,
+		`DELETE FROM settings WHERE key = ?`, selfHealKey,
+	); err != nil {
+		t.Fatalf("clear gate: %v", err)
+	}
+
+	// Inject a stale error matching the pre-fix lister signature.
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE catalog_provider_meta
+		 SET last_discovery_error = 'lister openai: HTTP 404: ',
+		     backoff_step = 2
+		 WHERE provider = 'openai'`,
+	); err != nil {
+		t.Fatalf("inject stale error: %v", err)
+	}
+
+	// Re-run — self-heal should clear the row.
+	if _, err := wireCatalog(ctx, st.DB()); err != nil {
+		t.Fatalf("wireCatalog 2: %v", err)
+	}
+
+	var errText string
+	var backoff int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT last_discovery_error, backoff_step FROM catalog_provider_meta WHERE provider = 'openai'`,
+	).Scan(&errText, &backoff); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if errText != "" {
+		t.Errorf("last_discovery_error = %q, want '' (self-heal didn't clear)", errText)
+	}
+	if backoff != 0 {
+		t.Errorf("backoff_step = %d, want 0 (self-heal didn't reset)", backoff)
+	}
+
+	// Gate must be set after self-heal runs.
+	var gateValue string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = ?`, selfHealKey,
+	).Scan(&gateValue); err != nil {
+		t.Fatalf("read gate: %v", err)
+	}
+	if gateValue != "true" {
+		t.Errorf("self-heal gate = %q, want 'true'", gateValue)
+	}
+}
+
+// TestSelfHeal_DoesNotClearNon404Errors — narrow-match contract.
+// If a future legit non-404 error lands in last_discovery_error
+// (e.g., 401, 500, or a network error), the self-heal must NOT
+// clear it. The match is exact text "HTTP 404:".
+func TestSelfHeal_DoesNotClearNon404Errors(t *testing.T) {
+	st := freshDB(t)
+	ctx := context.Background()
+
+	if _, err := wireCatalog(ctx, st.DB()); err != nil {
+		t.Fatalf("wireCatalog 1: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`DELETE FROM settings WHERE key = ?`, selfHealKey,
+	); err != nil {
+		t.Fatalf("clear gate: %v", err)
+	}
+
+	// Inject a non-404 error.
+	const realErr = "lister openai: HTTP 401: invalid token"
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE catalog_provider_meta
+		 SET last_discovery_error = ?, backoff_step = 1
+		 WHERE provider = 'openai'`, realErr,
+	); err != nil {
+		t.Fatalf("inject 401: %v", err)
+	}
+
+	if _, err := wireCatalog(ctx, st.DB()); err != nil {
+		t.Fatalf("wireCatalog 2: %v", err)
+	}
+
+	var errText string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT last_discovery_error FROM catalog_provider_meta WHERE provider = 'openai'`,
+	).Scan(&errText); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if errText != realErr {
+		t.Errorf("self-heal incorrectly cleared a 401 error: got %q, want %q", errText, realErr)
+	}
+}
+
+// TestSelfHeal_IsOneShot — once the gate is set, subsequent wireCatalog
+// calls must NOT re-run the self-heal. A new 404 error injected AFTER
+// the gate is set must survive.
+func TestSelfHeal_IsOneShot(t *testing.T) {
+	st := freshDB(t)
+	ctx := context.Background()
+
+	// First boot: self-heal runs and sets the gate.
+	if _, err := wireCatalog(ctx, st.DB()); err != nil {
+		t.Fatalf("wireCatalog 1: %v", err)
+	}
+
+	// Inject a new 404 (post-gate) — represents a hypothetical future
+	// 404 from a different cause that we WANT to surface to the user.
+	const postGateErr = "lister openai: HTTP 404: hypothetical-future-cause"
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE catalog_provider_meta
+		 SET last_discovery_error = ?, backoff_step = 1
+		 WHERE provider = 'openai'`, postGateErr,
+	); err != nil {
+		t.Fatalf("inject post-gate 404: %v", err)
+	}
+
+	// Second boot: self-heal must NOT clear because the gate is set.
+	if _, err := wireCatalog(ctx, st.DB()); err != nil {
+		t.Fatalf("wireCatalog 2: %v", err)
+	}
+
+	var errText string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT last_discovery_error FROM catalog_provider_meta WHERE provider = 'openai'`,
+	).Scan(&errText); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if errText != postGateErr {
+		t.Errorf("one-shot gate failed: post-gate 404 was cleared. got %q, want %q", errText, postGateErr)
+	}
+}

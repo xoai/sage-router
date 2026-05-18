@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -34,12 +35,27 @@ type openaiModelEntry struct {
 }
 
 func listOpenAIModels(ctx context.Context, creds ListerCredentials) ([]Model, error) {
-	url := strings.TrimRight(creds.BaseURL, "/") + "/v1/models"
+	// BaseURL already includes the /v1 segment (config.KnownProviders);
+	// append only the resource path. Mirrors the request executor pattern
+	// at internal/executor/default.go:42-44. Pre-fix the lister appended
+	// "/v1/models" and produced "/v1/v1/models" → 404. See plan
+	// 20260514-discovery-url-doubling.
+	url := strings.TrimRight(creds.BaseURL, "/") + "/models"
+	slog.Debug("lister: request URL", "provider", "openai", "url", url)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("lister openai: build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+creds.APIKey)
+	// Prefer the subscription access token when present; fall back to
+	// the API key. Mirrors the executor's auth-type-aware precedence at
+	// internal/executor/default.go:55-69 — the docstring contract at
+	// listers.go:21-27 promises "AccessToken takes precedence" and this
+	// is where it's enforced.
+	token := creds.AccessToken
+	if token == "" {
+		token = creds.APIKey
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	for k, v := range creds.ExtraHeaders {
 		req.Header.Set(k, v)
 	}

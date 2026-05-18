@@ -15,6 +15,7 @@ type ConnRow struct {
 	Provider     string
 	AccessToken  string
 	RefreshToken string
+	// ExchangedToken removed in cycle 20260517-provider-auth-variants M2.6.3.
 	ExpiresAt    *time.Time
 	ProviderData []byte
 }

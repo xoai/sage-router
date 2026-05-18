@@ -36,6 +36,20 @@ const navItems = [
     ),
   },
   {
+    // Cycle 20260516-keys-management-redesign: dedicated keys management
+    // page. Sits between Models and Usage in the nav order.
+    path: '/keys',
+    label: 'API Keys',
+    icon: (
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="8" cy="15" r="4" />
+        <path d="M10.85 12.15L21 2" />
+        <path d="M18 5l3 3" />
+        <path d="M15 8l3 3" />
+      </svg>
+    ),
+  },
+  {
     path: '/usage',
     label: 'Usage',
     icon: (

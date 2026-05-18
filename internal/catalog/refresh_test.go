@@ -9,9 +9,11 @@ import (
 
 // credsForAll is a CredentialsLookup that returns a fixed
 // ListerCredentials for every provider — adequate for tests that
-// don't care about per-provider auth.
-func credsForAll(_ string) (ListerCredentials, bool) {
-	return ListerCredentials{BaseURL: "https://example.test", APIKey: "test"}, true
+// don't care about per-provider auth. authType is "apikey" so the
+// 24h ticker's DiscoveryListerKey dispatch resolves to the
+// provider's own lister (no mirror routing).
+func credsForAll(_ string) (ListerCredentials, string, bool) {
+	return ListerCredentials{BaseURL: "https://example.test", APIKey: "test"}, "apikey", true
 }
 
 // TestRefresh_TicksAfterInitialSettle — the ticker fires once after
@@ -206,8 +208,8 @@ func TestRefresh_SkipsProviderWithMissingCredentials(t *testing.T) {
 		}},
 	})
 
-	results := runner.DiscoverAll(ctx, func(_ string) (ListerCredentials, bool) {
-		return ListerCredentials{}, false // no creds available
+	results := runner.DiscoverAll(ctx, func(_ string) (ListerCredentials, string, bool) {
+		return ListerCredentials{}, "", false // no creds available
 	})
 
 	if len(results) != 0 {

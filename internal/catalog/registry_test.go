@@ -69,6 +69,11 @@ func (d *reentranceDetector) ListProviderMetas(ctx context.Context) ([]ProviderM
 	return d.inner.ListProviderMetas(ctx)
 }
 
+func (d *reentranceDetector) ListModelIDsForProviders(ctx context.Context, providers []string) (map[string][]string, error) {
+	d.check("ListModelIDsForProviders")
+	return d.inner.ListModelIDsForProviders(ctx, providers)
+}
+
 // TestRegistry_NoStoreCallsUnderMu — AC31. Verifies the runtime
 // contract that Registry never holds its own mu while calling Store
 // methods. Exercises every Registry-public method (Lookup, Pricing,
@@ -280,4 +285,7 @@ func (c *callCountingStore) GetProviderMeta(ctx context.Context, p string) (*Pro
 }
 func (c *callCountingStore) ListProviderMetas(ctx context.Context) ([]ProviderMeta, error) {
 	return c.inner.ListProviderMetas(ctx)
+}
+func (c *callCountingStore) ListModelIDsForProviders(ctx context.Context, providers []string) (map[string][]string, error) {
+	return c.inner.ListModelIDsForProviders(ctx, providers)
 }

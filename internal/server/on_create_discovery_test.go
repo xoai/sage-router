@@ -10,10 +10,49 @@ import (
 	"testing"
 	"time"
 
+	"sage-router/internal/auth"
 	"sage-router/internal/catalog"
 	"sage-router/internal/provider"
 	"sage-router/internal/store"
 )
+
+// testAuthAdapter is the minimum surface auth.AuthStore needs to read
+// connection rows in tests. Mirrors cmd/sage-router/auth_wire.go's
+// adapter but lives in the server-test package since the cmd adapter
+// can't be imported here.
+type testAuthAdapter struct {
+	s store.Store
+}
+
+func (a *testAuthAdapter) GetConnection(id string) (*auth.ConnRow, error) {
+	c, err := a.s.GetConnection(id)
+	if err != nil {
+		return nil, err
+	}
+	if c == nil {
+		return nil, nil
+	}
+	return &auth.ConnRow{
+		ID:           c.ID,
+		Provider:     c.Provider,
+		AccessToken:  c.AccessToken,
+		RefreshToken: c.RefreshToken,
+		ExpiresAt:    c.ExpiresAt,
+		ProviderData: []byte(c.ProviderData),
+	}, nil
+}
+
+func (a *testAuthAdapter) UpdateConnection(id string, updates map[string]any) error {
+	return a.s.UpdateConnection(id, updates)
+}
+
+func (a *testAuthAdapter) BumpConnectionRefreshFailures(id string) (int, error) {
+	return a.s.BumpConnectionRefreshFailures(id)
+}
+
+func (a *testAuthAdapter) GetConnectionRefreshFailures(id string) (int, error) {
+	return a.s.GetConnectionRefreshFailures(id)
+}
 
 // fakeLister captures the credentials passed in + returns canned
 // results. Used by the on-create-discovery hook tests so we don't
@@ -56,6 +95,11 @@ func newDiscoveryServer(t *testing.T, listers map[string]catalog.ModelLister) (*
 			CatalogStore:     cs,
 			Discovery:        catalog.NewDiscoveryRunner(cs, listers),
 			ProviderSelector: provider.NewSelector(),
+			// AuthStore is wired so buildListerCredentials can surface
+			// provider-specific ExtraHeaders (e.g., ChatGPT-Account-ID)
+			// for subscription connections — same pattern as production
+			// main.go:179.
+			AuthStore: auth.NewAuthStore(&testAuthAdapter{s: st}),
 		},
 	}
 	return srv, st, cs
@@ -171,8 +215,13 @@ func TestCreateConnection_Subscription_DiscoverableTrue_TriggersDiscovery(t *tes
 			{Provider: "openai", ModelID: "gpt-4.1", Tier: catalog.TierFrontier},
 		},
 	}
+	// Subscription openai dispatches to the openrouter-mirror lister
+	// per catalog.DiscoveryListerKey (fix 20260514-openrouter-fallback).
+	// Register the fake under that key so the test exercises the
+	// production dispatch path.
 	srv, _, _ := newDiscoveryServer(t, map[string]catalog.ModelLister{
-		"openai": lister,
+		"openai":                   lister,
+		"openai@codex-subscription": lister,
 	})
 
 	code := postCreateConnection(t, srv, store.Connection{
