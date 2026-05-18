@@ -108,17 +108,19 @@ The new model picks up exactly where the old one left off. No repeated explanati
 ## Quick Start
 
 ```bash
-# Option 1: Install script (Linux/macOS)
-curl -fsSL https://sage-router.dev/install.sh | sh
+# Option 1: Docker (multi-arch: linux/amd64 + linux/arm64)
+docker run -d --name sage-router \
+  -p 20128:20128 \
+  -v sage-data:/home/sage/.sage-router \
+  xoai/sage-router:latest
 
-# Option 2: Docker
-docker run -p 20128:20128 -v sage-data:/home/sage/.sage-router ghcr.io/sage-router/sage-router
-
-# Option 3: Build from source
+# Option 2: Build from source
 git clone https://github.com/sage-router/sage-router && cd sage-router
 make build
 ./bin/sage-router
 ```
+
+See the [Docker](#docker) section below for full setup, persistence, and build-from-source instructions.
 
 On first run, Sage Router prints a one-click setup URL:
 
@@ -209,6 +211,84 @@ export OPENAI_API_KEY="sk-sage-YOUR-KEY"
 aider
 ```
 
+## Docker
+
+Sage Router publishes multi-architecture images to Docker Hub at
+[`xoai/sage-router`](https://hub.docker.com/r/xoai/sage-router). Both
+`linux/amd64` and `linux/arm64` are supported — Docker auto-selects the
+right one for your host (works natively on Apple Silicon, AWS Graviton,
+Raspberry Pi 4+, and standard x86 servers).
+
+### Pull and run
+
+```bash
+docker run -d --name sage-router \
+  -p 20128:20128 \
+  -v sage-data:/home/sage/.sage-router \
+  xoai/sage-router:latest
+```
+
+The container exposes the dashboard at `http://127.0.0.1:20128/dashboard`.
+On first run, fetch the one-time setup token from the container logs:
+
+```bash
+docker logs sage-router
+```
+
+Look for the boxed banner with `First-run setup: http://127.0.0.1:20128/dashboard/?token=...` — copy that URL into a browser to create your dashboard password.
+
+### Persistence
+
+The named volume `sage-data` mounted at `/home/sage/.sage-router` holds
+the SQLite database — provider connections, encrypted credentials, API
+keys, usage history, routing telemetry. **Don't delete this volume**
+unless you want to start over.
+
+To inspect it:
+
+```bash
+docker volume inspect sage-data
+```
+
+To back it up:
+
+```bash
+docker run --rm -v sage-data:/data -v "$(pwd):/backup" alpine \
+  tar czf /backup/sage-data-backup.tar.gz -C /data .
+```
+
+### Updating
+
+```bash
+docker pull xoai/sage-router:latest
+docker stop sage-router && docker rm sage-router
+# then re-run the original `docker run` command — volume preserved
+```
+
+### Build locally
+
+```bash
+# Single-arch, tagged with the git version
+make docker
+
+# Or directly
+docker build -t sage-router:dev .
+```
+
+### Build + push multi-arch (for forks)
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag <your-user>/sage-router:latest \
+  --push .
+```
+
+Requires `docker buildx` (bundled with Docker Desktop) and a logged-in
+Docker Hub session (`docker login`). The build cross-compiles both the
+dashboard (Node 22) and the Go binary (Go 1.25) inside the container —
+no toolchain needed on the host beyond Docker itself.
+
 ## Dashboard
 
 Sage Router includes a built-in web dashboard for:
@@ -267,7 +347,7 @@ Adding a new provider is O(1) work — write a translator, register it.
 ## Development
 
 ```bash
-# Prerequisites: Go 1.22+, Node.js 22+
+# Prerequisites: Go 1.25+, Node.js 22+
 
 # Build everything (dashboard + binary)
 make build
