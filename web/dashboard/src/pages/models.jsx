@@ -35,6 +35,19 @@ const pricingDraft = signal({
   thinking_price: '0',
 });
 
+// Typed-name delete confirmation modals — mirrors the keys.jsx blueprint
+// at keys.jsx:29-30,98-113,392-466 (cycle: add-confirm-to-alias-combo-delete).
+// Two pairs of signals; separate state names are clearer than one shared
+// `deleting` signal at the cost of needing the cross-clear guard in each
+// opener function to ENFORCE mutual exclusion (otherwise both modals
+// could theoretically render at the same zIndex via scripted paths).
+// Backend invariant: alias/combo names are non-empty; matches keys.jsx's
+// empty-prefix assumption.
+const deletingAlias = signal(null);
+const deleteAliasInput = signal('');
+const deletingCombo = signal(null);
+const deleteComboInput = signal('');
+
 function loadAliases() {
   getAliases().then(data => {
     if (data && typeof data === 'object' && !Array.isArray(data)) {
@@ -258,10 +271,51 @@ function handleSaveCombo() {
   });
 }
 
-function handleDeleteCombo(id, name) {
-  deleteCombo(id).then(() => {
-    addToast(`Combo "${name}" deleted`, 'info');
+// Opens the typed-name delete confirmation modal for a combo.
+// The actual API call lives in handleDeleteComboConfirm below — split
+// per the typed-confirm pattern (keys.jsx blueprint).
+// Cross-clear alias state to enforce the mutual-exclusion invariant
+// noted at the signal declarations above (post-ship /review m2 fold).
+function openDeleteComboModal(combo) {
+  deletingAlias.value = null;
+  deleteAliasInput.value = '';
+  deletingCombo.value = combo;
+  deleteComboInput.value = '';
+}
+
+function handleDeleteComboConfirm() {
+  const combo = deletingCombo.value;
+  if (!combo) return;
+  if (deleteComboInput.value !== combo.name) {
+    addToast('Type the combo name exactly to confirm', 'warning');
+    return;
+  }
+  deleteCombo(combo.id).then(() => {
+    addToast(`Combo "${combo.name}" deleted`, 'success');
+    deletingCombo.value = null;
+    deleteComboInput.value = '';
     loadCombos();
+  }).catch(err => {
+    addToast('Failed: ' + err.message, 'error');
+  });
+}
+
+// Alias counterpart of the same pattern. The AliasRow's button now
+// calls openDeleteAliasModal directly (closure over `alias`); the
+// gated API call lives at module level so the modal can read shared
+// state (deletingAlias / deleteAliasInput).
+function handleDeleteAliasConfirm() {
+  const alias = deletingAlias.value;
+  if (!alias) return;
+  if (deleteAliasInput.value !== alias.name) {
+    addToast('Type the alias name exactly to confirm', 'warning');
+    return;
+  }
+  deleteAlias(alias.name).then(() => {
+    addToast(`Alias "${alias.name}" deleted`, 'success');
+    deletingAlias.value = null;
+    deleteAliasInput.value = '';
+    loadAliases();
   }).catch(err => {
     addToast('Failed: ' + err.message, 'error');
   });
@@ -312,13 +366,14 @@ function AliasRow({ alias }) {
 
   const cancelEdit = () => { editingAlias.value = null; };
 
+  // Opens the typed-name confirm modal (closure captures `alias`).
+  // The actual API call lives in module-level handleDeleteAliasConfirm.
+  // Cross-clear combo state to enforce mutual exclusion (post-ship m2).
   const handleDelete = () => {
-    deleteAlias(alias.name).then(() => {
-      addToast(`Alias "${alias.name}" deleted`, 'info');
-      loadAliases();
-    }).catch(err => {
-      addToast('Failed: ' + err.message, 'error');
-    });
+    deletingCombo.value = null;
+    deleteComboInput.value = '';
+    deletingAlias.value = alias;
+    deleteAliasInput.value = '';
   };
 
   return (
@@ -383,7 +438,7 @@ function ComboCard({ combo }) {
           </span>
         </div>
         <button
-          onClick={() => handleDeleteCombo(combo.id, combo.name)}
+          onClick={() => openDeleteComboModal(combo)}
           style={{ fontSize: 11, color: 'var(--status-red)', padding: '3px 8px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
         >
           Delete
@@ -752,6 +807,185 @@ export function ModelsPage() {
                 }}
               >
                 Create Combo
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete confirmation: alias.
+          Mirrors keys.jsx:392-466 — backdrop click + Cancel both clear
+          the signal; Delete is disabled until input matches alias.name. */}
+      {deletingAlias.value && (
+        <div
+          onClick={() => { deletingAlias.value = null; }}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+            backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center',
+            justifyContent: 'center', zIndex: 9000,
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: 'var(--bg-1)',
+              border: '1px solid var(--border-hover)',
+              borderRadius: 'var(--radius-xl)',
+              padding: 'var(--space-xl)',
+              width: 460,
+              maxWidth: '92vw',
+            }}
+          >
+            <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 'var(--space-md)' }}>
+              Delete alias?
+            </h3>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 'var(--space-md)', lineHeight: 1.4 }}>
+              This permanently removes the alias <strong>{deletingAlias.value.name}</strong>.
+              Any tool referencing this alias as a model name will fail on next request.
+              Type the alias name to confirm:
+            </div>
+            <div style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 12,
+              color: 'var(--text-tertiary)',
+              marginBottom: 6,
+            }}>
+              {deletingAlias.value.name}
+            </div>
+            <input
+              type="text"
+              value={deleteAliasInput.value}
+              onInput={e => { deleteAliasInput.value = e.target.value; }}
+              autoFocus
+              style={{
+                width: '100%',
+                padding: '8px 10px',
+                background: 'var(--bg-2)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-md)',
+                color: 'var(--text-primary)',
+                fontSize: 13,
+                fontFamily: 'var(--font-mono)',
+                marginBottom: 'var(--space-lg)',
+              }}
+            />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => { deletingAlias.value = null; }}
+                style={{
+                  padding: '6px 14px', fontSize: 13,
+                  color: 'var(--text-secondary)',
+                  background: 'var(--bg-2)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-md)',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteAliasConfirm}
+                disabled={deleteAliasInput.value !== deletingAlias.value.name}
+                style={{
+                  padding: '6px 14px', fontSize: 13,
+                  color: 'var(--text-primary)',
+                  background: deleteAliasInput.value === deletingAlias.value.name ? 'var(--status-red)' : 'var(--bg-2)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-md)',
+                  cursor: deleteAliasInput.value === deletingAlias.value.name ? 'pointer' : 'not-allowed',
+                  opacity: deleteAliasInput.value === deletingAlias.value.name ? 1 : 0.5,
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete confirmation: combo. Same scaffolding as alias modal,
+          targeting combo.name. */}
+      {deletingCombo.value && (
+        <div
+          onClick={() => { deletingCombo.value = null; }}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+            backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center',
+            justifyContent: 'center', zIndex: 9000,
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: 'var(--bg-1)',
+              border: '1px solid var(--border-hover)',
+              borderRadius: 'var(--radius-xl)',
+              padding: 'var(--space-xl)',
+              width: 460,
+              maxWidth: '92vw',
+            }}
+          >
+            <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 'var(--space-md)' }}>
+              Delete combo?
+            </h3>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 'var(--space-md)', lineHeight: 1.4 }}>
+              This permanently removes the combo <strong>{deletingCombo.value.name}</strong>.
+              Any tool using this combo as a model name will fail on next request.
+              Type the combo name to confirm:
+            </div>
+            <div style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 12,
+              color: 'var(--text-tertiary)',
+              marginBottom: 6,
+            }}>
+              {deletingCombo.value.name}
+            </div>
+            <input
+              type="text"
+              value={deleteComboInput.value}
+              onInput={e => { deleteComboInput.value = e.target.value; }}
+              autoFocus
+              style={{
+                width: '100%',
+                padding: '8px 10px',
+                background: 'var(--bg-2)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-md)',
+                color: 'var(--text-primary)',
+                fontSize: 13,
+                fontFamily: 'var(--font-mono)',
+                marginBottom: 'var(--space-lg)',
+              }}
+            />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => { deletingCombo.value = null; }}
+                style={{
+                  padding: '6px 14px', fontSize: 13,
+                  color: 'var(--text-secondary)',
+                  background: 'var(--bg-2)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-md)',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteComboConfirm}
+                disabled={deleteComboInput.value !== deletingCombo.value.name}
+                style={{
+                  padding: '6px 14px', fontSize: 13,
+                  color: 'var(--text-primary)',
+                  background: deleteComboInput.value === deletingCombo.value.name ? 'var(--status-red)' : 'var(--bg-2)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-md)',
+                  cursor: deleteComboInput.value === deletingCombo.value.name ? 'pointer' : 'not-allowed',
+                  opacity: deleteComboInput.value === deletingCombo.value.name ? 1 : 0.5,
+                }}
+              >
+                Delete
               </button>
             </div>
           </div>
