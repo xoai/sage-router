@@ -2,6 +2,7 @@
 bin/
 dist/
 *.exe
+/scenario-live-test
 
 # Dependencies
 web/dashboard/node_modules/
