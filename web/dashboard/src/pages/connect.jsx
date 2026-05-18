@@ -1,29 +1,29 @@
 import { signal, computed } from '@preact/signals';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useRef } from 'preact/hooks';
+import { useLocation } from 'wouter-preact';
 import { CopyButton } from '../components/copy-button';
-import { getKeys, createKey, updateKey, deleteKey, getModels, getCombos } from '../api/client';
-import { addToast } from '../components/toast';
+import { getKeys, getModels, getCombos } from '../api/client';
+import { parseEntries } from '../components/model-picker-helpers';
+import { filterAllowed, pickInitialSelection, getConfigFile } from './connect-helpers';
+
+// ConnectPage — read-only guide for setting up external tools/IDEs
+// against sage-router. Cycle 20260518-connect-page-guide removed all
+// key-management surfaces (KeyCreateWizard, '+ New', 'Manage keys →')
+// — /keys is now the single home for key CRUD. This page is a pure
+// picker → filtered model/combo → tool → config-snippet flow.
 
 const endpointUrl = signal(window.location.origin);
 const activeTool = signal('claude-code');
 
-// ── Delete confirmation state ──
-const deleteConfirmKey = signal(null);   // key object being confirmed
-const deleteConfirmInput = signal('');
-
-// ── Edit key state ──
-const editingKey = signal(null);
-const editForm = signal({});
-
-// ── API Keys state ──
+// API Keys state — picker only.
 const allKeys = signal([]);
 const selectedKeyId = signal('');
-const newKeyName = signal('');
-const newKeyValue = signal(null);   // full key, only after creation
-const newKeyId = signal(null);      // id of just-created key
-const creatingKey = signal(false);
 
-// ── Model selection state ──
+// Searchable picker state.
+const keyPopoverOpen = signal(false);
+const keySearch = signal('');
+
+// Model selection state.
 const availableModels = signal([]);
 const allCombos = signal([]);
 const modelMode = signal('single');
@@ -44,12 +44,7 @@ const tools = [
   { id: 'generic', label: 'Generic OpenAI API' },
 ];
 
-// ── Computed: active key display for instructions ──
 const activeKeyDisplay = computed(() => {
-  // If a key was just created and is selected, show the full key
-  if (newKeyValue.value && newKeyId.value === selectedKeyId.value) {
-    return newKeyValue.value;
-  }
   const key = allKeys.value.find(k => k.id === selectedKeyId.value);
   if (!key) return '<your-api-key>';
   return key.prefix + '********************************';
@@ -63,15 +58,11 @@ const activeModel = computed(() => {
 // ── Loaders ──
 
 function loadKeys() {
-  getKeys().then(data => {
-    if (Array.isArray(data)) {
-      allKeys.value = data;
-      // Auto-select newly created key, or first key if none selected
-      if (newKeyId.value && data.find(k => k.id === newKeyId.value)) {
-        selectedKeyId.value = newKeyId.value;
-      } else if (data.length > 0 && !selectedKeyId.value) {
-        selectedKeyId.value = data[0].id;
-      }
+  getKeys().then(res => {
+    const items = Array.isArray(res?.items) ? res.items : [];
+    allKeys.value = items;
+    if (items.length > 0 && !selectedKeyId.value) {
+      selectedKeyId.value = items[0].id;
     }
   }).catch(() => {});
 }
@@ -98,90 +89,6 @@ function loadCombos() {
   }).catch(() => {});
 }
 
-function getNextKeyName() {
-  const existing = allKeys.value.map(k => k.name);
-  if (!existing.includes('Default')) return 'Default';
-  let i = 2;
-  while (existing.includes(`Default ${i}`)) i++;
-  return `Default ${i}`;
-}
-
-function handleCreateKey() {
-  const name = newKeyName.value.trim() || getNextKeyName();
-  creatingKey.value = true;
-  createKey({ name }).then(data => {
-    newKeyValue.value = data.key;
-    newKeyId.value = data.id;
-    selectedKeyId.value = data.id;
-    newKeyName.value = '';
-    addToast('API key created — copy it now', 'success');
-    creatingKey.value = false;
-    loadKeys();
-  }).catch(err => {
-    addToast('Failed: ' + err.message, 'error');
-    creatingKey.value = false;
-  });
-}
-
-function requestDeleteKey(key) {
-  deleteConfirmKey.value = key;
-  deleteConfirmInput.value = '';
-}
-
-function confirmDeleteKey() {
-  const key = deleteConfirmKey.value;
-  if (!key || deleteConfirmInput.value !== key.name) return;
-
-  deleteKey(key.id).then(() => {
-    allKeys.value = allKeys.value.filter(k => k.id !== key.id);
-    if (selectedKeyId.value === key.id) {
-      selectedKeyId.value = allKeys.value.length > 0 ? allKeys.value[0].id : '';
-      newKeyValue.value = null;
-      newKeyId.value = null;
-    }
-    deleteConfirmKey.value = null;
-    deleteConfirmInput.value = '';
-    addToast('Key deleted', 'info');
-    loadKeys();
-  }).catch(err => {
-    addToast('Failed: ' + err.message, 'error');
-    deleteConfirmKey.value = null;
-  });
-}
-
-function cancelDeleteKey() {
-  deleteConfirmKey.value = null;
-  deleteConfirmInput.value = '';
-}
-
-function openEditKey(key) {
-  editingKey.value = key;
-  editForm.value = {
-    name: key.name || '',
-    budget_monthly: key.budget_monthly || 0,
-    budget_hard_limit: key.budget_hard_limit || false,
-    allowed_models: key.allowed_models || '*',
-    rate_limit_rpm: key.rate_limit_rpm || 0,
-    routing_strategy: key.routing_strategy || '',
-  };
-}
-
-function saveEditKey() {
-  const key = editingKey.value;
-  if (!key) return;
-  updateKey(key.id, editForm.value).then(() => {
-    addToast('Key updated', 'success');
-    editingKey.value = null;
-    loadKeys();
-  }).catch(err => {
-    addToast('Failed: ' + err.message, 'error');
-  });
-}
-
-function cancelEditKey() {
-  editingKey.value = null;
-}
-
 // ── Components ──
 
 function CodeBlock({ code, lang = '' }) {
@@ -205,12 +112,27 @@ function CodeBlock({ code, lang = '' }) {
   );
 }
 
+// Button styled as inline text-link — matches the dashboard's
+// "navigate via setLocation" idiom while LOOKING like a link.
+function LinkButton({ onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: 'transparent', border: 'none', padding: 0,
+        color: 'var(--accent)', textDecoration: 'underline',
+        cursor: 'pointer', font: 'inherit',
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 function getInstructions(tool) {
   const url = endpointUrl.value;
   const key = activeKeyDisplay.value;
   const model = activeModel.value;
-
-  // Most tools use OpenAI-compatible config
   const openaiEnv = `export OPENAI_BASE_URL="${url}/v1"\nexport OPENAI_API_KEY="${key}"`;
 
   switch (tool) {
@@ -226,41 +148,40 @@ function getInstructions(tool) {
     case 'codex':
       return {
         title: 'Codex CLI',
-        description: 'Point Codex CLI at Sage Router.',
+        description: 'Configure the OpenAI-compatible base URL, then launch Codex.',
         steps: [
           { label: 'Set environment variables', code: openaiEnv, lang: 'bash' },
-          { label: 'Run', code: `codex --model "${model}"`, lang: 'bash' },
+          { label: 'Run', code: 'codex', lang: 'bash' },
         ],
       };
     case 'cursor':
       return {
         title: 'Cursor',
-        description: 'Settings > Models > OpenAI API configuration.',
+        description: 'Settings → Models → Override OpenAI Base URL.',
         steps: [
-          { label: 'OpenAI API Key', code: key, lang: 'text' },
-          { label: 'Override OpenAI Base URL', code: `${url}/v1`, lang: 'text' },
-          { label: 'Model name', code: model, lang: 'text' },
+          { label: 'OpenAI Base URL', code: `${url}/v1`, lang: '' },
+          { label: 'API Key', code: key, lang: '' },
+          { label: 'Model', code: model, lang: '' },
         ],
       };
     case 'cline':
       return {
-        title: 'Cline',
-        description: 'Set API Provider to "OpenAI Compatible" in Cline settings.',
+        title: 'Cline (VSCode)',
+        description: 'Settings → Cline → OpenAI-compatible provider.',
         steps: [
-          { label: 'Base URL', code: `${url}/v1`, lang: 'text' },
-          { label: 'API Key', code: key, lang: 'text' },
-          { label: 'Model', code: model, lang: 'text' },
+          { label: 'Base URL', code: `${url}/v1`, lang: '' },
+          { label: 'API Key', code: key, lang: '' },
+          { label: 'Model', code: model, lang: '' },
         ],
       };
     case 'windsurf':
       return {
         title: 'Windsurf',
-        description: 'Configure Windsurf to use Sage Router as an OpenAI-compatible endpoint.',
+        description: 'Settings → AI → OpenAI provider override.',
         steps: [
-          { label: 'In Windsurf settings, add OpenAI-compatible provider', code: '', lang: '' },
-          { label: 'Base URL', code: `${url}/v1`, lang: 'text' },
-          { label: 'API Key', code: key, lang: 'text' },
-          { label: 'Model', code: model, lang: 'text' },
+          { label: 'Base URL', code: `${url}/v1`, lang: '' },
+          { label: 'API Key', code: key, lang: '' },
+          { label: 'Model', code: model, lang: '' },
         ],
       };
     case 'continue':
@@ -268,51 +189,45 @@ function getInstructions(tool) {
         title: 'Continue',
         description: 'Add to ~/.continue/config.json or VS Code settings.',
         steps: [
-          { label: 'Add to config.json models array', code: JSON.stringify({ title: "Sage Router", provider: "openai", model: model, apiBase: `${url}/v1`, apiKey: key }, null, 2), lang: 'json' },
+          { label: 'Add to config.json models array', code: `{\n  "title": "Sage Router",\n  "provider": "openai",\n  "model": "${model}",\n  "apiBase": "${url}/v1",\n  "apiKey": "${key}"\n}`, lang: 'json' },
         ],
       };
     case 'aider':
       return {
         title: 'Aider',
-        description: 'Set environment variables, then run aider.',
+        description: 'Set environment variables, then launch Aider.',
         steps: [
           { label: 'Set environment variables', code: openaiEnv, lang: 'bash' },
-          { label: 'Run', code: `aider --model "openai/${model}"`, lang: 'bash' },
+          { label: 'Run', code: `aider --model openai/${model}`, lang: 'bash' },
         ],
       };
     case 'antigravity':
       return {
         title: 'Antigravity',
-        description: 'Configure Antigravity to route through Sage Router.',
+        description: 'OpenAI-compatible provider.',
         steps: [
-          { label: 'Set environment variables', code: `export ANTHROPIC_BASE_URL="${url}"\nexport ANTHROPIC_API_KEY="${key}"`, lang: 'bash' },
-          { label: 'Run', code: 'antigravity', lang: 'bash' },
+          { label: 'Base URL', code: `${url}/v1`, lang: '' },
+          { label: 'API Key', code: key, lang: '' },
+          { label: 'Model', code: model, lang: '' },
         ],
       };
     case 'openclaw':
-      return {
-        title: 'OpenClaw',
-        description: 'Configure OpenClaw to use Sage Router.',
-        steps: [
-          { label: 'Set environment variables', code: openaiEnv, lang: 'bash' },
-          { label: 'Run', code: `openclaw --model "${model}"`, lang: 'bash' },
-        ],
-      };
     case 'opencode':
       return {
-        title: 'OpenCode',
-        description: 'Configure OpenCode to use Sage Router.',
+        title: tool === 'openclaw' ? 'OpenClaw' : 'OpenCode',
+        description: 'Anthropic-compatible provider.',
         steps: [
-          { label: 'Set environment variables', code: openaiEnv, lang: 'bash' },
-          { label: 'Run', code: 'opencode', lang: 'bash' },
+          { label: 'Base URL', code: url, lang: '' },
+          { label: 'API Key', code: key, lang: '' },
+          { label: 'Model', code: model, lang: '' },
         ],
       };
     case 'generic':
       return {
-        title: 'Generic OpenAI API',
-        description: 'Use with any OpenAI-compatible client or SDK.',
+        title: 'Generic OpenAI-compatible API',
+        description: 'Most OpenAI SDK clients work out of the box.',
         steps: [
-          { label: 'cURL example', code: `curl ${url}/v1/chat/completions \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "${model}",\n    "messages": [{"role": "user", "content": "Hello"}]\n  }'`, lang: 'bash' },
+          { label: 'cURL', code: `curl ${url}/v1/chat/completions \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "${model}",\n    "messages": [{"role": "user", "content": "Hello"}]\n  }'`, lang: 'bash' },
           { label: 'Python (openai SDK)', code: `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${url}/v1",\n    api_key="${key}",\n)\n\nresponse = client.chat.completions.create(\n    model="${model}",\n    messages=[{"role": "user", "content": "Hello"}],\n)`, lang: 'python' },
         ],
       };
@@ -324,19 +239,101 @@ function getInstructions(tool) {
 // ── Page ──
 
 export function ConnectPage() {
+  const [, setLocation] = useLocation();
+  const popoverRef = useRef(null);
+  const searchInputRef = useRef(null);
+
   useEffect(() => {
     loadKeys();
     loadModels();
     loadCombos();
   }, []);
 
+  // Allowed-models filter derived from the selected key.
+  const selectedKey = allKeys.value.find(k => k.id === selectedKeyId.value);
+  const allowedEntries = parseEntries(selectedKey?.allowed_models || '*');
+  const filteredModels = filterAllowed(availableModels.value, allowedEntries, 'id');
+  const filteredCombos = filterAllowed(allCombos.value, allowedEntries, 'name');
+
+  // Auto-reset when key OR catalog/combos change. The catalog deps
+  // (availableModels.value, allCombos.value) cover the initial-load
+  // race: loadKeys/loadModels/loadCombos fire in parallel from
+  // useEffect(...,[]) above, and loadModels assigns
+  // selectedModel.value = data[0].id unconditionally — if that
+  // model isn't in the first key's allowed_models the user would
+  // see a stale snippet on first paint without this dep. Effect
+  // captures filteredModels/filteredCombos from render closure;
+  // pickInitialSelection is idempotent (returns currentValue when
+  // it's still valid), so no infinite loop.
+  useEffect(() => {
+    selectedModel.value = pickInitialSelection(selectedModel.value, filteredModels, 'id');
+    selectedCombo.value = pickInitialSelection(selectedCombo.value, filteredCombos, 'name');
+  }, [selectedKeyId.value, availableModels.value, allCombos.value]);
+
+  // Popover: auto-focus search input on open, ESC + click-outside close.
+  // Mirrors usage.jsx:151-173 idiom (cycle 20260517 T9b).
+  useEffect(() => {
+    if (!keyPopoverOpen.value) return undefined;
+    // Auto-focus search input on open (NEW behavior — not inherited).
+    setTimeout(() => searchInputRef.current?.focus(), 0);
+    const onKey = e => { if (e.key === 'Escape') keyPopoverOpen.value = false; };
+    const onClick = e => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target)) {
+        keyPopoverOpen.value = false;
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    // Belt-and-suspenders: trigger button calls e.stopPropagation;
+    // setTimeout defers listener attach so the opening click doesn't
+    // immediately close. Both guards intentional.
+    const t = setTimeout(() => document.addEventListener('click', onClick), 0);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('click', onClick);
+    };
+  }, [keyPopoverOpen.value]);
+
+  // Filtered keys for the popover search.
+  const filteredKeys = allKeys.value.filter(k => {
+    if (!keySearch.value) return true;
+    const q = keySearch.value.toLowerCase();
+    return (k.name || '').toLowerCase().includes(q)
+      || (k.prefix || '').toLowerCase().includes(q);
+  });
+
+  const triggerLabel = selectedKey
+    ? `${selectedKey.name}  ${selectedKey.prefix}…`
+    : 'Pick an API key';
+
+  // Empty-state: zero keys → guide prose only, no Step 2/3 sections.
+  if (allKeys.value.length === 0) {
+    return (
+      <div style={{ padding: 'var(--space-2xl)', maxWidth: 760, width: '100%' }}>
+        <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 'var(--space-xl)' }}>Connect</h1>
+        <section style={{
+          background: 'var(--bg-1)', border: '1px solid var(--border)',
+          borderRadius: 'var(--radius-lg)', padding: 'var(--space-lg)',
+        }}>
+          <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: 0 }}>
+            No API keys yet. Create one on the{' '}
+            <LinkButton onClick={() => setLocation('/keys')}>Keys page</LinkButton>{' '}
+            to see connection instructions here.
+          </p>
+        </section>
+      </div>
+    );
+  }
+
   const instructions = getInstructions(activeTool.value);
+  const configFile = getConfigFile(activeTool.value);
+  const selectedCombo_obj = filteredCombos.find(c => c.name === selectedCombo.value);
 
   return (
     <div style={{ padding: 'var(--space-2xl)', maxWidth: 760, width: '100%' }}>
       <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 'var(--space-xl)' }}>Connect</h1>
 
-      {/* Step 1: API Key */}
+      {/* Step 1: Searchable API Key picker */}
       <section style={{
         background: 'var(--bg-1)', border: '1px solid var(--border)',
         borderRadius: 'var(--radius-lg)', padding: 'var(--space-lg)',
@@ -348,124 +345,88 @@ export function ConnectPage() {
             width: 22, height: 22, borderRadius: '50%', background: 'var(--accent)',
             fontSize: 11, fontWeight: 700, color: 'var(--text-primary)',
           }}>1</span>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>API Key</span>
-          {allKeys.value.length > 0 && (
-            <span style={{ fontSize: 11, color: 'var(--text-tertiary)', marginLeft: 'auto' }}>
-              {allKeys.value.length} key{allKeys.value.length !== 1 ? 's' : ''}
-            </span>
-          )}
+          <span style={{ fontSize: 14, fontWeight: 600 }}>Choose API Key</span>
         </div>
 
-        {/* Key list */}
-        {allKeys.value.length > 0 && (
-          <div style={{ marginBottom: 'var(--space-md)' }}>
-            {allKeys.value.map(k => (
-              <div key={k.id} style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                padding: '6px 0', borderBottom: '1px solid var(--border)',
-              }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', flex: 1 }}>
-                  <input
-                    type="radio"
-                    name="apikey"
-                    checked={selectedKeyId.value === k.id}
-                    onChange={() => {
-                      selectedKeyId.value = k.id;
-                      // Clear the full key display if switching away from newly created key
-                      if (newKeyId.value !== k.id) {
-                        newKeyValue.value = null;
-                        newKeyId.value = null;
-                      }
-                    }}
-                  />
-                  <span style={{ fontSize: 13, fontWeight: 500 }}>{k.name}</span>
-                  <code style={{ fontSize: 11, color: 'var(--text-tertiary)', background: 'var(--bg-2)', padding: '2px 6px', borderRadius: 'var(--radius-sm)' }}>
-                    {k.prefix}
-                  </code>
-                  {k.budget_monthly > 0 && (
-                    <span style={{ fontSize: 9, background: 'var(--accent-muted)', color: 'var(--accent)', padding: '1px 5px', borderRadius: 8 }}>
-                      ${k.budget_monthly}/mo{k.budget_hard_limit ? ' hard' : ''}
-                    </span>
-                  )}
-                  {k.rate_limit_rpm > 0 && (
-                    <span style={{ fontSize: 9, background: 'var(--accent-muted)', color: 'var(--accent)', padding: '1px 5px', borderRadius: 8 }}>
-                      {k.rate_limit_rpm} rpm
-                    </span>
-                  )}
-                  {k.allowed_models && k.allowed_models !== '*' && (
-                    <span style={{ fontSize: 9, background: 'var(--accent-muted)', color: 'var(--accent)', padding: '1px 5px', borderRadius: 8 }}>
-                      ACL
-                    </span>
-                  )}
-                </label>
-                <div style={{ display: 'flex', gap: 4 }}>
-                  <button
-                    onClick={() => openEditKey(k)}
-                    style={{ fontSize: 10, color: 'var(--text-secondary)', padding: '2px 6px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
-                  >
-                    Edit
-                  </button>
-                  <button
-                    onClick={() => requestDeleteKey(k)}
-                    style={{ fontSize: 10, color: 'var(--status-red)', padding: '2px 6px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Create key */}
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <input
-            type="text"
-            placeholder={`Key name (default: ${getNextKeyName()})`}
-            value={newKeyName.value}
-            onInput={e => { newKeyName.value = e.target.value; }}
-            onKeyDown={e => { if (e.key === 'Enter') handleCreateKey(); }}
-            style={{
-              flex: 1, padding: '7px 10px', background: 'var(--bg-2)',
-              border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
-              color: 'var(--text-primary)', fontSize: 12,
-            }}
-          />
+        <div style={{ position: 'relative' }} ref={popoverRef}>
           <button
-            onClick={handleCreateKey}
-            disabled={creatingKey.value}
+            onClick={e => { e.stopPropagation(); keyPopoverOpen.value = !keyPopoverOpen.value; }}
             style={{
-              padding: '7px 14px', fontSize: 12, fontWeight: 500, whiteSpace: 'nowrap',
-              color: 'var(--text-primary)', background: 'var(--accent)',
-              borderRadius: 'var(--radius-md)', cursor: 'pointer',
-              opacity: creatingKey.value ? 0.6 : 1,
+              width: '100%', padding: '8px 10px', textAlign: 'left',
+              background: 'var(--bg-2)', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)', color: 'var(--text-primary)',
+              fontSize: 13, fontFamily: 'var(--font-mono)', cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
             }}
           >
-            {creatingKey.value ? 'Creating...' : '+ New Key'}
+            <span>{triggerLabel}</span>
+            <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>▼</span>
           </button>
-        </div>
 
-        {/* Newly created key */}
-        {newKeyValue.value && (
-          <div style={{
-            marginTop: 'var(--space-md)', padding: 'var(--space-md)',
-            background: 'var(--accent-muted)', borderRadius: 'var(--radius-md)',
-            border: '1px solid var(--accent)',
-          }}>
-            <div style={{ fontSize: 11, color: 'var(--accent)', marginBottom: 4 }}>
-              Copy this key now — it won't be shown again.
+          {keyPopoverOpen.value && (
+            <div style={{
+              position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4,
+              maxHeight: 320, overflowY: 'auto',
+              background: 'var(--bg-2)', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)', zIndex: 10,
+              boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+            }}>
+              <div style={{ padding: 8, borderBottom: '1px solid var(--border)' }}>
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  placeholder="Search keys..."
+                  value={keySearch.value}
+                  onChange={e => { keySearch.value = e.target.value; }}
+                  style={{
+                    width: '100%', padding: '6px 10px',
+                    background: 'var(--bg-1)', border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)',
+                    fontSize: 12,
+                  }}
+                />
+              </div>
+              <div style={{ padding: '4px 0' }}>
+                {filteredKeys.length === 0 ? (
+                  <div style={{ padding: '12px 16px', fontSize: 12, color: 'var(--text-tertiary)' }}>
+                    No keys match
+                  </div>
+                ) : (
+                  filteredKeys.map(k => {
+                    const isSel = k.id === selectedKeyId.value;
+                    return (
+                      <div
+                        key={k.id}
+                        onClick={() => {
+                          selectedKeyId.value = k.id;
+                          keyPopoverOpen.value = false;
+                          keySearch.value = '';
+                        }}
+                        style={{
+                          padding: '8px 12px', cursor: 'pointer', fontSize: 13,
+                          background: isSel ? 'var(--bg-3)' : 'transparent',
+                          display: 'flex', alignItems: 'center', gap: 8,
+                        }}
+                      >
+                        <span style={{ width: 12, fontSize: 11, color: 'var(--accent)' }}>
+                          {isSel ? '●' : '○'}
+                        </span>
+                        <span style={{ flex: 1 }}>{k.name}</span>
+                        <code style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>{k.prefix}</code>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <div style={{ padding: 8, borderTop: '1px solid var(--border)', fontSize: 11 }}>
+                <LinkButton onClick={() => setLocation('/keys')}>Manage keys on the Keys page</LinkButton>
+              </div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <code style={{ fontSize: 12, fontFamily: 'var(--font-mono)', flex: 1, wordBreak: 'break-all' }}>
-                {newKeyValue.value}
-              </code>
-              <CopyButton text={newKeyValue.value} label="Copy" />
-            </div>
-          </div>
-        )}
+          )}
+        </div>
       </section>
 
-      {/* Step 2: Choose Model */}
+      {/* Step 2: Choose Model or Combo */}
       <section style={{
         background: 'var(--bg-1)', border: '1px solid var(--border)',
         borderRadius: 'var(--radius-lg)', padding: 'var(--space-lg)',
@@ -480,7 +441,6 @@ export function ConnectPage() {
           <span style={{ fontSize: 14, fontWeight: 600 }}>Choose Model</span>
         </div>
 
-        {/* Mode tabs */}
         <div style={{
           display: 'flex', gap: 2, marginBottom: 'var(--space-md)',
           background: 'var(--bg-2)', padding: 3, borderRadius: 'var(--radius-md)',
@@ -505,25 +465,33 @@ export function ConnectPage() {
         </div>
 
         {modelMode.value === 'single' && (
-          <select
-            value={selectedModel.value}
-            onChange={e => { selectedModel.value = e.target.value; }}
-            style={{
-              width: '100%', padding: '8px 10px', background: 'var(--bg-2)',
-              border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
-              color: 'var(--text-primary)', fontSize: 13, fontFamily: 'var(--font-mono)',
-            }}
-          >
-            {availableModels.value.map(m => (
-              <option key={m.id} value={m.id}>
-                {m.id}{m.display_name ? ` — ${m.display_name}` : ''}
-              </option>
-            ))}
-          </select>
+          filteredModels.length > 0 ? (
+            <select
+              value={selectedModel.value}
+              onChange={e => { selectedModel.value = e.target.value; }}
+              style={{
+                width: '100%', padding: '8px 10px', background: 'var(--bg-2)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
+                color: 'var(--text-primary)', fontSize: 13, fontFamily: 'var(--font-mono)',
+              }}
+            >
+              {filteredModels.map(m => (
+                <option key={m.id} value={m.id}>
+                  {m.id}{m.display_name ? ` — ${m.display_name}` : ''}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <div style={{ fontSize: 12, color: 'var(--text-tertiary)', padding: '8px 0' }}>
+              This key's allowed_models doesn't include any available models. Edit the key on the{' '}
+              <LinkButton onClick={() => setLocation('/keys')}>Keys page</LinkButton>{' '}
+              to allow more.
+            </div>
+          )
         )}
 
         {modelMode.value === 'combo' && (
-          allCombos.value.length > 0 ? (
+          filteredCombos.length > 0 ? (
             <div>
               <select
                 value={selectedCombo.value}
@@ -534,34 +502,32 @@ export function ConnectPage() {
                   color: 'var(--text-primary)', fontSize: 13, fontFamily: 'var(--font-mono)',
                 }}
               >
-                {allCombos.value.map(c => (
+                {filteredCombos.map(c => (
                   <option key={c.id} value={c.name}>{c.name}</option>
                 ))}
               </select>
-              {(() => {
-                const combo = allCombos.value.find(c => c.name === selectedCombo.value);
-                if (!combo || !combo.models) return null;
-                return (
-                  <div style={{ marginTop: 8, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
-                    {combo.models.map((m, i) => (
-                      <span key={i} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)', background: 'var(--bg-3)', padding: '2px 6px', borderRadius: 'var(--radius-sm)' }}>{m}</span>
-                        {i < combo.models.length - 1 && <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>→</span>}
-                      </span>
-                    ))}
-                  </div>
-                );
-              })()}
+              {selectedCombo_obj?.models && (
+                <div style={{ marginTop: 8, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                  {selectedCombo_obj.models.map((m, i) => (
+                    <span key={i} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)', background: 'var(--bg-3)', padding: '2px 6px', borderRadius: 'var(--radius-sm)' }}>{m}</span>
+                      {i < selectedCombo_obj.models.length - 1 && <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>→</span>}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             <div style={{ fontSize: 12, color: 'var(--text-tertiary)', padding: '8px 0' }}>
-              No combos defined yet. Create one in the <span style={{ color: 'var(--accent)' }}>Models</span> page.
+              This key's allowed_models doesn't include any combos. Edit the key on the{' '}
+              <LinkButton onClick={() => setLocation('/keys')}>Keys page</LinkButton>{' '}
+              to allow more.
             </div>
           )
         )}
       </section>
 
-      {/* Step 3: Connect your tool */}
+      {/* Step 3: Connect Your Tool */}
       <section style={{
         background: 'var(--bg-1)', border: '1px solid var(--border)',
         borderRadius: 'var(--radius-lg)', padding: 'var(--space-lg)',
@@ -575,7 +541,6 @@ export function ConnectPage() {
           <span style={{ fontSize: 14, fontWeight: 600 }}>Connect Your Tool</span>
         </div>
 
-        {/* Tool dropdown */}
         <select
           value={activeTool.value}
           onChange={e => { activeTool.value = e.target.value; }}
@@ -591,9 +556,15 @@ export function ConnectPage() {
         </select>
 
         <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>{instructions.title}</h3>
-        <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>
+        <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: configFile ? 6 : 'var(--space-lg)' }}>
           {instructions.description}
         </p>
+
+        {configFile && (
+          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 'var(--space-lg)' }}>
+            Where to paste: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>{configFile}</span>
+          </div>
+        )}
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
           {instructions.steps.map((step, i) => (
@@ -606,151 +577,6 @@ export function ConnectPage() {
           ))}
         </div>
       </section>
-
-      {/* Edit key modal */}
-      {editingKey.value && (
-        <div style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-        }} onClick={cancelEditKey}>
-          <div style={{
-            background: 'var(--bg-1)', border: '1px solid var(--border)',
-            borderRadius: 'var(--radius-lg)', padding: 'var(--space-xl)',
-            width: 440, maxWidth: '90vw',
-          }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 'var(--space-md)' }}>
-              Edit Key: {editingKey.value.name}
-            </h3>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
-              <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                Name
-                <input type="text" value={editForm.value.name}
-                  onInput={e => { editForm.value = { ...editForm.value, name: e.target.value }; }}
-                  style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
-                />
-              </label>
-
-              <div style={{ display: 'flex', gap: 12 }}>
-                <label style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1 }}>
-                  Monthly Budget ($)
-                  <input type="number" step="0.01" min="0" value={editForm.value.budget_monthly}
-                    onInput={e => { editForm.value = { ...editForm.value, budget_monthly: parseFloat(e.target.value) || 0 }; }}
-                    style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
-                  />
-                </label>
-                <label style={{ fontSize: 12, color: 'var(--text-secondary)', display: 'flex', alignItems: 'flex-end', gap: 6, paddingBottom: 8 }}>
-                  <input type="checkbox" checked={editForm.value.budget_hard_limit}
-                    onChange={e => { editForm.value = { ...editForm.value, budget_hard_limit: e.target.checked }; }}
-                  />
-                  Hard limit
-                </label>
-              </div>
-
-              <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                Allowed Models
-                <span style={{ fontSize: 10, color: 'var(--text-tertiary)', marginLeft: 4 }}>* = all, or comma-separated: anthropic/*,openai/gpt-4o</span>
-                <input type="text" value={editForm.value.allowed_models}
-                  onInput={e => { editForm.value = { ...editForm.value, allowed_models: e.target.value }; }}
-                  style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, fontFamily: 'var(--font-mono)', boxSizing: 'border-box' }}
-                />
-              </label>
-
-              <div style={{ display: 'flex', gap: 12 }}>
-                <label style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1 }}>
-                  Rate Limit (rpm)
-                  <input type="number" min="0" value={editForm.value.rate_limit_rpm}
-                    onInput={e => { editForm.value = { ...editForm.value, rate_limit_rpm: parseInt(e.target.value) || 0 }; }}
-                    placeholder="0 = unlimited"
-                    style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
-                  />
-                </label>
-                <label style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1 }}>
-                  Routing Strategy
-                  <select value={editForm.value.routing_strategy}
-                    onChange={e => { editForm.value = { ...editForm.value, routing_strategy: e.target.value }; }}
-                    style={{ display: 'block', width: '100%', marginTop: 4, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' }}
-                  >
-                    <option value="">Default</option>
-                    <option value="fast">Fast</option>
-                    <option value="cheap">Cheap</option>
-                    <option value="best">Best</option>
-                    <option value="balanced">Balanced</option>
-                  </select>
-                </label>
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 'var(--space-lg)' }}>
-              <button onClick={cancelEditKey}
-                style={{ padding: '7px 14px', fontSize: 12, color: 'var(--text-secondary)', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', cursor: 'pointer' }}
-              >Cancel</button>
-              <button onClick={saveEditKey}
-                style={{ padding: '7px 14px', fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', background: 'var(--accent)', borderRadius: 'var(--radius-md)', cursor: 'pointer' }}
-              >Save</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Delete confirmation modal */}
-      {deleteConfirmKey.value && (
-        <div style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-        }} onClick={cancelDeleteKey}>
-          <div style={{
-            background: 'var(--bg-1)', border: '1px solid var(--border)',
-            borderRadius: 'var(--radius-lg)', padding: 'var(--space-xl)',
-            width: 400, maxWidth: '90vw',
-          }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4, color: 'var(--status-red)' }}>
-              Delete API Key
-            </h3>
-            <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 'var(--space-md)' }}>
-              This will permanently revoke the key <strong>{deleteConfirmKey.value.name}</strong> ({deleteConfirmKey.value.prefix}...).
-              Any tools using this key will stop working.
-            </p>
-            <p style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 8 }}>
-              Type <strong>{deleteConfirmKey.value.name}</strong> to confirm:
-            </p>
-            <input
-              type="text"
-              value={deleteConfirmInput.value}
-              onInput={e => { deleteConfirmInput.value = e.target.value; }}
-              onKeyDown={e => { if (e.key === 'Enter') confirmDeleteKey(); }}
-              placeholder={deleteConfirmKey.value.name}
-              autoFocus
-              style={{
-                width: '100%', padding: '8px 10px', background: 'var(--bg-2)',
-                border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
-                color: 'var(--text-primary)', fontSize: 13, marginBottom: 'var(--space-md)',
-                boxSizing: 'border-box',
-              }}
-            />
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <button
-                onClick={cancelDeleteKey}
-                style={{
-                  padding: '7px 14px', fontSize: 12, color: 'var(--text-secondary)',
-                  background: 'var(--bg-2)', border: '1px solid var(--border)',
-                  borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                }}
-              >Cancel</button>
-              <button
-                onClick={confirmDeleteKey}
-                disabled={deleteConfirmInput.value !== deleteConfirmKey.value.name}
-                style={{
-                  padding: '7px 14px', fontSize: 12, fontWeight: 500,
-                  color: '#fff', background: deleteConfirmInput.value === deleteConfirmKey.value.name ? 'var(--status-red)' : 'var(--bg-3)',
-                  borderRadius: 'var(--radius-md)', cursor: deleteConfirmInput.value === deleteConfirmKey.value.name ? 'pointer' : 'not-allowed',
-                  opacity: deleteConfirmInput.value === deleteConfirmKey.value.name ? 1 : 0.5,
-                }}
-              >Delete Key</button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
