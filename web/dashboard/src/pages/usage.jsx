@@ -1,12 +1,37 @@
 import { signal } from '@preact/signals';
-import { useEffect } from 'preact/hooks';
-import { getUsage, getUsageSummary, getKeys } from '../api/client';
+import { useEffect, useRef } from 'preact/hooks';
+import { getUsage, getUsageSummary, getKeys, getConnections } from '../api/client';
 import { CostSummary } from '../components/cost-summary';
+import { CostCell } from '../components/cost-cell';
+import {
+  toUTCStartOfDay,
+  toUTCEndOfDay,
+  presetDateStrings,
+  shouldShowBreakdown,
+  shouldShowBudgetBar,
+  singleSelectedKey,
+} from './usage-helpers';
 
 const usageData = signal([]);
 const usageSummary = signal(null);
 const allKeys = signal([]);
-const selectedKeyFilter = signal('');
+const connections = signal([]);
+
+// Multi-key selection (cycle 20260517-usage-page-filters T9a). Empty
+// Set = all keys. Mutations must assign a brand-new Set instance —
+// Preact signals are identity-based, so `selectedKeys.value.add(x)`
+// is a silent no-op.
+const selectedKeys = signal(new Set());
+const keySearch = signal('');
+const keyPopoverOpen = signal(false);
+
+// Date range filter. Plain "YYYY-MM-DD" strings — the values from
+// <input type="date">. Empty string = no bound on that side.
+// Transformation to ISO-Z happens at fetch time via toUTC*OfDay
+// helpers (signal-string identity means same-string reassignment
+// does NOT refire; see usage-wire.test.js).
+const fromDate = signal('');
+const toDate = signal('');
 
 const sortField = signal('timestamp');
 const sortDir = signal('desc');
@@ -41,7 +66,7 @@ function SortHeader({ field, children, align = 'left' }) {
       {children}
       {active && (
         <span style={{ marginLeft: 4, fontSize: 10 }}>
-          {sortDir.value === 'asc' ? '\u2191' : '\u2193'}
+          {sortDir.value === 'asc' ? '↑' : '↓'}
         </span>
       )}
     </th>
@@ -56,10 +81,21 @@ function formatLatency(ns) {
 }
 
 function loadUsage() {
-  const params = { limit: 200 };
-  if (selectedKeyFilter.value) {
-    params.api_key_id = selectedKeyFilter.value;
-  }
+  // Date range: transform local "YYYY-MM-DD" → UTC ISO-Z byte-for-byte
+  // matching the server's timeStr storage. toUTC*OfDay returns "" for
+  // empty inputs; buildQS skips empty strings.
+  const range = {};
+  if (fromDate.value) range.from = toUTCStartOfDay(fromDate.value);
+  if (toDate.value) range.to = toUTCEndOfDay(toDate.value);
+
+  // Multi-key: Set → Array at the callsite. buildQS serializes the
+  // array as repeated params (api_key_id=A&api_key_id=B). Empty Set
+  // yields empty array which buildQS skips entirely.
+  const keyIds = Array.from(selectedKeys.value);
+
+  const params = { limit: 200, ...range };
+  if (keyIds.length > 0) params.api_key_id = keyIds;
+
   getUsage(params).then(data => {
     if (Array.isArray(data)) {
       usageData.value = data.map((r, i) => ({
@@ -73,29 +109,68 @@ function loadUsage() {
         cacheReadTokens: r.cache_read_tokens || 0,
         cacheWriteTokens: r.cache_write_tokens || 0,
         cost: r.cost || 0,
+        cost_source: r.cost_source || 'apikey',
+        input_tokens: r.input_tokens || 0,
+        output_tokens: r.output_tokens || 0,
+        estimated_api_cost: r.estimated_api_cost || 0,
         latency: formatLatency(r.latency),
       }));
     }
   }).catch(() => {});
-  // Summary is computed server-side from usage_log (includes
-  // subscription_savings via current pricing × historical tokens).
-  // We don't pass api_key_id here because the cost summary is a
-  // whole-system view (matches the rollup tooltip wording).
-  getUsageSummary().then(s => { usageSummary.value = s; }).catch(() => {});
+
+  // Summary follows the same filter as the row list (cycle
+  // 20260517-usage-page-filters AC9c). Previously summary was a
+  // whole-system view; the user-facing decision was consistency over
+  // purity — selection scopes everything.
+  const summaryParams = { ...range };
+  if (keyIds.length > 0) summaryParams.api_key_id = keyIds;
+  getUsageSummary(summaryParams).then(s => { usageSummary.value = s; }).catch(() => {});
 }
 
 export function UsagePage() {
+  const popoverRef = useRef(null);
+
   useEffect(() => {
-    getKeys().then(data => {
-      if (Array.isArray(data)) allKeys.value = data;
+    getKeys({ limit: 200 }).then(res => {
+      if (Array.isArray(res?.items)) allKeys.value = res.items;
+    }).catch(() => {});
+    getConnections().then(data => {
+      if (Array.isArray(data)) connections.value = data;
     }).catch(() => {});
     loadUsage();
   }, []);
 
-  // Reload when filter changes
+  // Refetch when filters change. Signal identity rules:
+  //   - selectedKeys: Set → identity-based, mutations create new instance
+  //   - fromDate / toDate: strings → value-based, same-string is no-op
+  // Pinned by usage-wire.test.js.
   useEffect(() => {
     loadUsage();
-  }, [selectedKeyFilter.value]);
+  }, [selectedKeys.value, fromDate.value, toDate.value]);
+
+  // Close popover on ESC or click outside.
+  useEffect(() => {
+    if (!keyPopoverOpen.value) return undefined;
+    const onKey = e => { if (e.key === 'Escape') keyPopoverOpen.value = false; };
+    const onClick = e => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target)) {
+        keyPopoverOpen.value = false;
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    // Defer adding the click listener so the same click that OPENED
+    // the popover (caught at capture phase before this effect runs)
+    // doesn't immediately close it. Belt-and-suspenders: the trigger
+    // button ALSO calls e.stopPropagation() in its onClick (below)
+    // — both guards are intentional. Removing either is safe today;
+    // removing BOTH would let toggle-open immediately re-close.
+    const t = setTimeout(() => document.addEventListener('click', onClick), 0);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('click', onClick);
+    };
+  }, [keyPopoverOpen.value]);
 
   const sorted = [...usageData.value].sort((a, b) => {
     const f = sortField.value;
@@ -112,46 +187,154 @@ export function UsagePage() {
   const totalCacheWrite = usageData.value.reduce((s, r) => s + r.cacheWriteTokens, 0);
   const cacheHitRate = totalInput > 0 ? (totalCacheRead / totalInput * 100) : 0;
 
-  // Per-key breakdown (only when viewing all keys)
-  const keyBreakdown = !selectedKeyFilter.value && allKeys.value.length > 1
-    ? allKeys.value.map(k => {
-        const keyUsage = usageData.value.filter(r => r.apiKeyId === k.id);
-        return {
-          ...k,
-          requests: keyUsage.length,
-          cost: keyUsage.reduce((s, r) => s + r.cost, 0),
-          tokens: keyUsage.reduce((s, r) => s + r.inputTokens + r.outputTokens, 0),
-        };
-      }).filter(k => k.requests > 0)
+  // Per-Key Breakdown gating (AC9). When 2+ keys selected, only show
+  // breakdown for those keys; the server has already filtered the
+  // usageData rows, so we only need to project the breakdown across
+  // the selected subset of allKeys.
+  const showBreakdown = shouldShowBreakdown(selectedKeys.value, allKeys.value);
+  const keyBreakdown = showBreakdown
+    ? allKeys.value
+        .filter(k => selectedKeys.value.size === 0 || selectedKeys.value.has(k.id))
+        .map(k => {
+          const keyUsage = usageData.value.filter(r => r.apiKeyId === k.id);
+          return {
+            ...k,
+            requests: keyUsage.length,
+            cost: keyUsage.reduce((s, r) => s + r.cost, 0),
+            tokens: keyUsage.reduce((s, r) => s + r.inputTokens + r.outputTokens, 0),
+          };
+        })
+        .filter(k => k.requests > 0)
     : [];
 
-  // Budget info for selected key
-  const selectedKeyInfo = selectedKeyFilter.value
-    ? allKeys.value.find(k => k.id === selectedKeyFilter.value)
-    : null;
+  // Single-key budget bar (AC9b). singleSelectedKey returns null when
+  // size !== 1, so the budget block is naturally omitted.
+  const selectedKeyInfo = singleSelectedKey(selectedKeys.value, allKeys.value);
+  const showBudget = shouldShowBudgetBar(selectedKeys.value, allKeys.value);
+
+  // Multi-select popover — filtered key list.
+  const filteredKeys = allKeys.value.filter(k => {
+    if (!keySearch.value) return true;
+    const q = keySearch.value.toLowerCase();
+    return (k.name || '').toLowerCase().includes(q)
+      || (k.prefix || '').toLowerCase().includes(q);
+  });
+
+  const toggleKey = (id) => {
+    const next = new Set(selectedKeys.value);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    selectedKeys.value = next;
+  };
+  const clearKeys = () => { selectedKeys.value = new Set(); };
+  const selectAllKeys = () => {
+    selectedKeys.value = new Set(allKeys.value.map(k => k.id));
+  };
+
+  // Trigger label for the multi-select.
+  const keyTriggerLabel = selectedKeys.value.size === 0
+    ? 'All keys'
+    : selectedKeys.value.size === 1
+      ? (singleSelectedKey(selectedKeys.value, allKeys.value)?.name || '1 key')
+      : `${selectedKeys.value.size} keys`;
 
   return (
     <div style={{ padding: 'var(--space-2xl)', maxWidth: 1060, width: '100%' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-xl)' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 'var(--space-xl)', gap: 'var(--space-md)', flexWrap: 'wrap' }}>
         <h1 style={{ fontSize: 20, fontWeight: 600 }}>Usage</h1>
 
-        {/* Key filter dropdown */}
-        {allKeys.value.length > 0 && (
-          <select
-            value={selectedKeyFilter.value}
-            onChange={e => { selectedKeyFilter.value = e.target.value; }}
-            style={{
-              padding: '6px 10px', background: 'var(--bg-2)',
-              border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
-              color: 'var(--text-primary)', fontSize: 12,
-            }}
-          >
-            <option value="">All Keys</option>
-            {allKeys.value.map(k => (
-              <option key={k.id} value={k.id}>{k.name} ({k.prefix})</option>
-            ))}
-          </select>
-        )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {/* Date range picker (AC1-AC4) */}
+          <label style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>From</label>
+          <input
+            type="date"
+            value={fromDate.value}
+            onChange={e => { fromDate.value = e.target.value; }}
+            style={inputStyle}
+          />
+          <label style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>To</label>
+          <input
+            type="date"
+            value={toDate.value}
+            onChange={e => { toDate.value = e.target.value; }}
+            style={inputStyle}
+          />
+          {/* Preset chips (AC2). Hydrate the date inputs; no active-preset state. */}
+          <button style={chipStyle} onClick={() => { const r = presetDateStrings(7); fromDate.value = r.from; toDate.value = r.to; }}>Last 7d</button>
+          <button style={chipStyle} onClick={() => { const r = presetDateStrings(30); fromDate.value = r.from; toDate.value = r.to; }}>Last 30d</button>
+          <button style={chipStyle} onClick={() => { fromDate.value = ''; toDate.value = ''; }}>All</button>
+
+          {/* Multi-select keys (AC5-AC7) */}
+          {allKeys.value.length > 0 && (
+            <div style={{ position: 'relative' }} ref={popoverRef}>
+              <button
+                onClick={e => { e.stopPropagation(); keyPopoverOpen.value = !keyPopoverOpen.value; }}
+                style={{ ...inputStyle, cursor: 'pointer', minWidth: 110, textAlign: 'left' }}
+              >
+                {keyTriggerLabel}
+                {selectedKeys.value.size > 1 && (
+                  <span style={{ marginLeft: 6, fontSize: 10, background: 'var(--accent)', color: '#fff', padding: '1px 5px', borderRadius: 8 }}>
+                    {selectedKeys.value.size}
+                  </span>
+                )}
+                <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--text-tertiary)' }}>▼</span>
+              </button>
+
+              {keyPopoverOpen.value && (
+                <div style={{
+                  position: 'absolute', top: '100%', right: 0, marginTop: 4,
+                  minWidth: 260, maxHeight: 320, overflowY: 'auto',
+                  background: 'var(--bg-2)', border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-md)', zIndex: 10,
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+                }}>
+                  <div style={{ padding: 8, borderBottom: '1px solid var(--border)' }}>
+                    <input
+                      type="text"
+                      placeholder="Search keys..."
+                      value={keySearch.value}
+                      onChange={e => { keySearch.value = e.target.value; }}
+                      style={{ ...inputStyle, width: '100%' }}
+                    />
+                  </div>
+                  <div style={{ padding: '4px 0' }}>
+                    {filteredKeys.length === 0 ? (
+                      <div style={{ padding: '12px 16px', fontSize: 12, color: 'var(--text-tertiary)' }}>
+                        No keys match
+                      </div>
+                    ) : (
+                      filteredKeys.map(k => {
+                        const checked = selectedKeys.value.has(k.id);
+                        return (
+                          <label
+                            key={k.id}
+                            style={{
+                              display: 'flex', alignItems: 'center', gap: 8,
+                              padding: '6px 12px', fontSize: 13, cursor: 'pointer',
+                              background: checked ? 'var(--bg-3)' : 'transparent',
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleKey(k.id)}
+                            />
+                            <span style={{ flex: 1 }}>{k.name}</span>
+                            <code style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>{k.prefix}</code>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, padding: 8, borderTop: '1px solid var(--border)' }}>
+                    <button style={chipStyle} onClick={clearKeys}>Clear</button>
+                    <button style={chipStyle} onClick={selectAllKeys}>Select all</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Summary bar */}
@@ -161,7 +344,10 @@ export function UsagePage() {
         border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)',
         flexWrap: 'wrap',
       }}>
-        <CostSummary summary={usageSummary.value} />
+        <CostSummary
+          summary={usageSummary.value}
+          hasSubConn={connections.value.some(c => c.auth_type === 'subscription' && c.state !== 'disabled')}
+        />
         <div>
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Input Tokens</div>
           <div style={{ fontSize: 20, fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{formatTokens(totalInput)}</div>
@@ -181,7 +367,7 @@ export function UsagePage() {
             <div style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>{formatTokens(totalCacheRead)} read / {formatTokens(totalCacheWrite)} write</div>
           </div>
         )}
-        {selectedKeyInfo && selectedKeyInfo.budget_monthly > 0 && (
+        {showBudget && selectedKeyInfo && (
           <div style={{ marginLeft: 'auto' }}>
             <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Budget</div>
             <div style={{ fontSize: 16, fontFamily: 'var(--font-mono)', fontWeight: 600 }}>
@@ -206,7 +392,7 @@ export function UsagePage() {
         )}
       </div>
 
-      {/* Per-key breakdown table (when viewing all keys and multiple exist) */}
+      {/* Per-key breakdown table */}
       {keyBreakdown.length > 0 && (
         <div style={{
           background: 'var(--bg-1)', border: '1px solid var(--border)',
@@ -229,7 +415,7 @@ export function UsagePage() {
             <tbody>
               {keyBreakdown.map(k => (
                 <tr key={k.id} style={{ borderTop: '1px solid var(--border)', cursor: 'pointer' }}
-                  onClick={() => { selectedKeyFilter.value = k.id; }}>
+                  onClick={() => { selectedKeys.value = new Set([k.id]); }}>
                   <td style={{ padding: '10px 16px' }}>
                     <span style={{ fontSize: 13, fontWeight: 500 }}>{k.name}</span>
                     <code style={{ fontSize: 10, color: 'var(--text-tertiary)', marginLeft: 6 }}>{k.prefix}</code>
@@ -293,7 +479,7 @@ export function UsagePage() {
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right', color: r.cacheReadTokens > 0 ? 'var(--status-green)' : 'var(--text-tertiary)' }}>
                   {r.cacheReadTokens > 0 ? formatTokens(r.cacheReadTokens) : '—'}
                 </td>
-                <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right', color: 'var(--accent)' }}>${r.cost.toFixed(4)}</td>
+                <td style={{ padding: '10px 16px', textAlign: 'right' }}><CostCell row={r} /></td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right' }}>{r.latency}</td>
               </tr>
             ))}
@@ -310,3 +496,22 @@ export function UsagePage() {
     </div>
   );
 }
+
+const inputStyle = {
+  padding: '6px 10px',
+  background: 'var(--bg-2)',
+  border: '1px solid var(--border)',
+  borderRadius: 'var(--radius-md)',
+  color: 'var(--text-primary)',
+  fontSize: 12,
+};
+
+const chipStyle = {
+  padding: '6px 10px',
+  background: 'var(--bg-2)',
+  border: '1px solid var(--border)',
+  borderRadius: 'var(--radius-md)',
+  color: 'var(--text-primary)',
+  fontSize: 11,
+  cursor: 'pointer',
+};

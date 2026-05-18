@@ -161,19 +161,33 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	// refresh_failures, and last_error so the dashboard can render the
 	// AC32 details (badge, expiry countdown, re-authenticate action).
 	// Access/refresh tokens and API keys are never echoed.
+	//
+	// Cycle 20260516-connection-runtime-state: also project the Selector's
+	// runtime view (RuntimeState, ModelDenylist, ModelLocks, CooldownUntil)
+	// so the dashboard can surface in-memory filter state that diverges from
+	// the DB row's `state`. Without this projection, a connection appears
+	// "green" in UI while silently refusing specific models — see plan.md.
 	type safeConn struct {
-		ID              string     `json:"id"`
-		Provider        string     `json:"provider"`
-		Name            string     `json:"name"`
-		AuthType        string     `json:"auth_type"`
-		Priority        int        `json:"priority"`
-		State           string     `json:"state"`
-		ExpiresAt       *time.Time `json:"expires_at,omitempty"`
-		AccountID       string     `json:"account_id,omitempty"`
-		RefreshFailures int        `json:"refresh_failures,omitempty"`
-		LastError       string     `json:"last_error,omitempty"`
-		CreatedAt       time.Time  `json:"created_at"`
-		UpdatedAt       time.Time  `json:"updated_at"`
+		ID              string               `json:"id"`
+		Provider        string               `json:"provider"`
+		Name            string               `json:"name"`
+		AuthType        string               `json:"auth_type"`
+		Priority        int                  `json:"priority"`
+		State           string               `json:"state"`
+		ExpiresAt       *time.Time           `json:"expires_at,omitempty"`
+		AccountID       string               `json:"account_id,omitempty"`
+		RefreshFailures int                  `json:"refresh_failures,omitempty"`
+		LastError       string               `json:"last_error,omitempty"`
+		// Selector runtime view (cycle 20260516-connection-runtime-state).
+		// Populated from provider.Connection when registered in the Selector;
+		// all four use omitempty so an unregistered connection (e.g., between
+		// handleCreateConnection insert and Selector.Register) renders as today.
+		RuntimeState  string               `json:"runtime_state,omitempty"`  // pc.State() — may differ from State
+		ModelDenylist map[string]time.Time `json:"model_denylist,omitempty"` // model → expiry (1h after 401/403)
+		ModelLocks    map[string]time.Time `json:"model_locks,omitempty"`    // model → expiry (per-429 cooldown)
+		CooldownUntil *time.Time           `json:"cooldown_until,omitempty"` // nil when not in cooldown
+		CreatedAt       time.Time            `json:"created_at"`
+		UpdatedAt       time.Time            `json:"updated_at"`
 	}
 	safe := make([]safeConn, 0, len(conns))
 	for _, c := range conns {
@@ -204,13 +218,30 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 		// rotates on every state transition, so the DB doesn't hold it.
 		// Only expose it when the connection is in a state where the
 		// user might need to act (errored / disabled / auth_expired);
-		// otherwise it's noise.
+		// otherwise it's noise. (Kept gated per fix-plan-review fold:
+		// MarkRateLimited doesn't clear lastError, so cooldowned conns
+		// would surface stale auth errors. Rate-limit context is conveyed
+		// via the structured ModelLocks/CooldownUntil fields below.)
+		//
+		// Cycle 20260516-connection-runtime-state: also project the Selector's
+		// runtime view so the dashboard can detect DB-vs-runtime state drift
+		// + show per-model filter state that would otherwise be invisible.
 		if pc := s.deps.ProviderSelector.ConnectionByID(c.ID); pc != nil {
 			if err := pc.LastError(); err != nil {
 				switch c.State {
 				case "errored", "disabled", "auth_expired":
 					sc.LastError = err.Error()
 				}
+			}
+			sc.RuntimeState = string(pc.State())
+			if dn := pc.ModelDenylistSnapshot(); len(dn) > 0 {
+				sc.ModelDenylist = dn
+			}
+			if lk := pc.ModelLocksSnapshot(); len(lk) > 0 {
+				sc.ModelLocks = lk
+			}
+			if cu := pc.CooldownUntil(); !cu.IsZero() {
+				sc.CooldownUntil = &cu
 			}
 		}
 		safe = append(safe, sc)
@@ -274,6 +305,19 @@ func (s *Server) handleCreateConnection(w http.ResponseWriter, r *http.Request) 
 		conn.AccessToken = creds.AccessToken
 		conn.RefreshToken = creds.RefreshToken
 		conn.AuthType = auth.AuthTypeSubscription
+		// Cycle 20260517-provider-auth-variants M2.6.2: token-exchange
+		// auto-chain REMOVED (was M2b.4-extend wrong-path). CodexSubscriptionExecutor
+		// uses the PKCE access_token directly against
+		// chatgpt.com/backend-api/codex/responses; no exchange step.
+		// Stash chatgpt_account_id so AuthStore.GetCredential surfaces
+		// it as cred.AccountID → ExtraHeaders → ChatGPT-Account-ID header
+		// on every downstream /v1/* call (executor + discovery listers).
+		// Matches the providerData JSON shape at internal/auth/store.go:54-59.
+		if creds.AccountID != "" {
+			if raw, mErr := json.Marshal(map[string]string{"account_id": creds.AccountID}); mErr == nil {
+				conn.ProviderData = raw
+			}
+		}
 	}
 
 	if err := s.deps.Store.CreateConnection(&conn); err != nil {
@@ -332,7 +376,7 @@ func (s *Server) triggerOnCreateDiscovery(conn store.Connection) {
 		return
 	}
 
-	creds := buildListerCredentials(conn)
+	creds := s.buildListerCredentials(conn)
 	if creds.BaseURL == "" {
 		// Unknown provider — we have no idea where to send the request.
 		// Shouldn't happen if the connection passed validation, but be
@@ -341,26 +385,42 @@ func (s *Server) triggerOnCreateDiscovery(conn store.Connection) {
 		return
 	}
 
-	res := s.deps.Discovery.DiscoverProvider(ctx, conn.Provider, creds)
+	// Dispatch through DiscoveryListerKey: most provider/auth pairs use
+	// the provider's own lister; subscription openai routes through
+	// "openai@openrouter-mirror" because ChatGPT subscription tokens
+	// can't read api.openai.com/v1/models (fix 20260514-openrouter-fallback).
+	listerKey := catalog.DiscoveryListerKey(conn.Provider, conn.AuthType)
+	res := s.deps.Discovery.DiscoverProviderWithLister(ctx, conn.Provider, listerKey, creds)
 	if res.Err != nil {
 		slog.Warn("on-create discovery: lister error",
-			"provider", conn.Provider, "connection_id", conn.ID, "err", res.Err)
+			"provider", conn.Provider, "lister_key", listerKey, "connection_id", conn.ID, "err", res.Err)
 	}
 }
 
 // buildListerCredentials translates a store.Connection + the static
 // provider definition into a catalog.ListerCredentials. Keeps the
 // catalog package decoupled from store.Connection / config types.
-func buildListerCredentials(conn store.Connection) catalog.ListerCredentials {
+//
+// For subscription connections, also queries AuthStore to thread
+// provider-specific ExtraHeaders (e.g., ChatGPT-Account-ID for openai).
+// This mirrors the request-time path at routes_v1.go:1031-1035, so
+// discovery sees the same auth shape as chat completions.
+func (s *Server) buildListerCredentials(conn store.Connection) catalog.ListerCredentials {
 	provDef, ok := config.KnownProviders[conn.Provider]
 	if !ok {
 		return catalog.ListerCredentials{}
 	}
-	return catalog.ListerCredentials{
+	creds := catalog.ListerCredentials{
 		BaseURL:     provDef.BaseURL,
 		APIKey:      conn.APIKey,
 		AccessToken: conn.AccessToken,
 	}
+	if conn.AuthType == auth.AuthTypeSubscription && s.deps.AuthStore != nil {
+		if cred, err := s.deps.AuthStore.GetCredential(conn.ID); err == nil && cred != nil {
+			creds.ExtraHeaders = cred.ExtraHeaders()
+		}
+	}
+	return creds
 }
 
 // triggerOnNotFoundDiscovery is the upstream-404 sibling of
@@ -419,12 +479,16 @@ func (s *Server) triggerOnNotFoundDiscovery(providerID string, conn *ConnectionI
 	}
 
 	creds := catalog.ListerCredentials{
-		BaseURL:     provDef.BaseURL,
-		APIKey:      conn.Credentials.APIKey,
-		AccessToken: conn.Credentials.AccessToken,
+		BaseURL:      provDef.BaseURL,
+		APIKey:       conn.Credentials.APIKey,
+		AccessToken:  conn.Credentials.AccessToken,
+		ExtraHeaders: conn.Credentials.ExtraHeaders, // pre-populated at routes_v1.go:1031-1035 for subscription connections
 	}
 
-	res := s.deps.Discovery.TryDiscoverOnNotFound(ctx, providerID, creds)
+	// Dispatch through DiscoveryListerKey for the same reason as the
+	// on-create path. See fix 20260514-openrouter-fallback.
+	listerKey := catalog.DiscoveryListerKey(providerID, conn.Credentials.AuthType)
+	res := s.deps.Discovery.TryDiscoverOnNotFoundWithLister(ctx, providerID, listerKey, creds)
 	switch {
 	case res.Skipped:
 		// Gated by backoff or debounce — expected during 404 storms.
@@ -654,13 +718,133 @@ func (s *Server) handleDeleteAlias(w http.ResponseWriter, r *http.Request) {
 
 // ── API Key Routes ──
 
+// handleListAPIKeys returns a paginated + filtered view of API keys.
+// Cycle 20260516-keys-management-redesign breaking contract change:
+// response shape is {items, total, limit, offset} (not bare []APIKey).
+//
+// Query params (all optional):
+//
+//	limit       integer 1..200, default 25
+//	offset      integer ≥0,    default 0
+//	search      substring on Name (case-insensitive, LOWER(name) LIKE LOWER(?))
+//	routing     "" | "default" | "fast" | "balanced" | "cheap" | "best"
+//	has_budget  "true" | "false" (strict — no other values; ParseBool rejected)
+//
+// Malformed values return HTTP 400 with the canonical envelope
+// {"error":{"message":"..."}} per the cycle 20260515 contract.
 func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
-	keys, err := s.deps.Store.ListAPIKeys()
+	limit, ok := parseIntQueryParam(r, w, "limit", 25, 1, 200)
+	if !ok {
+		return
+	}
+	offset, ok := parseIntQueryParam(r, w, "offset", 0, 0, -1) // -1 sentinel = no upper bound
+	if !ok {
+		return
+	}
+
+	var hasBudget *bool
+	switch raw := r.URL.Query().Get("has_budget"); raw {
+	case "":
+		// no filter
+	case "true":
+		v := true
+		hasBudget = &v
+	case "false":
+		v := false
+		hasBudget = &v
+	default:
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid %q value: must be 'true' or 'false' (got %q)", "has_budget", raw))
+		return
+	}
+
+	// Sort params — strict whitelist for AC-A2 (sortable headers).
+	// SQL identifier injection is the risk if these pass through to
+	// ORDER BY without validation; the switch is the boundary guard.
+	sortField, sortDir, ok := parseSortParam(w, r.URL.Query().Get("sort"), r.URL.Query().Get("dir"))
+	if !ok {
+		return
+	}
+
+	filter := store.APIKeyFilter{
+		Search:    r.URL.Query().Get("search"),
+		Routing:   r.URL.Query().Get("routing"),
+		HasBudget: hasBudget,
+		Limit:     limit,
+		Offset:    offset,
+		SortField: sortField,
+		SortDir:   sortDir,
+	}
+
+	page, err := s.deps.Store.ListAPIKeysPaged(filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, keys)
+	writeJSON(w, http.StatusOK, page)
+}
+
+// parseSortParam validates the (sort, dir) pair against a strict
+// whitelist before letting either flow into SQL ORDER BY. Returns
+// ("", "", true) when both params are absent (caller uses the
+// historical default created_at DESC). Returns ("", "", false) after
+// writing a 400 envelope on invalid input.
+//
+// AC-A2 of 20260516-keys-management-redesign post-review revision.
+// Strict whitelist because SortField/SortDir flow into raw SQL at
+// sqlite.go (the only acceptable injection guard is rejection here).
+func parseSortParam(w http.ResponseWriter, sort, dir string) (string, string, bool) {
+	// Both absent — fall back to default ordering at the SQL layer.
+	if sort == "" && dir == "" {
+		return "", "", true
+	}
+	switch sort {
+	case "name", "created_at":
+		// ok
+	default:
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid %q value: must be 'name' or 'created_at' (got %q)", "sort", sort))
+		return "", "", false
+	}
+	switch dir {
+	case "", "asc", "desc":
+		// ok; empty dir defaults to ASC at the SQL layer when paired with
+		// an explicit sort field. (Empty dir + empty sort is handled above.)
+	default:
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid %q value: must be 'asc' or 'desc' (got %q)", "dir", dir))
+		return "", "", false
+	}
+	return sort, dir, true
+}
+
+// parseIntQueryParam extracts a non-negative integer from a query
+// parameter, with optional bounds-checking. minV is the minimum allowed
+// value (inclusive); maxV is the maximum (inclusive) — pass -1 for no
+// upper bound. Returns (defaultV, true) when the param is absent.
+// Mirrors parseTimeQueryParam from cycle 20260515-chat-routing-fix.
+func parseIntQueryParam(r *http.Request, w http.ResponseWriter, name string, defaultV, minV, maxV int) (int, bool) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return defaultV, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid %q: must be an integer (got %q)", name, raw))
+		return 0, false
+	}
+	if n < minV {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid %q: must be ≥ %d (got %d)", name, minV, n))
+		return 0, false
+	}
+	if maxV >= 0 && n > maxV {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid %q: must be ≤ %d (got %d)", name, maxV, n))
+		return 0, false
+	}
+	return n, true
 }
 
 func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
@@ -770,6 +954,26 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 // ── Usage Routes ──
 
+// parseTimeQueryParam extracts an RFC3339 timestamp from a query
+// parameter. Returns (zero, true) when the param is absent (no filter).
+// Returns (zero, false) and writes a 400 envelope when the value is
+// present but malformed — RFC3339 strictness is intentional so the
+// dashboard's toISOString() output (always Z-suffixed) is the only
+// valid form. AC-C3 + AC-C4 of 20260515-cost-savings-display.
+func parseTimeQueryParam(r *http.Request, w http.ResponseWriter, name string) (time.Time, bool) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return time.Time{}, true
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid %q timestamp: must be RFC3339 (got %q)", name, raw))
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 func (s *Server) handleGetUsage(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -777,11 +981,21 @@ func (s *Server) handleGetUsage(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
+	from, ok := parseTimeQueryParam(r, w, "from")
+	if !ok {
+		return
+	}
+	to, ok := parseTimeQueryParam(r, w, "to")
+	if !ok {
+		return
+	}
 	filter := store.UsageFilter{
-		Provider: r.URL.Query().Get("provider"),
-		Model:    r.URL.Query().Get("model"),
-		APIKeyID: r.URL.Query().Get("api_key_id"),
-		Limit:    limit,
+		Provider:  r.URL.Query().Get("provider"),
+		Model:     r.URL.Query().Get("model"),
+		APIKeyIDs: r.URL.Query()["api_key_id"],
+		From:      from,
+		To:        to,
+		Limit:     limit,
 	}
 
 	entries, err := s.deps.Store.QueryUsage(filter)
@@ -789,12 +1003,46 @@ func (s *Server) handleGetUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Enrich each entry with EstimatedAPICost — the would-have-been-API
+	// cost computed at query time via the current pricing table.
+	// Mirrors the query-time pattern used for SubscriptionSavings in
+	// handleGetUsageSummary below (lines ~843-861). For apikey rows
+	// this approximately equals Cost (modulo pricing changes since the
+	// row was written); for subscription rows it surfaces the savings
+	// value the dashboard renders parenthetically. AC-B3 of
+	// 20260515-cost-savings-display.
+	if s.deps.Catalog != nil {
+		for i := range entries {
+			entries[i].EstimatedAPICost = s.deps.Catalog.EstimateCost(
+				entries[i].Provider, entries[i].Model,
+				catalog.TokenBreakdown{
+					Input:        entries[i].InputTokens,
+					Output:       entries[i].OutputTokens,
+					CacheReadIn:  entries[i].CacheReadTokens,
+					CacheWriteIn: entries[i].CacheWriteTokens,
+				},
+			)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, entries)
 }
 
 func (s *Server) handleGetUsageSummary(w http.ResponseWriter, r *http.Request) {
+	from, ok := parseTimeQueryParam(r, w, "from")
+	if !ok {
+		return
+	}
+	to, ok := parseTimeQueryParam(r, w, "to")
+	if !ok {
+		return
+	}
 	filter := store.UsageFilter{
-		Provider: r.URL.Query().Get("provider"),
+		Provider:  r.URL.Query().Get("provider"),
+		APIKeyIDs: r.URL.Query()["api_key_id"],
+		From:      from,
+		To:        to,
 	}
 	summary, err := s.deps.Store.UsageSummary(filter)
 	if err != nil {

@@ -126,8 +126,17 @@ export function deleteAlias(name) {
 }
 
 // API Keys
-export function getKeys() {
-  return request('/keys');
+//
+// Cycle 20260516-keys-management-redesign: getKeys now accepts a params
+// object and serializes via URLSearchParams. Server responds with
+// `{items, total, limit, offset}` envelope (not a bare array) per the
+// new pagination contract. Existing callers that call `getKeys()` with
+// no args still work — empty URLSearchParams yields empty query string.
+export function getKeys(params) {
+  const qs = params && Object.keys(params).length
+    ? '?' + new URLSearchParams(params).toString()
+    : '';
+  return request('/keys' + qs);
 }
 
 export function createKey(data) {
@@ -152,13 +161,35 @@ export function updateSettings(data) {
 }
 
 // Usage
+//
+// buildQS serializes a params object to a URL query string, honoring
+// array values by emitting repeated params (`api_key_id=A&api_key_id=B`).
+// The bare `new URLSearchParams(obj)` constructor stringifies arrays as
+// `[object Object]`-style values and silently breaks multi-key filtering.
+// Cycle 20260517-usage-page-filters T7.
+//
+// Skipped values: null, undefined, empty string, empty array.
+export function buildQS(params) {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v == null || v === '') continue;
+    if (Array.isArray(v)) {
+      if (v.length === 0) continue;
+      v.forEach(x => qs.append(k, String(x)));
+    } else {
+      qs.append(k, String(v));
+    }
+  }
+  return qs.toString();
+}
+
 export function getUsage(params = {}) {
-  const qs = new URLSearchParams(params).toString();
+  const qs = buildQS(params);
   return request(`/usage${qs ? '?' + qs : ''}`);
 }
 
 export function getUsageSummary(params = {}) {
-  const qs = new URLSearchParams(params).toString();
+  const qs = buildQS(params);
   return request(`/usage/summary${qs ? '?' + qs : ''}`);
 }
 
@@ -240,11 +271,11 @@ export function getCatalogProviders() {
 
 // Routing analytics
 export function getRoutingSummary(params = {}) {
-  const qs = new URLSearchParams(params).toString();
+  const qs = buildQS(params);
   return request(`/routing/summary${qs ? '?' + qs : ''}`);
 }
 
 export function getRoutingLog(params = {}) {
-  const qs = new URLSearchParams(params).toString();
+  const qs = buildQS(params);
   return request(`/routing/log${qs ? '?' + qs : ''}`);
 }

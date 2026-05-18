@@ -41,7 +41,41 @@ func buildConnectionFilter(f ConnectionFilter) whereClause {
 	return w
 }
 
+// buildAPIKeyFilter turns an APIKeyFilter into a WHERE clause for the
+// api_keys table. Mirrors buildUsageFilter. Cycle
+// 20260516-keys-management-redesign.
+//
+// Routing semantics: "default" sentinel maps to empty-string storage
+// (the default-routing-strategy keys carry routing_strategy=''). Non-
+// empty values match the storage value exactly.
+//
+// Search uses LOWER(name) LIKE LOWER(?) so case-insensitive matching
+// works for unicode names — SQLite's default LIKE is ASCII-only
+// case-insensitive (spec-review m5).
+func buildAPIKeyFilter(f APIKeyFilter) whereClause {
+	var w whereClause
+	if f.Search != "" {
+		w.add("LOWER(name) LIKE LOWER(?)", "%"+f.Search+"%")
+	}
+	if f.Routing == "default" {
+		w.add("routing_strategy = ?", "")
+	} else if f.Routing != "" {
+		w.add("routing_strategy = ?", f.Routing)
+	}
+	if f.HasBudget != nil {
+		if *f.HasBudget {
+			w.add("budget_monthly > ?", 0.0)
+		} else {
+			w.add("budget_monthly = ?", 0.0)
+		}
+	}
+	return w
+}
+
 // buildUsageFilter turns a UsageFilter into a WHERE clause.
+//
+// Multi-key precedence: APIKeyIDs (non-empty) wins over APIKeyID;
+// cycle 20260517-usage-page-filters spec collision rule.
 func buildUsageFilter(f UsageFilter) whereClause {
 	var w whereClause
 	if f.Provider != "" {
@@ -56,7 +90,12 @@ func buildUsageFilter(f UsageFilter) whereClause {
 	if !f.To.IsZero() {
 		w.add("created_at <= ?", f.To.UTC().Format("2006-01-02T15:04:05Z"))
 	}
-	if f.APIKeyID != "" {
+	if len(f.APIKeyIDs) > 0 {
+		w.conds = append(w.conds, "api_key_id IN ("+placeholders(len(f.APIKeyIDs))+")")
+		for _, id := range f.APIKeyIDs {
+			w.params = append(w.params, id)
+		}
+	} else if f.APIKeyID != "" {
 		w.add("api_key_id = ?", f.APIKeyID)
 	}
 	return w

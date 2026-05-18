@@ -45,11 +45,49 @@ func TestMigrations_AllTablesCreated(t *testing.T) {
 		}
 	}
 
-	// Verify all migrations were recorded (5 initial + 006/007/008/009/010/011 = 11).
+	// Verify all migrations were recorded. Count grows as cycles ship.
+	// 014 added at cycle 20260517-usage-page-filters T3 — swaps the
+	// standalone idx_usage_log_api_key_id for a composite with created_at.
 	var migrationCount int
 	s.db.QueryRow("SELECT COUNT(*) FROM _migrations").Scan(&migrationCount)
-	if migrationCount != 11 {
-		t.Errorf("expected 11 migrations recorded, got %d", migrationCount)
+	if migrationCount != 14 {
+		t.Errorf("expected 14 migrations recorded, got %d", migrationCount)
+	}
+}
+
+// TestMigration014_IndexSwap pins the index swap performed by migration
+// 014: the standalone idx_usage_log_api_key_id MUST be dropped, and the
+// composite idx_usage_log_api_key_id_created_at MUST exist. Cycle
+// 20260517-usage-page-filters T3.
+func TestMigration014_IndexSwap(t *testing.T) {
+	db, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	s := db.(*sqliteStore)
+
+	var standaloneCount int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_log_api_key_id'`,
+	).Scan(&standaloneCount); err != nil {
+		t.Fatalf("query standalone index: %v", err)
+	}
+	if standaloneCount != 0 {
+		t.Errorf("expected idx_usage_log_api_key_id to be dropped, but it still exists")
+	}
+
+	var compositeCount int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_log_api_key_id_created_at'`,
+	).Scan(&compositeCount); err != nil {
+		t.Fatalf("query composite index: %v", err)
+	}
+	if compositeCount != 1 {
+		t.Errorf("expected idx_usage_log_api_key_id_created_at to exist, found %d", compositeCount)
 	}
 }
 
@@ -629,5 +667,93 @@ func TestMigration006_NormalizesAuthType(t *testing.T) {
 		if got != expect {
 			t.Errorf("connection %s: auth_type = %q, want %q", id, got, expect)
 		}
+	}
+}
+
+// TestMigration013_DropsExchangedTokenColumn verifies migration 013 succeeds
+// against a fresh DB: the `exchanged_token` column on `connections` no
+// longer exists after Migrate() runs. Cycle 20260517-provider-auth-variants
+// M2.6.4 — see decision-codex-subscription-contract.md for why the column
+// was removed (RFC 8693 chain was wrong-path).
+func TestMigration013_DropsExchangedTokenColumn(t *testing.T) {
+	db, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	s := db.(*sqliteStore)
+
+	// Probe the column list. Old shape: `exchanged_token TEXT NOT NULL DEFAULT ''`.
+	// New shape (post-013): column absent. SELECT exchanged_token should error.
+	_, err = s.db.Query("SELECT exchanged_token FROM connections LIMIT 0")
+	if err == nil {
+		t.Errorf("post-migration-013: SELECT exchanged_token did NOT error — column still exists")
+	}
+}
+
+// TestMigration013_ExistingSubscriptionConnectionsKeepRouting (AC-R6 / C4
+// review-fold) — pins that an openai+subscription row created BEFORE
+// migration 013 (when `exchanged_token` was a column) still round-trips
+// after migration with AccessToken preserved. CodexSubscriptionExecutor
+// uses AccessToken directly (no exchanged_token needed), so the row
+// remains routable post-migration without re-auth.
+//
+// Implementation note: since the migration table records 013 as already
+// applied on a fresh schema, we simulate "pre-migration row" by:
+//  1. Apply migrations.
+//  2. Insert a connection via the production CreateConnection path
+//     (the new connCols list, no exchanged_token).
+//  3. Verify GetConnection returns it intact.
+// The harder case (a DB file that started on schema 012 and migrates
+// forward to 013 in-place) is exercised at deployment time; here we pin
+// the equivalence between "row inserted post-013" and "row that survived
+// the DROP COLUMN" — both end up with the same fields.
+func TestMigration013_ExistingSubscriptionConnectionsKeepRouting(t *testing.T) {
+	db, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	conn := &Connection{
+		ID:           "sub-conn-r6",
+		Provider:     "openai",
+		Name:         "Pre-013 OpenAI Subscription",
+		AuthType:     "subscription",
+		AccessToken:  "pkce-access-token-survives-013",
+		RefreshToken: "pkce-refresh-token",
+		Priority:     0,
+		State:        "idle",
+	}
+	if err := db.CreateConnection(conn); err != nil {
+		t.Fatalf("CreateConnection: %v", err)
+	}
+
+	got, err := db.GetConnection(conn.ID)
+	if err != nil {
+		t.Fatalf("GetConnection: %v", err)
+	}
+	if got.AccessToken != conn.AccessToken {
+		t.Errorf("AccessToken roundtrip: got %q, want %q (must survive migration 013 for variant routing)", got.AccessToken, conn.AccessToken)
+	}
+	if got.RefreshToken != conn.RefreshToken {
+		t.Errorf("RefreshToken roundtrip: got %q, want %q", got.RefreshToken, conn.RefreshToken)
+	}
+	if got.AuthType != "subscription" {
+		t.Errorf("AuthType = %q, want subscription", got.AuthType)
+	}
+	if got.Provider != "openai" {
+		t.Errorf("Provider = %q, want openai", got.Provider)
+	}
+	// AccessToken is what CodexSubscriptionExecutor uses as Bearer; pin its
+	// non-emptiness as the load-bearing assertion for variant routing.
+	if got.AccessToken == "" {
+		t.Error("AccessToken empty — CodexSubscriptionExecutor's PreflightChecker would reject this connection")
 	}
 }

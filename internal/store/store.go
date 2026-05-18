@@ -43,7 +43,14 @@ type Store interface {
 	ListAliases() (map[string]string, error)
 
 	// API Keys
-	ListAPIKeys() ([]APIKey, error)
+	// ListAPIKeysPaged returns a paginated + filtered slice of API keys
+	// + the unfiltered/filtered total for pagination math. Replaces the
+	// prior `ListAPIKeys() ([]APIKey, error)` method as of cycle
+	// 20260516-keys-management-redesign. Callers compose APIKeyFilter
+	// with Search/Routing/HasBudget/Limit/Offset; pass a zero filter
+	// (empty struct) to list all keys (used by /api/keys without query
+	// params; handler defaults Limit to 25).
+	ListAPIKeysPaged(filter APIKeyFilter) (*APIKeyPage, error)
 	GetAPIKeyByHash(keyHash string) (*APIKey, error)
 	CreateAPIKey(k *APIKey) error
 	UpdateAPIKey(id string, updates map[string]any) error
@@ -111,13 +118,15 @@ type Store interface {
 
 // Connection represents a configured provider connection.
 type Connection struct {
-	ID              string          `json:"id"`
-	Provider        string          `json:"provider"`
-	Name            string          `json:"name"`
-	AuthType        string          `json:"auth_type"`
-	AccessToken     string          `json:"access_token,omitempty"`
-	RefreshToken    string          `json:"refresh_token,omitempty"`
-	APIKey          string          `json:"api_key,omitempty"`
+	ID           string `json:"id"`
+	Provider     string `json:"provider"`
+	Name         string `json:"name"`
+	AuthType     string `json:"auth_type"`
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	// ExchangedToken field removed in cycle 20260517-provider-auth-variants
+	// M2.6.3. Column drop via migration 013 in M2.6.4.
+	APIKey string `json:"api_key,omitempty"`
 	Priority        int             `json:"priority"`
 	State           string          `json:"state"`
 	ExpiresAt       *time.Time      `json:"expires_at,omitempty"`
@@ -140,6 +149,33 @@ type Combo struct {
 	Name      string   `json:"name"`
 	Models    []string `json:"models"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// APIKeyFilter narrows ListAPIKeysPaged results. All fields optional.
+// Cycle 20260516-keys-management-redesign. Mirrors UsageFilter pattern.
+type APIKeyFilter struct {
+	Search    string // case-insensitive substring match on Name
+	Routing   string // "" = any | "default" = empty-strategy keys | "fast"|"balanced"|"cheap"|"best"
+	HasBudget *bool  // nil = no filter; true = BudgetMonthly > 0; false = == 0
+	Limit     int    // page size; handler clamps to 1..200
+	Offset    int    // ≥ 0
+	// SortField + SortDir control table ordering. AC-A2 of post-review
+	// revision: dashboard table headers click-to-sort on Name and
+	// Created. Empty SortField = default created_at DESC (matches the
+	// prior bare-list behavior). Whitelisted at the handler boundary —
+	// see parseSortParam in routes_api.go. Storage column names: "name",
+	// "created_at". Direction: "asc" | "desc".
+	SortField string
+	SortDir   string
+}
+
+// APIKeyPage is the result envelope for ListAPIKeysPaged. Replaces the
+// old bare-array response of ListAPIKeys (which is removed in this cycle).
+type APIKeyPage struct {
+	Items  []APIKey `json:"items"`
+	Total  int      `json:"total"`
+	Limit  int      `json:"limit"`
+	Offset int      `json:"offset"`
 }
 
 // APIKey represents a hashed API key for authenticating requests to sage-router.
@@ -175,7 +211,16 @@ type UsageEntry struct {
 	// "subscription" means the user paid a flat subscription fee — Cost is
 	// 0 and the dashboard computes "savings" against the would-have-been
 	// API cost via the pricing table.
-	CostSource string        `json:"cost_source"`
+	CostSource string `json:"cost_source"`
+	// EstimatedAPICost is the would-have-been-API cost for this row,
+	// computed at query time via the current pricing table. For apikey
+	// rows this equals Cost (within rounding); for subscription rows
+	// this is the savings value the dashboard renders parenthetically.
+	// TRANSIENT — populated by handleGetUsage at read time; never
+	// persisted (no usage_log column). Mirrors the query-time semantic
+	// of UsageSummary.SubscriptionSavings at routes_api.go:843-861.
+	// Initiative 20260515-cost-savings-display.
+	EstimatedAPICost float64 `json:"estimated_api_cost"`
 	Latency    time.Duration `json:"latency"`
 	Status     string        `json:"status"`
 	CreatedAt  time.Time     `json:"created_at"`
@@ -183,12 +228,13 @@ type UsageEntry struct {
 
 // UsageFilter controls which usage entries are returned or summarised.
 type UsageFilter struct {
-	Provider string    `json:"provider,omitempty"`
-	Model    string    `json:"model,omitempty"`
-	APIKeyID string    `json:"api_key_id,omitempty"`
-	From     time.Time `json:"from,omitempty"`
-	To       time.Time `json:"to,omitempty"`
-	Limit    int       `json:"limit,omitempty"`
+	Provider  string    `json:"provider,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	APIKeyID  string    `json:"api_key_id,omitempty"`
+	APIKeyIDs []string  `json:"api_key_ids,omitempty"`
+	From      time.Time `json:"from,omitempty"`
+	To        time.Time `json:"to,omitempty"`
+	Limit     int       `json:"limit,omitempty"`
 }
 
 // UsageSummary is an aggregated view of usage data.
