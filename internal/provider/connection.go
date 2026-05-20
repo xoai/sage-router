@@ -27,8 +27,18 @@ type Connection struct {
 	Priority int
 	AuthType string
 
-	mu              sync.RWMutex
-	state           State
+	mu    sync.RWMutex
+	state State
+
+	// M2 three-facet connection-health model (cycle 20260520-m2-circuit-breaker,
+	// ADR-1). These land alongside the old `state` field during the strangler
+	// migration; `state` and the old State enum are removed in plan T6/T14.
+	breaker          BreakerState
+	auth             AuthState
+	lifecycle        LifecycleState
+	failureKind      FailureKind
+	halfOpenInFlight bool
+
 	lastUsedAt      time.Time
 	consecutiveUses int
 	modelLocks      map[string]time.Time // model → rate-limit expiry
@@ -50,6 +60,9 @@ func NewConnection(id, provider, name string, priority int, authType string) *Co
 		Priority:      priority,
 		AuthType:      authType,
 		state:         StateIdle,
+		breaker:       BreakerClosed,
+		auth:          AuthValid,
+		lifecycle:     LifecycleIdle,
 		modelLocks:    make(map[string]time.Time),
 		modelDenylist: make(map[string]time.Time),
 	}
@@ -457,4 +470,173 @@ func (c *Connection) ModelLocksSnapshot() map[string]time.Time {
 		}
 	}
 	return out
+}
+
+// ── M2 three-facet model: breaker / auth / lifecycle methods ──
+//
+// New code (cycle 20260520-m2-circuit-breaker, plan T5) alongside the old
+// State enum. T6 rewrites the old State()/Mark*/IsAvailable surface as shims
+// over these facets; T14 deletes the old enum.
+
+// Breaker returns the transient-health facet (thread-safe).
+func (c *Connection) Breaker() BreakerState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.breaker
+}
+
+// Auth returns the credential-validity facet (thread-safe).
+func (c *Connection) Auth() AuthState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.auth
+}
+
+// Lifecycle returns the request-lifecycle facet (thread-safe).
+func (c *Connection) Lifecycle() LifecycleState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lifecycle
+}
+
+// FailureKind returns the kind of the failure that last opened the breaker.
+func (c *Connection) FailureKind() FailureKind {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.failureKind
+}
+
+// Selectable reports whether the Selector may hand this connection a request
+// for the given model. The rule (ADR-1 §Selectability): the breaker is CLOSED
+// or HALF_OPEN, the credential is valid, the connection is not operator-
+// disabled, and — for a non-empty model — there is no live model-scoped
+// rate-limit lock, no live post-403 denylist entry, and the subscription tier
+// permits the model. A blank model skips the per-model checks.
+func (c *Connection) Selectable(model string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.selectableLocked(model)
+}
+
+// selectableLocked is the lock-free selectability check. The caller must hold
+// c.mu (read or write).
+func (c *Connection) selectableLocked(model string) bool {
+	if c.breaker != BreakerClosed && c.breaker != BreakerHalfOpen {
+		return false
+	}
+	if c.auth != AuthValid {
+		return false
+	}
+	if c.lifecycle == LifecycleDisabled {
+		return false
+	}
+	if model == "" {
+		return true
+	}
+	now := time.Now()
+	if exp, locked := c.modelLocks[model]; locked && now.Before(exp) {
+		return false
+	}
+	if until, denied := c.modelDenylist[model]; denied && now.Before(until) {
+		return false
+	}
+	// Subscription-tier allowlist. AuthType is immutable and SubscriptionAllowed
+	// is a pure registry lookup, so this is safe under the held lock.
+	if c.AuthType == auth.AuthTypeSubscription && !providers.SubscriptionAllowed(c.Provider, model) {
+		return false
+	}
+	return true
+}
+
+// TryClaimHalfOpenTrial reports whether this connection is selectable for the
+// model and, when its breaker is HALF_OPEN, atomically claims the single trial
+// slot (compare-and-set halfOpenInFlight false→true). A CLOSED connection is
+// selectable without consuming a slot. A HALF_OPEN connection is selectable
+// only if the claim wins — the losing caller falls through to the next
+// candidate. The claimer MUST pair this with ReleaseHalfOpenTrial on every
+// terminal path of the request (spec §4).
+func (c *Connection) TryClaimHalfOpenTrial(model string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.selectableLocked(model) {
+		return false
+	}
+	if c.breaker == BreakerHalfOpen {
+		if c.halfOpenInFlight {
+			return false // the single trial slot is already taken
+		}
+		c.halfOpenInFlight = true
+	}
+	return true
+}
+
+// ReleaseHalfOpenTrial frees the HALF_OPEN single-trial slot. It is idempotent
+// — releasing an unclaimed slot is a no-op — so a caller may defer it
+// unconditionally after any Select, covering every terminal path (success,
+// trial failure, executor error, context cancel, panic unwind).
+func (c *Connection) ReleaseHalfOpenTrial() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.halfOpenInFlight = false
+}
+
+// OpenBreaker opens the circuit breaker after a failed request: it records the
+// failure kind, escalates the backoff level, sets cooldownUntil from
+// CooldownFor (honoring retryAfter for rate-limit/quota), sets a model-scoped
+// lock when model is non-empty, and returns an Active connection to Idle. A
+// failed HALF_OPEN trial is OpenBreaker observing a HALF_OPEN breaker.
+// Re-opening an already-OPEN breaker is rejected (errors.Is ErrTransitionRejected).
+func (c *Connection) OpenBreaker(kind FailureKind, retryAfter time.Duration, model string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !CanTransitionBreaker(c.breaker, BreakerOpen) {
+		return rejectedTransition("OpenBreaker", string(c.breaker), string(BreakerOpen))
+	}
+	c.breaker = BreakerOpen
+	c.failureKind = kind
+	if c.backoffLevel < MaxBackoffLevel {
+		c.backoffLevel++
+	}
+	c.cooldownUntil = time.Now().Add(CooldownFor(kind, c.backoffLevel, retryAfter))
+	if model != "" {
+		c.modelLocks[model] = c.cooldownUntil
+	}
+	if c.lifecycle == LifecycleActive {
+		c.lifecycle = LifecycleIdle
+	}
+	c.halfOpenInFlight = false
+	return nil
+}
+
+// ToHalfOpen moves an OPEN breaker to HALF_OPEN — the timer-driven recovery
+// step the HealthChecker performs once cooldownUntil has elapsed. It resets
+// the trial slot so the next Selector pick can claim it.
+func (c *Connection) ToHalfOpen() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !CanTransitionBreaker(c.breaker, BreakerHalfOpen) {
+		return rejectedTransition("ToHalfOpen", string(c.breaker), string(BreakerHalfOpen))
+	}
+	c.breaker = BreakerHalfOpen
+	c.halfOpenInFlight = false
+	return nil
+}
+
+// SetFacetsForTest seeds the three facets directly, bypassing the transition
+// rules. Test-only — production code transitions facets via OpenBreaker /
+// ToHalfOpen / the Mark* methods. The "ForTest" suffix is deliberately ugly so
+// reviewers notice if it leaks into a non-test path (cf. SetCredentialForTest).
+func (c *Connection) SetFacetsForTest(breaker BreakerState, authState AuthState, lifecycle LifecycleState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.breaker = breaker
+	c.auth = authState
+	c.lifecycle = lifecycle
+}
+
+// rejectedTransition builds an error for an illegal facet transition. It wraps
+// ErrTransitionRejected so callers can errors.Is it — the same contract the
+// old State-enum transitions use.
+func rejectedTransition(op, from, to string) error {
+	return fmt.Errorf("%s: transition %s→%s rejected: %w", op, from, to, ErrTransitionRejected)
 }
