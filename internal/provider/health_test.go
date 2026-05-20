@@ -5,95 +5,75 @@ import (
 	"time"
 )
 
-func TestHealthChecker_CooldownRecovery(t *testing.T) {
+// TestHealthChecker_OpenToHalfOpenOnCooldownExpiry: once an OPEN breaker's
+// cooldown has elapsed, the health checker promotes it to HALF_OPEN so the
+// Selector can run a single trial request (M2 spec §6 — timer-driven recovery).
+func TestHealthChecker_OpenToHalfOpenOnCooldownExpiry(t *testing.T) {
 	sel := NewSelector()
 	c := NewConnection("c1", "anthropic", "test", 0, "apikey")
 	sel.Register(c)
 
-	// Put connection into cooldown with an already-expired timer.
+	c.SetFacetsForTest(BreakerOpen, AuthValid, LifecycleIdle)
 	c.mu.Lock()
-	c.state = StateCooldown
-	c.cooldownUntil = time.Now().Add(-1 * time.Second)
+	c.cooldownUntil = time.Now().Add(-1 * time.Second) // already elapsed
 	c.mu.Unlock()
 
-	// Verify connection is not available (cooldown check uses time.Now inside IsAvailable,
-	// but the cooldown is already expired so it should be available via IsAvailable).
-	// The health checker should transition it back to Idle.
 	hc := NewHealthChecker(sel, 100*time.Millisecond)
-	hc.check() // Run a single check cycle.
+	hc.check() // a single check cycle
 
-	if c.State() != StateIdle {
-		t.Fatalf("expected Idle after cooldown expiry, got %s", c.State())
+	if c.Breaker() != BreakerHalfOpen {
+		t.Fatalf("expected HALF_OPEN after cooldown expiry, got %s", c.Breaker())
 	}
 }
 
-func TestHealthChecker_CooldownNotExpired(t *testing.T) {
+// TestHealthChecker_OpenStaysOpenBeforeCooldown: an OPEN breaker whose cooldown
+// has not yet elapsed is left OPEN.
+func TestHealthChecker_OpenStaysOpenBeforeCooldown(t *testing.T) {
 	sel := NewSelector()
 	c := NewConnection("c1", "anthropic", "test", 0, "apikey")
 	sel.Register(c)
 
-	// Put connection into cooldown with a future timer.
+	c.SetFacetsForTest(BreakerOpen, AuthValid, LifecycleIdle)
 	c.mu.Lock()
-	c.state = StateCooldown
 	c.cooldownUntil = time.Now().Add(10 * time.Minute)
 	c.mu.Unlock()
 
 	hc := NewHealthChecker(sel, 100*time.Millisecond)
 	hc.check()
 
-	if c.State() != StateCooldown {
-		t.Fatalf("expected Cooldown to remain, got %s", c.State())
+	if c.Breaker() != BreakerOpen {
+		t.Fatalf("expected OPEN to remain before cooldown elapses, got %s", c.Breaker())
 	}
 }
 
-func TestHealthChecker_ErroredAutoRecovery(t *testing.T) {
+// TestHealthChecker_HalfOpenLeftUntouched: the checker acts only on OPEN
+// breakers — an already-HALF_OPEN connection (a trial in progress) is left
+// alone, so a slow trial is not disturbed (AC7).
+func TestHealthChecker_HalfOpenLeftUntouched(t *testing.T) {
 	sel := NewSelector()
-	c := NewConnection("c1", "openai", "test", 0, "apikey")
+	c := NewConnection("c1", "anthropic", "test", 0, "apikey")
 	sel.Register(c)
 
-	// Put connection into errored state with lastUsedAt > 5 minutes ago.
+	c.SetFacetsForTest(BreakerHalfOpen, AuthValid, LifecycleIdle)
 	c.mu.Lock()
-	c.state = StateErrored
-	c.lastUsedAt = time.Now().Add(-6 * time.Minute)
-	c.backoffLevel = 3
+	c.cooldownUntil = time.Now().Add(-1 * time.Second) // elapsed — irrelevant once HALF_OPEN
 	c.mu.Unlock()
 
 	hc := NewHealthChecker(sel, 100*time.Millisecond)
 	hc.check()
 
-	if c.State() != StateIdle {
-		t.Fatalf("expected Idle after grace period, got %s", c.State())
-	}
-	if c.BackoffLevel() != 0 {
-		t.Fatalf("expected backoff reset to 0, got %d", c.BackoffLevel())
+	if c.Breaker() != BreakerHalfOpen {
+		t.Fatalf("expected HALF_OPEN to remain untouched, got %s", c.Breaker())
 	}
 }
 
-func TestHealthChecker_ErroredTooRecent(t *testing.T) {
-	sel := NewSelector()
-	c := NewConnection("c1", "openai", "test", 0, "apikey")
-	sel.Register(c)
-
-	// Errored but used recently — should NOT auto-recover.
-	c.mu.Lock()
-	c.state = StateErrored
-	c.lastUsedAt = time.Now().Add(-1 * time.Minute)
-	c.mu.Unlock()
-
-	hc := NewHealthChecker(sel, 100*time.Millisecond)
-	hc.check()
-
-	if c.State() != StateErrored {
-		t.Fatalf("expected Errored to remain (too recent), got %s", c.State())
-	}
-}
-
+// TestHealthChecker_ModelLockCleanup: expired model-scoped locks are
+// garbage-collected; active ones remain.
 func TestHealthChecker_ModelLockCleanup(t *testing.T) {
 	sel := NewSelector()
 	c := NewConnection("c1", "anthropic", "test", 0, "apikey")
 	sel.Register(c)
 
-	// Add expired and active model locks.
 	c.mu.Lock()
 	c.modelLocks["expired-model"] = time.Now().Add(-1 * time.Second)
 	c.modelLocks["active-model"] = time.Now().Add(10 * time.Minute)
@@ -119,7 +99,7 @@ func TestHealthChecker_StartStop(t *testing.T) {
 	sel := NewSelector()
 	hc := NewHealthChecker(sel, 50*time.Millisecond)
 	hc.Start()
-	time.Sleep(120 * time.Millisecond) // Let at least one tick run.
+	time.Sleep(120 * time.Millisecond) // let at least one tick run
 	hc.Stop()
-	// If Stop() hangs, the test will timeout — that IS the test.
+	// If Stop() hangs, the test times out — that IS the test.
 }

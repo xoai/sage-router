@@ -70,38 +70,34 @@ func (h *HealthChecker) check() {
 	}
 }
 
+// checkConnection performs the health checker's per-connection work: the
+// timer-driven OPEN→HALF_OPEN breaker recovery, plus model-lock GC. Once an
+// OPEN breaker's cooldown has elapsed the connection is promoted to HALF_OPEN
+// so the Selector can run a single trial request (M2, ADR-1 / spec §6). The
+// checker acts only on OPEN breakers — a CLOSED or HALF_OPEN connection is
+// left untouched, so a slow in-flight trial is not disturbed. A failed
+// credential refresh is no longer auto-recovered here: it stays
+// Auth=AuthExpired and is re-driven by the refresh loop.
 func (h *HealthChecker) checkConnection(c *Connection, now time.Time) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	switch c.state {
-	case StateCooldown:
-		// If cooldown has expired, transition back to Idle.
-		if !c.cooldownUntil.IsZero() && now.After(c.cooldownUntil) {
-			if err := c.transitionLocked(StateIdle); err == nil {
-				c.cooldownUntil = time.Time{}
-				slog.Info("health: cooldown expired, connection restored",
-					"connection", c.ID, "provider", c.Provider)
-			}
-		}
-
-	case StateErrored:
-		// Auto-recover errored connections after a grace period (5 minutes).
-		grace := 5 * time.Minute
-		if !c.lastUsedAt.IsZero() && now.Sub(c.lastUsedAt) > grace {
-			if err := c.transitionLocked(StateIdle); err == nil {
-				c.backoffLevel = 0
-				c.lastError = nil
-				slog.Info("health: errored connection auto-recovered",
-					"connection", c.ID, "provider", c.Provider)
-			}
-		}
-	}
-
-	// Garbage-collect expired model locks regardless of state.
+	breaker := c.breaker
+	cooldownElapsed := !c.cooldownUntil.IsZero() && now.After(c.cooldownUntil)
+	// Garbage-collect expired model-scoped locks, regardless of breaker state.
 	for model, expiry := range c.modelLocks {
 		if now.After(expiry) {
 			delete(c.modelLocks, model)
+		}
+	}
+	c.mu.Unlock()
+
+	// Timer-driven OPEN→HALF_OPEN. ToHalfOpen acquires c.mu itself, so it is
+	// called only after the lock above is released (the lock-discipline rule).
+	// ToHalfOpen's own transition check makes a concurrent breaker change
+	// between the read and the call harmless.
+	if breaker == BreakerOpen && cooldownElapsed {
+		if err := c.ToHalfOpen(); err == nil {
+			slog.Info("health: breaker cooldown elapsed, connection half-open",
+				"connection", c.ID, "provider", c.Provider)
 		}
 	}
 }
