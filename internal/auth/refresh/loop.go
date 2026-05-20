@@ -14,8 +14,8 @@ import (
 const (
 	defaultLoopInterval = 30 * time.Second
 	defaultRateLimit    = 200 * time.Millisecond // 5 refreshes/sec, generous to providers
-	disableThreshold    = 3                       // consecutive refresh failures before auto-disable
-	preemptiveBuffer    = 5 * time.Minute         // refresh when token expires within this window
+	disableThreshold    = 3                      // consecutive refresh failures before auto-disable
+	preemptiveBuffer    = 5 * time.Minute        // refresh when token expires within this window
 )
 
 // CredentialStore is the narrow view of auth.AuthStore the loop needs.
@@ -114,7 +114,7 @@ func (l *Loop) tick(ctx context.Context) {
 // refreshOne handles a single connection. The decision tree:
 //
 //   - In AuthExpired → drive the full state machine
-//     (AuthExpired → Refreshing → {Active|Errored}).
+//     (AuthExpired → Refreshing → {AuthValid|AuthExpired}).
 //   - In Idle/Active with cred expiring within the buffer → refresh
 //     transparently, no state-machine transition. (Skipping for
 //     non-Idle/Active states avoids racing with in-flight requests.)
@@ -140,14 +140,19 @@ func (l *Loop) refreshOne(ctx context.Context, c *provider.Connection) {
 	cred.Provider = c.Provider
 	cred.ConnectionID = c.ID
 
-	state := c.State()
-	inAuthExpired := state == provider.StateAuthExpired
+	authState := c.Auth()
+	inAuthExpired := authState == provider.AuthExpired
 
 	if !inAuthExpired {
-		// Only proactively refresh Idle/Active connections that are
-		// expiring soon. Skip Refreshing (already in progress) and
-		// Errored/Disabled (operator action required).
-		if state != provider.StateIdle && state != provider.StateActive {
+		// Only proactively refresh a healthy Idle/Active connection whose
+		// credential is expiring soon. Skip a connection mid-refresh
+		// (Auth=Refreshing), one with a tripped breaker (a transient
+		// cooldown — not an auth problem), and an operator-Disabled one —
+		// none of those want a transparent token swap. (AuthExpired is
+		// handled by the branch below.)
+		if authState != provider.AuthValid ||
+			c.Breaker() != provider.BreakerClosed ||
+			c.Lifecycle() == provider.LifecycleDisabled {
 			return
 		}
 		if !cred.ExpiresWithin(preemptiveBuffer) {
@@ -179,8 +184,10 @@ func (l *Loop) refreshOne(ctx context.Context, c *provider.Connection) {
 		}
 
 		if inAuthExpired {
-			// Drive Refreshing → Errored. Failure to mark is logged but
-			// we still attempt the disable path.
+			// Drive Refreshing → AuthExpired (the facet model — NOT Errored;
+			// staying AuthExpired is what lets the next tick re-drive this
+			// connection). Failure to mark is logged but we still attempt the
+			// disable path.
 			if merr := c.MarkRefreshFailure(err); merr != nil {
 				slog.Warn("refresh loop: MarkRefreshFailure rejected",
 					"conn_id", c.ID, "err", merr)

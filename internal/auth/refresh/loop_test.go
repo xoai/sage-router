@@ -166,9 +166,12 @@ func TestLoop_ProactivelyRefreshesIdleExpiringConn(t *testing.T) {
 	if store.putCalls != 1 {
 		t.Errorf("PutCredential calls = %d, want 1", store.putCalls)
 	}
-	// State should remain Idle — no state transition for proactive refresh.
-	if got, want := conn.State(), provider.StateIdle; got != want {
-		t.Errorf("state = %v, want %v (no transition on proactive refresh)", got, want)
+	// No state-machine transition for a proactive refresh — facets unchanged.
+	if got := conn.Auth(); got != provider.AuthValid {
+		t.Errorf("auth = %v, want valid (no transition on proactive refresh)", got)
+	}
+	if got := conn.Lifecycle(); got != provider.LifecycleIdle {
+		t.Errorf("lifecycle = %v, want idle (no transition on proactive refresh)", got)
 	}
 	// Cache should be invalidated so next request loads from updated DB.
 	if conn.HasCredential() {
@@ -223,11 +226,13 @@ func TestLoop_AuthExpiredHappyPath(t *testing.T) {
 
 	l.tick(context.Background())
 
-	// AuthExpired → Refreshing → AuthValid; a refreshed, idle connection
-	// derives to StateIdle (the facet model — the old enum reused "Active"
-	// for "refreshed and ready").
-	if got, want := conn.State(), provider.StateIdle; got != want {
-		t.Errorf("state = %v, want %v", got, want)
+	// AuthExpired → Refreshing → AuthValid; lifecycle is left Idle (the facet
+	// model — the old enum reused "Active" for "refreshed and ready").
+	if got := conn.Auth(); got != provider.AuthValid {
+		t.Errorf("auth = %v, want valid after a successful refresh", got)
+	}
+	if got := conn.Lifecycle(); got != provider.LifecycleIdle {
+		t.Errorf("lifecycle = %v, want idle after a successful refresh", got)
 	}
 	if store.resetCalls != 1 {
 		t.Errorf("ResetRefreshFailures calls = %d, want 1 after success", store.resetCalls)
@@ -251,8 +256,8 @@ func TestLoop_RevokedRefreshTokenDisablesConn(t *testing.T) {
 
 	l.tick(context.Background())
 
-	if got, want := conn.State(), provider.StateDisabled; got != want {
-		t.Errorf("state = %v, want %v (revoked token should Disable on first failure)", got, want)
+	if got := conn.Lifecycle(); got != provider.LifecycleDisabled {
+		t.Errorf("lifecycle = %v, want disabled (revoked token should Disable on first failure)", got)
 	}
 	if store.failures["s1"] != 1 {
 		t.Errorf("refresh_failures = %d, want 1", store.failures["s1"])
@@ -276,7 +281,7 @@ func TestLoop_TransientFailureDoesNotDisableUntilThreshold(t *testing.T) {
 	})
 
 	// Under the facet model a failed refresh leaves the connection
-	// Auth=AuthExpired (it derives to StateAuthExpired) — NOT Errored — so the
+	// Auth=AuthExpired — NOT Errored — so the
 	// loop re-drives the same connection on its next tick automatically. No
 	// manual "move back to AuthExpired" between ticks is needed; that was an
 	// old-enum workaround for MarkRefreshFailure→Errored taking the connection
@@ -284,8 +289,8 @@ func TestLoop_TransientFailureDoesNotDisableUntilThreshold(t *testing.T) {
 
 	// First failure: AuthExpired → Refreshing → AuthExpired. Not yet disabled.
 	l.tick(context.Background())
-	if got, want := conn.State(), provider.StateAuthExpired; got != want {
-		t.Errorf("after 1 failure: state = %v, want %v", got, want)
+	if got := conn.Auth(); got != provider.AuthExpired {
+		t.Errorf("after 1 failure: auth = %v, want expired", got)
 	}
 	if store.failures["s1"] != 1 {
 		t.Errorf("after 1 failure: refresh_failures = %d, want 1", store.failures["s1"])
@@ -293,8 +298,8 @@ func TestLoop_TransientFailureDoesNotDisableUntilThreshold(t *testing.T) {
 
 	// Second failure — the loop re-drives the still-AuthExpired connection.
 	l.tick(context.Background())
-	if got, want := conn.State(), provider.StateAuthExpired; got != want {
-		t.Errorf("after 2 failures: state = %v, want %v", got, want)
+	if got := conn.Auth(); got != provider.AuthExpired {
+		t.Errorf("after 2 failures: auth = %v, want expired", got)
 	}
 	if store.failures["s1"] != 2 {
 		t.Errorf("after 2 failures: refresh_failures = %d, want 2", store.failures["s1"])
@@ -302,8 +307,8 @@ func TestLoop_TransientFailureDoesNotDisableUntilThreshold(t *testing.T) {
 
 	// Third failure → threshold reached → auto-disable.
 	l.tick(context.Background())
-	if got, want := conn.State(), provider.StateDisabled; got != want {
-		t.Errorf("after 3 failures: state = %v, want %v (auto-disable)", got, want)
+	if got := conn.Lifecycle(); got != provider.LifecycleDisabled {
+		t.Errorf("after 3 failures: lifecycle = %v, want disabled (auto-disable)", got)
 	}
 }
 
@@ -354,9 +359,9 @@ func TestLoop_TickIsResilientToGetCredentialError(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got != 0 {
 		t.Errorf("refresher should not be called when GetCredential fails; got %d", got)
 	}
-	// State should remain AuthExpired (we never marked Refreshing).
-	if got, want := conn.State(), provider.StateAuthExpired; got != want {
-		t.Errorf("state = %v, want %v", got, want)
+	// Auth should remain AuthExpired (we never marked Refreshing).
+	if got := conn.Auth(); got != provider.AuthExpired {
+		t.Errorf("auth = %v, want expired", got)
 	}
 }
 
