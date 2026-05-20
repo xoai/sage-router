@@ -48,10 +48,12 @@ func TestMigrations_AllTablesCreated(t *testing.T) {
 	// Verify all migrations were recorded. Count grows as cycles ship.
 	// 014 added at cycle 20260517-usage-page-filters T3 — swaps the
 	// standalone idx_usage_log_api_key_id for a composite with created_at.
+	// 015 added at cycle 20260520-m2-circuit-breaker T1 — normalizes the
+	// connections.state column to the persistable Lifecycle/Auth vocabulary.
 	var migrationCount int
 	s.db.QueryRow("SELECT COUNT(*) FROM _migrations").Scan(&migrationCount)
-	if migrationCount != 14 {
-		t.Errorf("expected 14 migrations recorded, got %d", migrationCount)
+	if migrationCount != 15 {
+		t.Errorf("expected 15 migrations recorded, got %d", migrationCount)
 	}
 }
 
