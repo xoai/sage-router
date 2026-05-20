@@ -236,6 +236,10 @@ func TestImport_FromFixtureFile(t *testing.T) {
 	if c.AccessToken == "" {
 		t.Error("AccessToken not persisted")
 	}
+	// Persisted lifecycle state is "idle" (M2 facet model — createSubscriptionConnection).
+	if c.State != "idle" {
+		t.Errorf("persisted State = %q, want idle", c.State)
+	}
 	// Selector should know about it.
 	if srv.deps.ProviderSelector.ConnectionByID(connID) == nil {
 		t.Error("connection not registered with selector")

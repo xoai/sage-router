@@ -304,7 +304,11 @@ func (s *Server) createSubscriptionConnection(providerID, name string, priority 
 		AccessToken:  cred.AccessToken,
 		RefreshToken: cred.RefreshToken,
 		Priority:     priority,
-		State:        string(provider.StateIdle),
+		// Persisted lifecycle state. Under the M2 facet model the connection
+		// constructs from provider.NewConnection's defaults (breaker=CLOSED,
+		// auth=AuthValid, lifecycle=Idle); "idle" is the persistable value
+		// migration 015 normalizes to. Matches handleCreateConnection.
+		State: "idle",
 	}
 	if !cred.ExpiresAt.IsZero() {
 		t := cred.ExpiresAt
