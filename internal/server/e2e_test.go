@@ -1759,9 +1759,9 @@ func TestHandleListConnections_RuntimeDivergence(t *testing.T) {
 	srv, db := setupTestServer(t, nil)
 	connID := addConnection(t, srv, db, "openai", "primary", "subscription")
 
-	// DB state stays "idle" (default from addConnection). Transition in-memory
-	// to Cooldown via MarkRateLimited — this simulates the stuck-after-429
-	// scenario where the dashboard would show green but Selector refuses.
+	// DB state stays "idle" (default from addConnection). Open the breaker
+	// in-memory via OpenBreaker — this simulates the stuck-after-429 scenario
+	// where the dashboard would show green but the Selector refuses.
 	pc := srv.deps.ProviderSelector.ConnectionByID(connID)
 	if pc == nil {
 		t.Fatalf("connection not registered in selector")
@@ -1769,8 +1769,8 @@ func TestHandleListConnections_RuntimeDivergence(t *testing.T) {
 	if err := pc.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
-	if err := pc.MarkRateLimited("gpt-5-nano", 0); err != nil {
-		t.Fatalf("MarkRateLimited: %v", err)
+	if err := pc.OpenBreaker(provider.FailureRateLimit, 0, "gpt-5-nano"); err != nil {
+		t.Fatalf("OpenBreaker: %v", err)
 	}
 
 	// Call the handler directly (bypasses protect middleware — same pattern
@@ -1800,7 +1800,7 @@ func TestHandleListConnections_RuntimeDivergence(t *testing.T) {
 	if got := conn["runtime_state"]; got != "cooldown" {
 		t.Errorf("expected runtime_state=cooldown (DB-vs-runtime divergence), got %v", got)
 	}
-	// model_locks must include gpt-5-nano (set by MarkRateLimited).
+	// model_locks must include gpt-5-nano (set by OpenBreaker).
 	locks, ok := conn["model_locks"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected model_locks object, got %T: %v", conn["model_locks"], conn["model_locks"])

@@ -150,12 +150,12 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 
 // legacyRuntimeState derives the legacy connection-state string from the three
 // health facets, for the /api/connections `runtime_state` projection (spec §8
-// of cycle 20260520-m2-circuit-breaker). It mirrors the derivation that
-// provider.Connection.State() performs — including the breaker-open split
-// (failure kind rate_limit → "cooldown", anything else → "errored") — so the
-// dashboard's existing `runtime_state` consumer is byte-for-byte unchanged by
-// the facet migration. The dashboard's own move to render the breaker/auth/
-// lifecycle facet fields directly is a tracked post-M2 deferral.
+// of cycle 20260520-m2-circuit-breaker). The derivation precedence — disabled →
+// auth → breaker → active → idle, with the breaker-open split (failure kind
+// rate_limit → "cooldown", anything else → "errored") — keeps the dashboard's
+// existing `runtime_state` consumer byte-for-byte unchanged by the facet
+// migration. The dashboard's own move to render the breaker/auth/lifecycle
+// facet fields directly is a tracked post-M2 deferral.
 func legacyRuntimeState(breaker provider.BreakerState, authState provider.AuthState, lifecycle provider.LifecycleState, failure provider.FailureKind) string {
 	switch {
 	case lifecycle == provider.LifecycleDisabled:
@@ -254,7 +254,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 		// Only expose it when the connection is in a state where the
 		// user might need to act (errored / disabled / auth_expired);
 		// otherwise it's noise. (Kept gated per fix-plan-review fold:
-		// MarkRateLimited doesn't clear lastError, so cooldowned conns
+		// OpenBreaker doesn't clear lastError, so a connection in cooldown
 		// would surface stale auth errors. Rate-limit context is conveyed
 		// via the structured ModelLocks/CooldownUntil fields below.)
 		//

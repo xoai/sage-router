@@ -31,9 +31,8 @@ type Connection struct {
 
 	// Three-facet connection-health model (cycle 20260520-m2-circuit-breaker,
 	// ADR-1) — the single source of truth. Breaker is transient health, Auth
-	// is credential validity, Lifecycle is the request lifecycle. They replace
-	// the old 8-value State enum (deleted in plan T14); State() derives the
-	// legacy value from these for the backward-compatible API surface.
+	// is credential validity, Lifecycle is the request lifecycle. They replaced
+	// the old 8-value State enum, which conflated the three concerns.
 	breaker          BreakerState
 	auth             AuthState
 	lifecycle        LifecycleState
@@ -65,40 +64,6 @@ func NewConnection(id, provider, name string, priority int, authType string) *Co
 		lifecycle:     LifecycleIdle,
 		modelLocks:    make(map[string]time.Time),
 		modelDenylist: make(map[string]time.Time),
-	}
-}
-
-// State derives the legacy State enum value from the three facets. It is the
-// backward-compatible accessor for callers not yet migrated to Breaker() /
-// Auth() / Lifecycle() (and for the /api/connections legacy-state projection);
-// it is removed with the old enum in plan T14.
-func (c *Connection) State() State {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.deriveStateLocked()
-}
-
-// deriveStateLocked maps the three facets onto the legacy State enum. The
-// caller holds c.mu. Precedence: disabled → auth → breaker → active → idle.
-// (StateRateLimited is never produced — a rate-limited connection derives to
-// StateCooldown, matching the old MarkRateLimited end state.)
-func (c *Connection) deriveStateLocked() State {
-	switch {
-	case c.lifecycle == LifecycleDisabled:
-		return StateDisabled
-	case c.auth == AuthRefreshing:
-		return StateRefreshing
-	case c.auth == AuthExpired:
-		return StateAuthExpired
-	case c.breaker == BreakerOpen || c.breaker == BreakerHalfOpen:
-		if c.failureKind == FailureRateLimit {
-			return StateCooldown
-		}
-		return StateErrored
-	case c.lifecycle == LifecycleActive:
-		return StateActive
-	default:
-		return StateIdle
 	}
 }
 
@@ -151,13 +116,6 @@ func (c *Connection) SetLastError(err error) {
 	c.lastError = err
 }
 
-// IsAvailable reports whether this connection can serve a request for the
-// given model right now — a backward-compatible alias for Selectable, kept
-// for callers not yet migrated off the legacy surface (removed in plan T14).
-func (c *Connection) IsAvailable(model string) bool {
-	return c.Selectable(model)
-}
-
 // MarkUsed transitions the lifecycle facet Idle→Active and updates the usage
 // counters. It rejects (errors.Is ErrTransitionRejected) if the connection is
 // not Idle — the same race-guard the old enum gave callers.
@@ -170,55 +128,6 @@ func (c *Connection) MarkUsed() error {
 	c.lifecycle = LifecycleActive
 	c.lastUsedAt = time.Now()
 	c.consecutiveUses++
-	return nil
-}
-
-// MarkRateLimited records a 429: it opens the breaker with failure kind
-// rate_limit, sets the given backoff level, applies a model-scoped lock, and
-// returns the connection to Idle. It is a transitional shim over the facet
-// model — the migrated request path calls OpenBreaker directly; this is
-// removed in plan T14. It rejects unless the connection is currently Active
-// (the old Active→RateLimited precondition).
-func (c *Connection) MarkRateLimited(model string, backoffLevel int) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lifecycle != LifecycleActive {
-		return rejectedTransition("MarkRateLimited", string(c.lifecycle), string(LifecycleActive))
-	}
-	if backoffLevel < 0 {
-		backoffLevel = 0
-	}
-	if backoffLevel > MaxBackoffLevel {
-		backoffLevel = MaxBackoffLevel
-	}
-	c.backoffLevel = backoffLevel
-	c.breaker = BreakerOpen
-	c.failureKind = FailureRateLimit
-	c.cooldownUntil = time.Now().Add(CalculateCooldown(c.backoffLevel))
-	if model != "" {
-		c.modelLocks[model] = c.cooldownUntil
-	}
-	c.lifecycle = LifecycleIdle
-	c.halfOpenInFlight = false
-	return nil
-}
-
-// MarkErrored records a non-rate-limit upstream failure: it opens the breaker
-// with failure kind errored and returns the connection to Idle. A transitional
-// shim — the migrated request path calls OpenBreaker directly (removed T14).
-// It rejects unless the connection is currently Active.
-func (c *Connection) MarkErrored(err error) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lifecycle != LifecycleActive {
-		return rejectedTransition("MarkErrored", string(c.lifecycle), string(LifecycleActive))
-	}
-	c.lastError = err
-	c.breaker = BreakerOpen
-	c.failureKind = FailureErrored
-	c.cooldownUntil = time.Now().Add(CalculateCooldown(c.backoffLevel))
-	c.lifecycle = LifecycleIdle
-	c.halfOpenInFlight = false
 	return nil
 }
 
@@ -485,9 +394,9 @@ func (c *Connection) ModelLocksSnapshot() map[string]time.Time {
 
 // ── M2 three-facet model: breaker / auth / lifecycle methods ──
 //
-// New code (cycle 20260520-m2-circuit-breaker, plan T5) alongside the old
-// State enum. T6 rewrites the old State()/Mark*/IsAvailable surface as shims
-// over these facets; T14 deletes the old enum.
+// The connection-health surface (cycle 20260520-m2-circuit-breaker). The old
+// State enum and its State()/MarkRateLimited/MarkErrored/IsAvailable surface
+// were removed in plan T14, once every caller had migrated to these facets.
 
 // Breaker returns the transient-health facet (thread-safe).
 func (c *Connection) Breaker() BreakerState {
@@ -523,9 +432,9 @@ func (c *Connection) FailureKind() FailureKind {
 // operator-disabled), and — for a non-empty model — there is no live
 // model-scoped rate-limit lock, no live post-403 denylist entry, and the
 // subscription tier permits the model. A blank model skips the per-model
-// checks. (ADR-1 §Selectability writes the lifecycle clause as "!= Disabled";
-// the old IsAvailable rejected Active too — one in-flight request per
-// connection — so the precise rule is "== Idle".)
+// checks. (ADR-1 §Selectability writes the lifecycle clause as "!= Disabled",
+// but the precise rule is "== Idle" — a connection is at most one in-flight
+// request, so an Active connection is not selectable.)
 func (c *Connection) Selectable(model string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

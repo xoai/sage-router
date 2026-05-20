@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSelectEmptySelector(t *testing.T) {
@@ -86,12 +87,12 @@ func TestSelectRateLimitedSkipped(t *testing.T) {
 	s.Register(c1)
 	s.Register(c2)
 
-	// Put c1 into Cooldown: Idle -> Active -> RateLimited -> Cooldown
+	// Open c1's breaker (rate limited) so the selector skips it.
 	if err := c1.MarkUsed(); err != nil {
 		t.Fatalf("c1 MarkUsed: %v", err)
 	}
-	if err := c1.MarkRateLimited("gpt-4", 1); err != nil {
-		t.Fatalf("c1 MarkRateLimited: %v", err)
+	if err := c1.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+		t.Fatalf("c1 OpenBreaker: %v", err)
 	}
 
 	res, err := s.Select("openai", "gpt-4", nil)
@@ -111,19 +112,19 @@ func TestSelectAllRateLimited(t *testing.T) {
 	s.Register(c1)
 	s.Register(c2)
 
-	// Put both into Cooldown.
+	// Open both breakers (rate limited).
 	if err := c1.MarkUsed(); err != nil {
 		t.Fatalf("c1 MarkUsed: %v", err)
 	}
-	if err := c1.MarkRateLimited("gpt-4", 1); err != nil {
-		t.Fatalf("c1 MarkRateLimited: %v", err)
+	if err := c1.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+		t.Fatalf("c1 OpenBreaker: %v", err)
 	}
 
 	if err := c2.MarkUsed(); err != nil {
 		t.Fatalf("c2 MarkUsed: %v", err)
 	}
-	if err := c2.MarkRateLimited("gpt-4", 2); err != nil {
-		t.Fatalf("c2 MarkRateLimited: %v", err)
+	if err := c2.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+		t.Fatalf("c2 OpenBreaker: %v", err)
 	}
 
 	res, err := s.Select("openai", "gpt-4", nil)
@@ -278,19 +279,21 @@ func TestSelectorAllRateLimited(t *testing.T) {
 	s.Register(c1)
 	s.Register(c2)
 
-	// Put both into Cooldown with different backoff levels.
+	// Open both breakers with distinct cooldowns (c1 sooner than c2) so the
+	// EarliestRetry assertion below is deterministic — CooldownFor honors the
+	// Retry-After verbatim for the rate_limit kind.
 	if err := c1.MarkUsed(); err != nil {
 		t.Fatalf("c1 MarkUsed: %v", err)
 	}
-	if err := c1.MarkRateLimited("gpt-4", 0); err != nil {
-		t.Fatalf("c1 MarkRateLimited: %v", err)
+	if err := c1.OpenBreaker(FailureRateLimit, 1*time.Second, "gpt-4"); err != nil {
+		t.Fatalf("c1 OpenBreaker: %v", err)
 	}
 
 	if err := c2.MarkUsed(); err != nil {
 		t.Fatalf("c2 MarkUsed: %v", err)
 	}
-	if err := c2.MarkRateLimited("gpt-4", 3); err != nil {
-		t.Fatalf("c2 MarkRateLimited: %v", err)
+	if err := c2.OpenBreaker(FailureRateLimit, 8*time.Second, "gpt-4"); err != nil {
+		t.Fatalf("c2 OpenBreaker: %v", err)
 	}
 
 	res, err := s.Select("openai", "gpt-4", nil)
@@ -307,7 +310,7 @@ func TestSelectorAllRateLimited(t *testing.T) {
 		t.Error("expected non-zero EarliestRetry")
 	}
 
-	// EarliestRetry should be the earlier cooldown (c1 with backoff 0 = 1s).
+	// EarliestRetry should be the earlier cooldown (c1 — 1s Retry-After).
 	// c1 cooldown < c2 cooldown, so earliest should be c1's.
 	c1Until := c1.CooldownUntil()
 	c2Until := c2.CooldownUntil()

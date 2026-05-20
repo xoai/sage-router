@@ -1,12 +1,20 @@
 package provider
 
+import "errors"
+
 // The three-facet connection-health model (ADR-1, cycle
 // 20260520-routing-core-hardening M2). The single 8-value provider.State enum
 // conflated three orthogonal concerns; this file introduces them as separate
 // facets — Breaker (transient health), Auth (credential validity), and
 // Lifecycle (request lifecycle) — each with its own small transition table.
-// The old State enum still exists during the strangler migration (plan T1-T13)
-// and is deleted in T14.
+// The old State enum and state.go were deleted in plan T14, once every caller
+// had migrated to the facets.
+
+// ErrTransitionRejected is the sentinel returned when a facet transition is
+// not allowed. Callers use errors.Is to distinguish a benign transition race
+// (e.g. next-connection fallthrough) from a hard failure that should bubble
+// up to the user. Every facet transition method wraps it via rejectedTransition.
+var ErrTransitionRejected = errors.New("state transition rejected")
 
 // BreakerState is the transient-health facet — a circuit breaker. It is
 // in-memory only: never persisted, a connection loads CLOSED on restart.
@@ -92,7 +100,7 @@ var validLifecycleTransitions = map[LifecycleState]map[LifecycleState]bool{
 }
 
 // CanTransitionBreaker reports whether a breaker move is legal. Self-loops are
-// not transitions and return false (consistent with state.go's CanTransition).
+// not transitions and return false.
 func CanTransitionBreaker(from, to BreakerState) bool {
 	return validBreakerTransitions[from][to]
 }
