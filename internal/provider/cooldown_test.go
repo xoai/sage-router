@@ -151,3 +151,45 @@ func TestCooldownNegativeLevel(t *testing.T) {
 		}
 	}
 }
+
+// TestCooldownFor pins the per-failure-kind cooldown (M2, spec §3.1). A
+// rate-limit or quota failure honors an explicit upstream Retry-After hint;
+// transient and errored failures always use the computed exponential.
+func TestCooldownFor(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       FailureKind
+		level      int
+		retryAfter time.Duration
+		want       time.Duration
+	}{
+		// rate_limit — Retry-After honored verbatim when present.
+		{"rate_limit honors Retry-After", FailureRateLimit, 0, 90 * time.Second, 90 * time.Second},
+		{"rate_limit honors Retry-After over backoff", FailureRateLimit, 5, 30 * time.Second, 30 * time.Second},
+		// rate_limit — no header: 60s base, escalating, 15m ceiling.
+		{"rate_limit level 0 => 60s base", FailureRateLimit, 0, 0, 60 * time.Second},
+		{"rate_limit level 2 => 4m", FailureRateLimit, 2, 0, 4 * time.Minute},
+		{"rate_limit high level => clamped to 15m", FailureRateLimit, 20, 0, 15 * time.Minute},
+		// quota — Retry-After honored; else a flat multi-hour fallback (no escalation).
+		{"quota honors Retry-After", FailureQuota, 3, 30 * time.Minute, 30 * time.Minute},
+		{"quota no header => 1h flat", FailureQuota, 0, 0, 1 * time.Hour},
+		{"quota ignores backoff level", FailureQuota, 9, 0, 1 * time.Hour},
+		// transient — the existing CalculateCooldown; Retry-After NOT honored (spec §3.1).
+		{"transient level 3 => 8s", FailureTransient, 3, 0, 8 * time.Second},
+		{"transient ignores Retry-After", FailureTransient, 0, 90 * time.Second, 1 * time.Second},
+		{"transient high level => capped at MaxCooldown", FailureTransient, 10, 0, MaxCooldown},
+		// errored — 5s base (slower than a 5xx blip), escalating, 2m ceiling.
+		{"errored level 0 => 5s base", FailureErrored, 0, 0, 5 * time.Second},
+		{"errored level 2 => 20s", FailureErrored, 2, 0, 20 * time.Second},
+		{"errored high level => capped at MaxCooldown", FailureErrored, 15, 0, MaxCooldown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CooldownFor(tt.kind, tt.level, tt.retryAfter)
+			if got != tt.want {
+				t.Errorf("CooldownFor(%s, %d, %v) = %v, want %v",
+					tt.kind, tt.level, tt.retryAfter, got, tt.want)
+			}
+		})
+	}
+}
