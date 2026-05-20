@@ -2,6 +2,8 @@ package provider
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -451,5 +453,43 @@ func TestSelectorRegisterReplace(t *testing.T) {
 	all := s.AllConnections("openai")
 	if len(all) != 1 {
 		t.Errorf("expected 1 connection after replacement, got %d", len(all))
+	}
+}
+
+// TestSelect_HalfOpenSingleTrialRaceSafe (AC8) pins the HALF_OPEN single-trial
+// gate: when many goroutines concurrently Select the same HALF_OPEN
+// connection, exactly one wins the trial slot (Select claims it via the
+// compare-and-set in TryClaimHalfOpenTrial) and the rest get ErrAllUnavailable.
+// Run under `go test -race`.
+func TestSelect_HalfOpenSingleTrialRaceSafe(t *testing.T) {
+	s := NewSelector()
+	c := NewConnection("c1", "openai", "conn-1", 0, "api_key")
+	s.Register(c)
+
+	// Drive the breaker OPEN → HALF_OPEN so the connection is a probe candidate.
+	if err := c.OpenBreaker(FailureTransient, 0, ""); err != nil {
+		t.Fatalf("OpenBreaker: %v", err)
+	}
+	if err := c.ToHalfOpen(); err != nil {
+		t.Fatalf("ToHalfOpen: %v", err)
+	}
+
+	const goroutines = 64
+	var wg sync.WaitGroup
+	var winners int32
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			res, err := s.Select("openai", "gpt-4", nil)
+			if err == nil && res != nil && res.Connection != nil {
+				atomic.AddInt32(&winners, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&winners); got != 1 {
+		t.Errorf("HALF_OPEN single-trial gate: %d goroutines won the pick, want exactly 1", got)
 	}
 }

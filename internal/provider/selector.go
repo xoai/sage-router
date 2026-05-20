@@ -20,8 +20,12 @@ type SelectResult struct {
 	// Connection is the chosen connection, or nil if none are available.
 	Connection *Connection
 
-	// AllRateLimited is true when every connection for the provider is in
-	// Cooldown or RateLimited state.
+	// AllRateLimited is true when every non-excluded connection for the
+	// provider is unavailable specifically because its breaker is OPEN with a
+	// rate-limit failure kind — a retry-after-cooldown situation, as opposed
+	// to an errored or auth-expired connection. (The name predates the
+	// three-facet model; M2 review MC1 kept it and documented the precise
+	// meaning rather than rename a field consumed across the request path.)
 	AllRateLimited bool
 
 	// EarliestRetry is the earliest time at which a rate-limited connection
@@ -87,16 +91,23 @@ func (s *Selector) removeLocked(id string) {
 	}
 }
 
-// Select picks the best available connection for the given provider and model.
+// Select picks the best selectable connection for the given provider and model.
 //
 // Algorithm:
-//  1. Filter out connections whose IDs appear in excludeIDs.
-//  2. Filter to connections that are available for the requested model.
-//  3. Sort candidates by: state priority (asc) → user priority (asc) → consecutive uses (asc).
-//  4. Return the top candidate.
+//  1. Skip connections whose IDs appear in excludeIDs.
+//  2. Filter to Selectable connections — breaker CLOSED or HALF_OPEN, auth
+//     valid, idle, and the model not rate-limit-locked, not denylisted, and
+//     permitted by the subscription tier.
+//  3. Sort candidates: CLOSED before HALF_OPEN (healthy before probing), then
+//     user priority ascending, then consecutive uses ascending (spread).
+//  4. Walk the sorted candidates and return the first whose HALF_OPEN trial
+//     slot can be claimed — a CLOSED connection always claims without
+//     consuming a slot; a HALF_OPEN connection only if it wins the atomic
+//     compare-and-set (ADR-1 §HALF_OPEN gate). The caller MUST pair the
+//     returned connection with ReleaseHalfOpenTrial on every terminal path.
 //
-// If no candidate is available, the returned SelectResult indicates whether all
-// connections are rate-limited and the earliest retry time.
+// If no candidate is available, the returned SelectResult reports whether
+// every connection is rate-limit-cooling-down, and the earliest retry time.
 func (s *Selector) Select(provider, model string, excludeIDs []string) (*SelectResult, error) {
 	s.mu.RLock()
 	conns, ok := s.conns[provider]
@@ -104,41 +115,31 @@ func (s *Selector) Select(provider, model string, excludeIDs []string) (*SelectR
 		s.mu.RUnlock()
 		return nil, ErrNoConnections
 	}
-
-	// Snapshot the slice reference under read lock; individual connections have
-	// their own locks for state reads.
+	// Snapshot the slice reference under the read lock; each connection has
+	// its own lock for the facet reads below.
 	snapshot := make([]*Connection, len(conns))
 	copy(snapshot, conns)
 	s.mu.RUnlock()
 
-	// Build exclusion set.
 	excluded := make(map[string]bool, len(excludeIDs))
 	for _, id := range excludeIDs {
 		excluded[id] = true
 	}
 
-	// Partition into candidates and rate-limited connections.
 	var candidates []*Connection
 	var rateLimitedCount int
 	var earliestRetry time.Time
-
 	for _, c := range snapshot {
 		if excluded[c.ID] {
 			continue
 		}
-
-		// IsAvailable: state-machine + rate-limit lock for this model.
-		// CanServeModel: auth-context allowlist (subscription tier) +
-		// per-model denylist from prior model-rejection 403s. Both must
-		// be true for a connection to serve this request.
-		if c.IsAvailable(model) && c.CanServeModel(model) {
+		if c.Selectable(model) {
 			candidates = append(candidates, c)
 			continue
 		}
-
-		// Track rate-limited / cooldown connections for the result metadata.
-		st := c.State()
-		if st == StateRateLimited || st == StateCooldown {
+		// Not selectable — track rate-limit cooldowns for the result metadata
+		// (a breaker opened by a 429, as opposed to a transient/errored fault).
+		if c.Breaker() == BreakerOpen && c.FailureKind() == FailureRateLimit {
 			rateLimitedCount++
 			cu := c.CooldownUntil()
 			if earliestRetry.IsZero() || (!cu.IsZero() && cu.Before(earliestRetry)) {
@@ -156,23 +157,44 @@ func (s *Selector) Select(provider, model string, excludeIDs []string) (*SelectR
 		}, ErrAllUnavailable
 	}
 
-	// Sort: state priority ascending, then user priority ascending, then
-	// consecutive uses ascending (spread traffic).
+	// Healthy (CLOSED) candidates before probing (HALF_OPEN) ones, then user
+	// priority ascending, then consecutive uses ascending (spread traffic).
 	sort.SliceStable(candidates, func(i, j int) bool {
-		si := statePriority(candidates[i].State())
-		sj := statePriority(candidates[j].State())
-		if si != sj {
-			return si < sj
+		ri, rj := selectionRank(candidates[i]), selectionRank(candidates[j])
+		if ri != rj {
+			return ri < rj
 		}
-		pi := candidates[i].Priority
-		pj := candidates[j].Priority
-		if pi != pj {
-			return pi < pj
+		if candidates[i].Priority != candidates[j].Priority {
+			return candidates[i].Priority < candidates[j].Priority
 		}
 		return candidates[i].ConsecutiveUses() < candidates[j].ConsecutiveUses()
 	})
 
-	return &SelectResult{Connection: candidates[0]}, nil
+	// Claim-the-winner. A CLOSED candidate claims without consuming a slot; a
+	// HALF_OPEN candidate claims only if it wins the compare-and-set — a loser
+	// is skipped (its single trial is already in flight elsewhere). The
+	// re-check inside TryClaimHalfOpenTrial closes the gap between the filter
+	// pass above and the claim.
+	for _, c := range candidates {
+		if c.TryClaimHalfOpenTrial(model) {
+			return &SelectResult{Connection: c}, nil
+		}
+	}
+
+	// Every candidate was a HALF_OPEN connection whose single trial slot is
+	// already taken (or it stopped being selectable mid-pick).
+	return &SelectResult{Connection: nil}, ErrAllUnavailable
+}
+
+// selectionRank orders selectable candidates: a healthy (CLOSED) breaker is
+// preferred over a probing (HALF_OPEN) one. Selectable candidates are always
+// Idle (Connection.Selectable requires it), so lifecycle does not enter the
+// rank.
+func selectionRank(c *Connection) int {
+	if c.Breaker() == BreakerClosed {
+		return 0
+	}
+	return 1 // HALF_OPEN
 }
 
 // AllConnections returns all connections registered for a provider.
