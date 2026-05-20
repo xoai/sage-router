@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"errors"
 	"testing"
 	"time"
 )
@@ -12,16 +11,25 @@ func newTestConn(t *testing.T) *Connection {
 	return NewConnection("test-id", "openai", "test-conn", 1, "api_key")
 }
 
-func assertState(t *testing.T, c *Connection, want State) {
+// assertFacets fails the test unless the connection's three health facets all
+// match. Replaces the pre-M2 assertState(State) helper — the facets are the
+// source of truth (cycle 20260520-m2-circuit-breaker).
+func assertFacets(t *testing.T, c *Connection, breaker BreakerState, authState AuthState, lifecycle LifecycleState) {
 	t.Helper()
-	if got := c.State(); got != want {
-		t.Fatalf("expected state %s, got %s", want, got)
+	if got := c.Breaker(); got != breaker {
+		t.Fatalf("breaker = %s, want %s", got, breaker)
+	}
+	if got := c.Auth(); got != authState {
+		t.Fatalf("auth = %s, want %s", got, authState)
+	}
+	if got := c.Lifecycle(); got != lifecycle {
+		t.Fatalf("lifecycle = %s, want %s", got, lifecycle)
 	}
 }
 
 func TestNewConnectionStartsIdle(t *testing.T) {
 	c := newTestConn(t)
-	assertState(t, c, StateIdle)
+	assertFacets(t, c, BreakerClosed, AuthValid, LifecycleIdle)
 }
 
 func TestSuccessPath_IdleActiveIdle(t *testing.T) {
@@ -30,40 +38,12 @@ func TestSuccessPath_IdleActiveIdle(t *testing.T) {
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
-	assertState(t, c, StateActive)
+	assertFacets(t, c, BreakerClosed, AuthValid, LifecycleActive)
 
 	if err := c.MarkSuccess(); err != nil {
 		t.Fatalf("MarkSuccess: %v", err)
 	}
-	assertState(t, c, StateIdle)
-}
-
-func TestRateLimitPath_IdleActiveCooldown(t *testing.T) {
-	c := newTestConn(t)
-
-	if err := c.MarkUsed(); err != nil {
-		t.Fatalf("MarkUsed: %v", err)
-	}
-	assertState(t, c, StateActive)
-
-	if err := c.MarkRateLimited("gpt-4", 1); err != nil {
-		t.Fatalf("MarkRateLimited: %v", err)
-	}
-	assertState(t, c, StateCooldown)
-}
-
-func TestErrorPath_IdleActiveErrored(t *testing.T) {
-	c := newTestConn(t)
-
-	if err := c.MarkUsed(); err != nil {
-		t.Fatalf("MarkUsed: %v", err)
-	}
-	assertState(t, c, StateActive)
-
-	if err := c.MarkErrored(errors.New("upstream timeout")); err != nil {
-		t.Fatalf("MarkErrored: %v", err)
-	}
-	assertState(t, c, StateErrored)
+	assertFacets(t, c, BreakerClosed, AuthValid, LifecycleIdle)
 }
 
 func TestAuthExpiredPath(t *testing.T) {
@@ -72,30 +52,32 @@ func TestAuthExpiredPath(t *testing.T) {
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
-	assertState(t, c, StateActive)
+	assertFacets(t, c, BreakerClosed, AuthValid, LifecycleActive)
 
 	if err := c.MarkAuthExpired(); err != nil {
 		t.Fatalf("MarkAuthExpired: %v", err)
 	}
-	assertState(t, c, StateAuthExpired)
+	// MarkAuthExpired drives the Auth facet to expired and releases the
+	// lifecycle back to Idle; the breaker is untouched.
+	assertFacets(t, c, BreakerClosed, AuthExpired, LifecycleIdle)
 }
 
 func TestCooldownToIdle(t *testing.T) {
 	c := newTestConn(t)
 
-	// Drive to Cooldown: Idle -> Active -> RateLimited -> Cooldown
+	// Drive to an open breaker: MarkUsed → OpenBreaker(rate_limit).
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
-	if err := c.MarkRateLimited("gpt-4", 0); err != nil {
-		t.Fatalf("MarkRateLimited: %v", err)
+	if err := c.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+		t.Fatalf("OpenBreaker: %v", err)
 	}
-	assertState(t, c, StateCooldown)
+	assertFacets(t, c, BreakerOpen, AuthValid, LifecycleIdle)
 
 	if err := c.ResetCooldown(); err != nil {
 		t.Fatalf("ResetCooldown: %v", err)
 	}
-	assertState(t, c, StateIdle)
+	assertFacets(t, c, BreakerClosed, AuthValid, LifecycleIdle)
 }
 
 func TestErroredToIdle(t *testing.T) {
@@ -104,19 +86,20 @@ func TestErroredToIdle(t *testing.T) {
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
-	if err := c.MarkErrored(errors.New("oops")); err != nil {
-		t.Fatalf("MarkErrored: %v", err)
+	if err := c.OpenBreaker(FailureTransient, 0, ""); err != nil {
+		t.Fatalf("OpenBreaker: %v", err)
 	}
-	assertState(t, c, StateErrored)
+	assertFacets(t, c, BreakerOpen, AuthValid, LifecycleIdle)
 
 	if err := c.ResetCooldown(); err != nil {
 		t.Fatalf("ResetCooldown: %v", err)
 	}
-	assertState(t, c, StateIdle)
+	assertFacets(t, c, BreakerClosed, AuthValid, LifecycleIdle)
 }
 
 func TestDisableAndEnable(t *testing.T) {
-	// Test Disable from various states.
+	// Disable must work from every starting point, and Enable must always
+	// return the connection to a clean Idle (breaker reset, auth untouched).
 	states := []struct {
 		name  string
 		setup func(t *testing.T) *Connection
@@ -136,27 +119,27 @@ func TestDisableAndEnable(t *testing.T) {
 			},
 		},
 		{
-			name: "from Cooldown",
+			name: "from an open breaker (rate-limited)",
 			setup: func(t *testing.T) *Connection {
 				c := newTestConn(t)
 				if err := c.MarkUsed(); err != nil {
 					t.Fatalf("setup MarkUsed: %v", err)
 				}
-				if err := c.MarkRateLimited("gpt-4", 0); err != nil {
-					t.Fatalf("setup MarkRateLimited: %v", err)
+				if err := c.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+					t.Fatalf("setup OpenBreaker: %v", err)
 				}
 				return c
 			},
 		},
 		{
-			name: "from Errored",
+			name: "from an open breaker (transient failure)",
 			setup: func(t *testing.T) *Connection {
 				c := newTestConn(t)
 				if err := c.MarkUsed(); err != nil {
 					t.Fatalf("setup MarkUsed: %v", err)
 				}
-				if err := c.MarkErrored(errors.New("fail")); err != nil {
-					t.Fatalf("setup MarkErrored: %v", err)
+				if err := c.OpenBreaker(FailureTransient, 0, ""); err != nil {
+					t.Fatalf("setup OpenBreaker: %v", err)
 				}
 				return c
 			},
@@ -170,19 +153,23 @@ func TestDisableAndEnable(t *testing.T) {
 			if err := c.Disable(); err != nil {
 				t.Fatalf("Disable: %v", err)
 			}
-			assertState(t, c, StateDisabled)
+			if got := c.Lifecycle(); got != LifecycleDisabled {
+				t.Fatalf("after Disable: lifecycle = %s, want disabled", got)
+			}
 
 			if err := c.Enable(); err != nil {
 				t.Fatalf("Enable: %v", err)
 			}
-			assertState(t, c, StateIdle)
+			// Enable produces a fully-clean Idle connection — the breaker is
+			// reset to CLOSED even when it was OPEN before the disable.
+			assertFacets(t, c, BreakerClosed, AuthValid, LifecycleIdle)
 		})
 	}
 }
 
 func TestInvalidTransition_MarkSuccessFromIdle(t *testing.T) {
 	c := newTestConn(t)
-	assertState(t, c, StateIdle)
+	assertFacets(t, c, BreakerClosed, AuthValid, LifecycleIdle)
 
 	err := c.MarkSuccess()
 	if err == nil {
@@ -190,31 +177,29 @@ func TestInvalidTransition_MarkSuccessFromIdle(t *testing.T) {
 	}
 }
 
-func TestInvalidTransition_MarkRateLimitedFromIdle(t *testing.T) {
-	c := newTestConn(t)
-	assertState(t, c, StateIdle)
-
-	err := c.MarkRateLimited("gpt-4", 1)
-	if err == nil {
-		t.Fatal("MarkRateLimited from Idle: expected error, got nil")
-	}
-}
-
 func TestBackoffLevelResetsOnSuccess(t *testing.T) {
 	c := newTestConn(t)
 
-	// Drive to Cooldown with backoff 3.
+	// Escalate the backoff level. Each OpenBreaker bumps it by one; the
+	// breaker must pass through HALF_OPEN before it can open again.
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
-	if err := c.MarkRateLimited("gpt-4", 3); err != nil {
-		t.Fatalf("MarkRateLimited: %v", err)
+	for i := 0; i < 3; i++ {
+		if err := c.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+			t.Fatalf("OpenBreaker #%d: %v", i+1, err)
+		}
+		if i < 2 {
+			if err := c.ToHalfOpen(); err != nil {
+				t.Fatalf("ToHalfOpen #%d: %v", i+1, err)
+			}
+		}
 	}
 	if c.BackoffLevel() != 3 {
-		t.Fatalf("expected backoff 3, got %d", c.BackoffLevel())
+		t.Fatalf("expected backoff 3 after 3 OpenBreaker calls, got %d", c.BackoffLevel())
 	}
 
-	// Reset and go through a success cycle.
+	// ResetCooldown zeroes the backoff.
 	if err := c.ResetCooldown(); err != nil {
 		t.Fatalf("ResetCooldown: %v", err)
 	}
@@ -222,7 +207,14 @@ func TestBackoffLevelResetsOnSuccess(t *testing.T) {
 		t.Fatalf("expected backoff 0 after ResetCooldown, got %d", c.BackoffLevel())
 	}
 
-	// Full success path also resets.
+	// A full success cycle also resets the backoff. Re-escalate, then drive
+	// a use→success round and confirm MarkSuccess cleared it.
+	if err := c.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+		t.Fatalf("re-OpenBreaker: %v", err)
+	}
+	if c.BackoffLevel() == 0 {
+		t.Fatalf("expected a non-zero backoff after OpenBreaker")
+	}
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
@@ -292,13 +284,18 @@ func TestConnectionFields(t *testing.T) {
 	}
 }
 
-// TestConnectionStateTransitions is a table-driven test verifying the four
-// main state-transition paths through the connection lifecycle.
-func TestConnectionStateTransitions(t *testing.T) {
+// TestConnectionLifecyclePaths is a table-driven test verifying the four main
+// transition paths through the connection's facets.
+func TestConnectionLifecyclePaths(t *testing.T) {
+	type facets struct {
+		breaker   BreakerState
+		auth      AuthState
+		lifecycle LifecycleState
+	}
 	tests := []struct {
 		name   string
 		steps  func(t *testing.T, c *Connection)
-		expect State
+		expect facets
 	}{
 		{
 			name: "success path: Idle -> Active -> Idle",
@@ -307,154 +304,63 @@ func TestConnectionStateTransitions(t *testing.T) {
 				if err := c.MarkUsed(); err != nil {
 					t.Fatalf("MarkUsed: %v", err)
 				}
-				assertState(t, c, StateActive)
+				assertFacets(t, c, BreakerClosed, AuthValid, LifecycleActive)
 				if err := c.MarkSuccess(); err != nil {
 					t.Fatalf("MarkSuccess: %v", err)
 				}
 			},
-			expect: StateIdle,
+			expect: facets{BreakerClosed, AuthValid, LifecycleIdle},
 		},
 		{
-			name: "429 path: Idle -> Active -> RateLimited -> Cooldown",
+			name: "rate-limit path: Idle -> Active -> breaker OPEN",
 			steps: func(t *testing.T, c *Connection) {
 				t.Helper()
 				if err := c.MarkUsed(); err != nil {
 					t.Fatalf("MarkUsed: %v", err)
 				}
-				assertState(t, c, StateActive)
-				if err := c.MarkRateLimited("gpt-4", 1); err != nil {
-					t.Fatalf("MarkRateLimited: %v", err)
+				assertFacets(t, c, BreakerClosed, AuthValid, LifecycleActive)
+				if err := c.OpenBreaker(FailureRateLimit, 0, "gpt-4"); err != nil {
+					t.Fatalf("OpenBreaker: %v", err)
 				}
 			},
-			expect: StateCooldown,
+			expect: facets{BreakerOpen, AuthValid, LifecycleIdle},
 		},
 		{
-			name: "5xx path: Idle -> Active -> Errored",
+			name: "transient-failure path: Idle -> Active -> breaker OPEN",
 			steps: func(t *testing.T, c *Connection) {
 				t.Helper()
 				if err := c.MarkUsed(); err != nil {
 					t.Fatalf("MarkUsed: %v", err)
 				}
-				assertState(t, c, StateActive)
-				if err := c.MarkErrored(errors.New("internal server error")); err != nil {
-					t.Fatalf("MarkErrored: %v", err)
+				assertFacets(t, c, BreakerClosed, AuthValid, LifecycleActive)
+				if err := c.OpenBreaker(FailureTransient, 0, ""); err != nil {
+					t.Fatalf("OpenBreaker: %v", err)
 				}
 			},
-			expect: StateErrored,
+			expect: facets{BreakerOpen, AuthValid, LifecycleIdle},
 		},
 		{
-			name: "401 path: Idle -> Active -> AuthExpired",
+			name: "auth-failure path: Idle -> Active -> AuthExpired",
 			steps: func(t *testing.T, c *Connection) {
 				t.Helper()
 				if err := c.MarkUsed(); err != nil {
 					t.Fatalf("MarkUsed: %v", err)
 				}
-				assertState(t, c, StateActive)
+				assertFacets(t, c, BreakerClosed, AuthValid, LifecycleActive)
 				if err := c.MarkAuthExpired(); err != nil {
 					t.Fatalf("MarkAuthExpired: %v", err)
 				}
 			},
-			expect: StateAuthExpired,
+			expect: facets{BreakerClosed, AuthExpired, LifecycleIdle},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := NewConnection("td-id", "openai", "td-conn", 1, "api_key")
-			assertState(t, c, StateIdle)
+			assertFacets(t, c, BreakerClosed, AuthValid, LifecycleIdle)
 			tt.steps(t, c)
-			assertState(t, c, tt.expect)
-		})
-	}
-}
-
-// TestConnectionIsAvailable verifies availability checks based on state.
-func TestConnectionIsAvailable(t *testing.T) {
-	tests := []struct {
-		name      string
-		setup     func(t *testing.T) *Connection
-		model     string
-		available bool
-	}{
-		{
-			name: "Idle connection is available",
-			setup: func(t *testing.T) *Connection {
-				return NewConnection("a1", "openai", "c", 1, "api_key")
-			},
-			model:     "gpt-4",
-			available: true,
-		},
-		{
-			name: "Active connection is not available",
-			setup: func(t *testing.T) *Connection {
-				c := NewConnection("a2", "openai", "c", 1, "api_key")
-				if err := c.MarkUsed(); err != nil {
-					t.Fatalf("setup MarkUsed: %v", err)
-				}
-				return c
-			},
-			model:     "gpt-4",
-			available: false,
-		},
-		{
-			name: "Errored connection is not available",
-			setup: func(t *testing.T) *Connection {
-				c := NewConnection("a3", "openai", "c", 1, "api_key")
-				if err := c.MarkUsed(); err != nil {
-					t.Fatalf("setup MarkUsed: %v", err)
-				}
-				if err := c.MarkErrored(errors.New("fail")); err != nil {
-					t.Fatalf("setup MarkErrored: %v", err)
-				}
-				return c
-			},
-			model:     "",
-			available: false,
-		},
-		{
-			name: "AuthExpired connection is not available",
-			setup: func(t *testing.T) *Connection {
-				c := NewConnection("a4", "openai", "c", 1, "api_key")
-				if err := c.MarkUsed(); err != nil {
-					t.Fatalf("setup MarkUsed: %v", err)
-				}
-				if err := c.MarkAuthExpired(); err != nil {
-					t.Fatalf("setup MarkAuthExpired: %v", err)
-				}
-				return c
-			},
-			model:     "",
-			available: false,
-		},
-		{
-			name: "Disabled connection is not available",
-			setup: func(t *testing.T) *Connection {
-				c := NewConnection("a5", "openai", "c", 1, "api_key")
-				if err := c.Disable(); err != nil {
-					t.Fatalf("setup Disable: %v", err)
-				}
-				return c
-			},
-			model:     "",
-			available: false,
-		},
-		{
-			name: "Idle connection with blank model is available",
-			setup: func(t *testing.T) *Connection {
-				return NewConnection("a6", "openai", "c", 1, "api_key")
-			},
-			model:     "",
-			available: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := tt.setup(t)
-			got := c.IsAvailable(tt.model)
-			if got != tt.available {
-				t.Errorf("IsAvailable(%q) = %v, want %v (state=%s)", tt.model, got, tt.available, c.State())
-			}
+			assertFacets(t, c, tt.expect.breaker, tt.expect.auth, tt.expect.lifecycle)
 		})
 	}
 }
@@ -550,13 +456,14 @@ func TestConnection_ModelDenylistSnapshot(t *testing.T) {
 func TestConnection_ModelLocksSnapshot(t *testing.T) {
 	c := NewConnection("conn-1", "openai", "primary", 0, "subscription")
 	_ = c.MarkUsed()
-	if err := c.MarkRateLimited("gpt-5-nano", 0); err != nil {
-		t.Fatalf("MarkRateLimited: %v", err)
+	// OpenBreaker with a non-empty model records a per-model lock.
+	if err := c.OpenBreaker(FailureRateLimit, 0, "gpt-5-nano"); err != nil {
+		t.Fatalf("OpenBreaker: %v", err)
 	}
 
 	snap := c.ModelLocksSnapshot()
 	if expiry, ok := snap["gpt-5-nano"]; !ok {
-		t.Errorf("expected gpt-5-nano in lock snapshot after MarkRateLimited")
+		t.Errorf("expected gpt-5-nano in lock snapshot after OpenBreaker")
 	} else if !time.Now().Before(expiry) {
 		t.Errorf("expected lock expiry in the future, got %v", expiry)
 	}
@@ -588,7 +495,7 @@ func TestConnection_SnapshotExcludesExpired_Boundary(t *testing.T) {
 
 func TestConnection_SnapshotConcurrentWithTransition(t *testing.T) {
 	// go test -race detector confirms no data race between snapshot reads
-	// and state-mutating writes (MarkRateLimited + RecordModelRejection).
+	// and state-mutating writes (RecordModelRejection).
 	c := NewConnection("conn-1", "openai", "primary", 0, "subscription")
 	_ = c.MarkUsed()
 

@@ -79,8 +79,8 @@ func TestMarkConnectionResult_401InvalidatesCredentialAndMarksAuthExpired(t *tes
 	s := fakeServerForStateMachine(t, c)
 	s.markConnectionResult("c1", "gpt-5", 401, []byte(`{"error":"unauthorized"}`), nil, 0)
 
-	if got, want := c.State(), provider.StateAuthExpired; got != want {
-		t.Errorf("state = %v, want %v", got, want)
+	if got := c.Auth(); got != provider.AuthExpired {
+		t.Errorf("auth = %v, want expired", got)
 	}
 	if c.HasCredential() {
 		t.Error("expected cred cache to be cleared after 401")
@@ -106,8 +106,13 @@ func TestMarkConnectionResult_403WithModelRejectionAddsToDenylist(t *testing.T) 
 	// access to. The connection returns to Idle, only the rejected
 	// model is denylisted. AuthExpired is reserved for actual auth
 	// failures (token revoked / invalid / expired).
-	if got, want := c.State(), provider.StateIdle; got != want {
-		t.Errorf("state = %v, want %v", got, want)
+	// Model-tier rejection keeps the connection healthy — breaker CLOSED and
+	// auth still valid; only the rejected model is denylisted.
+	if got := c.Breaker(); got != provider.BreakerClosed {
+		t.Errorf("breaker = %v, want closed", got)
+	}
+	if got := c.Auth(); got != provider.AuthValid {
+		t.Errorf("auth = %v, want valid (model rejection must not auth-expire)", got)
 	}
 	if c.CanServeModel("gpt-9") {
 		t.Error("CanServeModel(gpt-9) should be false after model-rejection 403")
@@ -138,8 +143,8 @@ func TestMarkConnectionResult_403WithoutModelRejectionStillAuthExpires(t *testin
 		0,
 	)
 
-	if got, want := c.State(), provider.StateAuthExpired; got != want {
-		t.Errorf("state = %v, want %v (generic 403 should still AuthExpire)", got, want)
+	if got := c.Auth(); got != provider.AuthExpired {
+		t.Errorf("auth = %v, want expired (generic 403 should still AuthExpire)", got)
 	}
 }
 
@@ -153,8 +158,11 @@ func TestMarkConnectionResult_429StillRateLimits(t *testing.T) {
 	s := fakeServerForStateMachine(t, c)
 	s.markConnectionResult("c1", "gpt-5", 429, nil, nil, 0)
 
-	if got, want := c.State(), provider.StateCooldown; got != want {
-		t.Errorf("state = %v, want %v", got, want)
+	if got := c.Breaker(); got != provider.BreakerOpen {
+		t.Errorf("breaker = %v, want open", got)
+	}
+	if got := c.FailureKind(); got != provider.FailureRateLimit {
+		t.Errorf("failureKind = %v, want rate_limit", got)
 	}
 }
 
@@ -167,8 +175,11 @@ func TestMarkConnectionResult_200MarksSuccess(t *testing.T) {
 	s := fakeServerForStateMachine(t, c)
 	s.markConnectionResult("c1", "gpt-5", 200, nil, nil, 0)
 
-	if got, want := c.State(), provider.StateIdle; got != want {
-		t.Errorf("state = %v, want %v", got, want)
+	if got := c.Lifecycle(); got != provider.LifecycleIdle {
+		t.Errorf("lifecycle = %v, want idle", got)
+	}
+	if got := c.Breaker(); got != provider.BreakerClosed {
+		t.Errorf("breaker = %v, want closed", got)
 	}
 }
 
@@ -196,8 +207,8 @@ func TestMarkConnectionResult_StreamingAuthFailureMidStream(t *testing.T) {
 	closingBody := []byte(`{"type":"error","error":{"type":"authentication_error","message":"token expired"}}`)
 	s.markConnectionResult("c1", "claude-sonnet-4", 401, closingBody, nil, 0)
 
-	if got, want := c.State(), provider.StateAuthExpired; got != want {
-		t.Errorf("state = %v, want %v after streaming 401", got, want)
+	if got := c.Auth(); got != provider.AuthExpired {
+		t.Errorf("auth = %v, want expired after streaming 401", got)
 	}
 	if c.HasCredential() {
 		t.Error("expected cred cache to be cleared after streaming 401")
@@ -231,7 +242,7 @@ func TestMarkConnectionResult_ConcurrentAuthFailures(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got, want := c.State(), provider.StateAuthExpired; got != want {
-		t.Errorf("final state = %v, want %v", got, want)
+	if got := c.Auth(); got != provider.AuthExpired {
+		t.Errorf("final auth = %v, want expired", got)
 	}
 }

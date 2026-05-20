@@ -1937,9 +1937,9 @@ func TestE2E_PreflightShortCircuitsBeforeExecute(t *testing.T) {
 	if pc == nil {
 		t.Fatal("connection not registered in provider selector")
 	}
-	if state := pc.State(); state != provider.StateAuthExpired {
-		t.Errorf("connection state = %q, want %q (preflight rejection should drive AuthExpired)",
-			state, provider.StateAuthExpired)
+	if auth := pc.Auth(); auth != provider.AuthExpired {
+		t.Errorf("connection auth facet = %q, want %q (preflight rejection should drive AuthExpired)",
+			auth, provider.AuthExpired)
 	}
 	if le := pc.LastError(); le == nil || le.Error() != rejectErr.Error() {
 		t.Errorf("LastError = %v, want preflight error %q (friendly tier-error message should be set)",

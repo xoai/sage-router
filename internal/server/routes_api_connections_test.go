@@ -56,7 +56,7 @@ func TestHandleListConnections_FacetProjection(t *testing.T) {
 		{
 			// The breaker-open split: a transient (non-rate-limit) failure
 			// derives the legacy "errored", not "cooldown" — preserving the
-			// distinction provider.Connection.State() draws today.
+			// cooldown/errored distinction the legacy connection state carried.
 			name:    "transient failure — breaker open, runtime_state errored",
 			setup:   func(pc *provider.Connection) { _ = pc.OpenBreaker(provider.FailureTransient, 0, "") },
 			breaker: "open", auth: "valid", lifecycle: "idle", runtime: "errored",

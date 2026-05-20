@@ -17,15 +17,15 @@ func TestTransitionLocked_RoundTrip(t *testing.T) {
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
-	if got, want := c.State(), StateActive; got != want {
-		t.Errorf("after MarkUsed: state = %v, want %v", got, want)
+	if got, want := c.Lifecycle(), LifecycleActive; got != want {
+		t.Errorf("after MarkUsed: lifecycle = %v, want %v", got, want)
 	}
-	// Active → Idle via MarkSuccess (also wraps transitionLocked).
+	// Active → Idle via MarkSuccess (also a facet transition).
 	if err := c.MarkSuccess(); err != nil {
 		t.Fatalf("MarkSuccess: %v", err)
 	}
-	if got, want := c.State(), StateIdle; got != want {
-		t.Errorf("after MarkSuccess: state = %v, want %v", got, want)
+	if got, want := c.Lifecycle(), LifecycleIdle; got != want {
+		t.Errorf("after MarkSuccess: lifecycle = %v, want %v", got, want)
 	}
 }
 
@@ -84,7 +84,7 @@ func TestCanServeModel_DenylistEntryExpires(t *testing.T) {
 	}
 }
 
-func TestConnection_ConcurrentDenylistAndStateRead(t *testing.T) {
+func TestConnection_ConcurrentDenylistAndFacetRead(t *testing.T) {
 	// Race-detector sweep: many goroutines stress the single c.mu.
 	c := NewConnection("c1", "openai", "test", 0, "subscription")
 
@@ -99,7 +99,7 @@ func TestConnection_ConcurrentDenylistAndStateRead(t *testing.T) {
 			} else if i%4 == 1 {
 				_ = c.CanServeModel(model)
 			} else if i%4 == 2 {
-				_ = c.State()
+				_ = c.Lifecycle()
 			} else {
 				c.InvalidateCredential()
 			}
