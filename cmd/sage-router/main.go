@@ -136,21 +136,7 @@ func main() {
 	connections, err := db.ListConnections(store.ConnectionFilter{})
 	if err == nil {
 		for i := range connections {
-			c := &connections[i]
-			conn := provider.NewConnection(c.ID, c.Provider, c.Name, c.Priority, c.AuthType)
-			// Hydrate the Lifecycle facet from the persisted state: a
-			// connection an operator disabled must stay disabled across a
-			// restart. The breaker / transient-health facets are deliberately
-			// not persisted (they load CLOSED); only Disabled carries over.
-			// Without this, a persisted-disabled connection would load
-			// Idle/selectable (M2 spec §10).
-			if c.State == "disabled" {
-				if derr := conn.Disable(); derr != nil {
-					slog.Warn("hydrate disabled connection failed",
-						"conn_id", c.ID, "err", derr)
-				}
-			}
-			providerSel.Register(conn)
+			providerSel.Register(hydrateConnection(&connections[i]))
 		}
 	}
 
@@ -327,6 +313,23 @@ func main() {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// hydrateConnection builds the runtime provider.Connection for a persisted
+// store row. It hydrates the Lifecycle facet from the persisted state: a
+// connection an operator disabled must stay disabled across a restart. The
+// breaker / transient-health facets are deliberately not persisted (they load
+// CLOSED); only Disabled carries over. Without this, a persisted-disabled
+// connection would load Idle/selectable (M2 spec §10).
+func hydrateConnection(c *store.Connection) *provider.Connection {
+	conn := provider.NewConnection(c.ID, c.Provider, c.Name, c.Priority, c.AuthType)
+	if c.State == "disabled" {
+		if derr := conn.Disable(); derr != nil {
+			slog.Warn("hydrate disabled connection failed",
+				"conn_id", c.ID, "err", derr)
+		}
+	}
+	return conn
 }
 
 func bootstrap(db store.Store) (masterSecret []byte, passwordHash string) {

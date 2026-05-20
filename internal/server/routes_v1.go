@@ -1418,7 +1418,13 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 
 	// Mark connection as in-use (Idle → Active)
 	if err := conn.MarkUsed(); err != nil {
-		// Already grabbed by another goroutine — exclude and retry
+		// Already grabbed by another goroutine, or concurrently disabled.
+		// Select may have claimed this connection's HALF_OPEN trial slot —
+		// release it before abandoning the connection, or the slot strands
+		// (the deferred ReleaseHalfOpenTrial in executeRequest only covers
+		// the connection it is handed, not one dropped here). Idempotent and
+		// a no-op for a CLOSED connection that never claimed a slot — spec §4.
+		conn.ReleaseHalfOpenTrial()
 		if excludeIDs == nil {
 			excludeIDs = []string{}
 		}

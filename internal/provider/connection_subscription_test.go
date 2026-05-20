@@ -13,7 +13,7 @@ import (
 
 func TestTransitionLocked_RoundTrip(t *testing.T) {
 	c := NewConnection("c1", "openai", "test", 0, "subscription")
-	// Drive Idle → Active via the public method, which wraps transitionLocked.
+	// Drive Idle → Active via the public method (a Lifecycle facet transition).
 	if err := c.MarkUsed(); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
 	}
@@ -34,7 +34,8 @@ func TestTransitionLocked_RejectionReturnsSentinel(t *testing.T) {
 	// callers can use errors.Is to distinguish state-machine races from
 	// real failures.
 	c := NewConnection("c1", "openai", "test", 0, "subscription")
-	// Idle → Refreshing is NOT a legal transition (state.go:34-37).
+	// MarkRefreshing from a fresh connection is rejected — it requires the
+	// Auth facet to be AuthExpired, and a fresh connection is AuthValid.
 	err := c.MarkRefreshing()
 	if err == nil {
 		t.Fatal("MarkRefreshing from Idle should have failed")
