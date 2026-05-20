@@ -77,7 +77,7 @@ func TestMarkConnectionResult_401InvalidatesCredentialAndMarksAuthExpired(t *tes
 	}
 
 	s := fakeServerForStateMachine(t, c)
-	s.markConnectionResult("c1", "gpt-5", 401, []byte(`{"error":"unauthorized"}`), nil)
+	s.markConnectionResult("c1", "gpt-5", 401, []byte(`{"error":"unauthorized"}`), nil, 0)
 
 	if got, want := c.State(), provider.StateAuthExpired; got != want {
 		t.Errorf("state = %v, want %v", got, want)
@@ -98,6 +98,7 @@ func TestMarkConnectionResult_403WithModelRejectionAddsToDenylist(t *testing.T) 
 		403,
 		[]byte(`{"error":{"message":"The model gpt-9 is not available with this token"}}`),
 		nil,
+		0,
 	)
 
 	// Model-tier rejections should NOT take the whole connection out of
@@ -134,6 +135,7 @@ func TestMarkConnectionResult_403WithoutModelRejectionStillAuthExpires(t *testin
 		403,
 		[]byte(`{"error":{"message":"insufficient_permissions"}}`),
 		nil,
+		0,
 	)
 
 	if got, want := c.State(), provider.StateAuthExpired; got != want {
@@ -149,7 +151,7 @@ func TestMarkConnectionResult_429StillRateLimits(t *testing.T) {
 	}
 
 	s := fakeServerForStateMachine(t, c)
-	s.markConnectionResult("c1", "gpt-5", 429, nil, nil)
+	s.markConnectionResult("c1", "gpt-5", 429, nil, nil, 0)
 
 	if got, want := c.State(), provider.StateCooldown; got != want {
 		t.Errorf("state = %v, want %v", got, want)
@@ -163,7 +165,7 @@ func TestMarkConnectionResult_200MarksSuccess(t *testing.T) {
 	}
 
 	s := fakeServerForStateMachine(t, c)
-	s.markConnectionResult("c1", "gpt-5", 200, nil, nil)
+	s.markConnectionResult("c1", "gpt-5", 200, nil, nil, 0)
 
 	if got, want := c.State(), provider.StateIdle; got != want {
 		t.Errorf("state = %v, want %v", got, want)
@@ -192,7 +194,7 @@ func TestMarkConnectionResult_StreamingAuthFailureMidStream(t *testing.T) {
 	// call with statusCode=401 after the stream ends. The caller (stream
 	// handler) reads the closing error body for any model-rejection signal.
 	closingBody := []byte(`{"type":"error","error":{"type":"authentication_error","message":"token expired"}}`)
-	s.markConnectionResult("c1", "claude-sonnet-4", 401, closingBody, nil)
+	s.markConnectionResult("c1", "claude-sonnet-4", 401, closingBody, nil, 0)
 
 	if got, want := c.State(), provider.StateAuthExpired; got != want {
 		t.Errorf("state = %v, want %v after streaming 401", got, want)
@@ -224,7 +226,7 @@ func TestMarkConnectionResult_ConcurrentAuthFailures(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.markConnectionResult("c1", "gpt-5", 401, []byte("unauthorized"), nil)
+			s.markConnectionResult("c1", "gpt-5", 401, []byte("unauthorized"), nil, 0)
 		}()
 	}
 	wg.Wait()

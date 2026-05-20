@@ -23,6 +23,7 @@ import (
 	"sage-router/internal/config"
 	"sage-router/internal/cost"
 	"sage-router/internal/executor"
+	"sage-router/internal/provider"
 	"sage-router/internal/routing"
 	"sage-router/internal/store"
 	"sage-router/internal/translate"
@@ -329,6 +330,20 @@ func (s *Server) executeRequest(
 	}
 
 	for {
+		// AC9: release this connection's HALF_OPEN trial slot on every terminal
+		// path of the request. The selector claims the slot inside Select
+		// (TryClaimHalfOpenTrial — spec §4); the request path is the single
+		// authoritative releaser. ReleaseHalfOpenTrial is idempotent and a
+		// no-op for a CLOSED connection that never claimed a slot, so deferring
+		// it unconditionally is safe. A defer fires on every exit of this frame
+		// — normal return, error return, context-cancel, and panic-unwind — so
+		// one defer per connection covers all five terminal paths. The fallback
+		// loop registers one per iteration; they accumulate and all fire when
+		// executeRequest returns.
+		if pc := s.deps.ProviderSelector.ConnectionByID(currentConn.ID); pc != nil {
+			defer pc.ReleaseHalfOpenTrial()
+		}
+
 		// M-v3-4 fold: ctx-cancel check between iterations.
 		if err := ctx.Err(); err != nil {
 			reqCtx.servedConnID = currentConn.ID
@@ -382,7 +397,7 @@ func (s *Server) executeRequest(
 			// AuthExpired branch + parseAuthError (which our variant
 			// returns the same typed error from). The body is nil because
 			// no HTTP call happened — parseAuthError handles nil body.
-			s.markConnectionResult(currentConn.ID, model, 401, nil, nil)
+			s.markConnectionResult(currentConn.ID, model, 401, nil, nil, 0)
 			// Now set the LastError directly so dashboard surfaces the
 			// friendly variant-supplied message (parseAuthError on a nil
 			// body won't match the pattern; this is the explicit hook).
@@ -426,7 +441,7 @@ func (s *Server) executeRequest(
 		if execErr != nil {
 			cancel() // safe: result is nil, no live stream
 			slog.Error("upstream error", "provider", providerID, "connection", currentConn.ID, "error", execErr)
-			s.markConnectionResult(currentConn.ID, model, 0, nil, execErr)
+			s.markConnectionResult(currentConn.ID, model, 0, nil, execErr, 0)
 			excludeIDs = append(excludeIDs, currentConn.ID)
 			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
 			if nextErr != nil {
@@ -447,7 +462,12 @@ func (s *Server) executeRequest(
 			// Mark connection state based on error. Pass respBody so 401/403 can
 			// detect model-level rejections (vs. token-level rejections) and
 			// add the model to the per-connection denylist accordingly.
-			s.markConnectionResult(currentConn.ID, model, statusCode, respBody, nil)
+			// retryAfter: parse the upstream's rate-limit headers so a 429's
+			// breaker cooldown honors Retry-After (§5). ParseRateLimitReset
+			// yields a zero Reset for non-rate-limit responses — harmless to
+			// compute for every 4xx/5xx; only the 429 branch consumes it.
+			rl := executor.ParseRateLimitReset(providerID, result.Headers, time.Now())
+			s.markConnectionResult(currentConn.ID, model, statusCode, respBody, nil, rl.Reset)
 
 			// Models Discovery M2.7 — on-404 ad-hoc refresh (AC16).
 			// Upstream "model not found" usually means the catalog is stale.
@@ -588,7 +608,7 @@ func (s *Server) forwardResult(
 	}
 
 	// Mark success after response is written (preserved from pre-refactor :399).
-	s.markConnectionResult(connID, model, result.StatusCode, nil, nil)
+	s.markConnectionResult(connID, model, result.StatusCode, nil, nil, 0)
 }
 
 func (s *Server) streamResponse(
@@ -1457,7 +1477,13 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 	}, 0, nil
 }
 
-// markConnectionResult transitions the connection state based on the upstream outcome.
+// markConnectionResult transitions the connection state based on the upstream
+// outcome — the M2 circuit-breaker classifier (spec §3.2). A transport error
+// and a 5xx open the breaker as FailureTransient; a 429 opens it as
+// FailureRateLimit, honoring retryAfter (the time until the rate limit resets,
+// parsed from the response's rate-limit headers by the caller; 0 when no header
+// was present). The 401/403 and 2xx branches are unchanged by M2 — auth
+// failures drive the Auth facet, not the breaker.
 //
 // For 401/403, also invalidates the in-memory credential cache so the next
 // request triggers a refresh attempt rather than reusing a token the upstream
@@ -1465,14 +1491,15 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 // (distinct from auth-token rejection) — when present, the model is added to
 // the connection's per-model denylist (1h TTL) so the selector skips it for
 // future requests on this connection.
-func (s *Server) markConnectionResult(connID, model string, statusCode int, respBody []byte, err error) {
+func (s *Server) markConnectionResult(connID, model string, statusCode int, respBody []byte, err error, retryAfter time.Duration) {
 	conn := s.deps.ProviderSelector.ConnectionByID(connID)
 	if conn == nil {
 		return
 	}
 
-	// All Mark* methods return errors only when the state-machine transition
-	// is rejected (e.g., already in AuthExpired due to a concurrent failure).
+	// The facet transition methods return errors only when the transition is
+	// rejected (e.g., already in AuthExpired due to a concurrent failure, or
+	// OpenBreaker re-opening an already-OPEN breaker).
 	// We log these at debug-as-warn level so operators can see stuck-state
 	// situations without inundating logs in the common case. Cred
 	// invalidation runs regardless: even if the state transition couldn't
@@ -1480,9 +1507,14 @@ func (s *Server) markConnectionResult(connID, model string, statusCode int, resp
 	var terr error
 	switch {
 	case err != nil:
-		terr = conn.MarkErrored(err)
+		// Transport/network error — classified transient (§3.2). SetLastError
+		// preserves the dashboard message; OpenBreaker records none of its own.
+		conn.SetLastError(err)
+		terr = conn.OpenBreaker(provider.FailureTransient, 0, model)
 	case statusCode == 429:
-		terr = conn.MarkRateLimited(model, conn.BackoffLevel()+1)
+		// Upstream rate limit (§3.2). retryAfter is honored by CooldownFor;
+		// OpenBreaker escalates the backoff level internally.
+		terr = conn.OpenBreaker(provider.FailureRateLimit, retryAfter, model)
 	case statusCode == 401 || statusCode == 403:
 		// Differentiate "this token can't do this model" from "this
 		// token is dead". Model-tier rejections only denylist the
@@ -1517,7 +1549,11 @@ func (s *Server) markConnectionResult(connID, model string, statusCode int, resp
 			conn.InvalidateCredential()
 		}
 	case statusCode >= 500:
-		terr = conn.MarkErrored(fmt.Errorf("upstream %d", statusCode))
+		// Upstream 5xx — classified transient (§3.2). SetLastError preserves the
+		// dashboard message; CooldownFor ignores retryAfter for the transient
+		// kind, but it is passed for consistency with the 429 branch.
+		conn.SetLastError(fmt.Errorf("upstream %d", statusCode))
+		terr = conn.OpenBreaker(provider.FailureTransient, retryAfter, model)
 	default:
 		terr = conn.MarkSuccess()
 	}

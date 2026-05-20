@@ -650,6 +650,17 @@ func (c *Connection) SetFacetsForTest(breaker BreakerState, authState AuthState,
 	c.lifecycle = lifecycle
 }
 
+// HalfOpenInFlightForTest reports whether the HALF_OPEN single-trial slot is
+// currently claimed. Test-only — production code never inspects the slot
+// directly; it is managed by TryClaimHalfOpenTrial / ReleaseHalfOpenTrial. The
+// "ForTest" suffix is deliberately ugly so reviewers notice if it leaks into a
+// non-test path (cf. SetFacetsForTest).
+func (c *Connection) HalfOpenInFlightForTest() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.halfOpenInFlight
+}
+
 // rejectedTransition builds an error for an illegal facet transition. It wraps
 // ErrTransitionRejected so callers can errors.Is it — the same contract the
 // old State-enum transitions use.
