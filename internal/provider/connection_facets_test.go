@@ -36,7 +36,7 @@ func TestConnection_Selectable(t *testing.T) {
 		want      bool
 	}{
 		{"closed+valid+idle is selectable", BreakerClosed, AuthValid, LifecycleIdle, true},
-		{"closed+valid+active is selectable", BreakerClosed, AuthValid, LifecycleActive, true},
+		{"closed+valid+active is NOT selectable (in-flight)", BreakerClosed, AuthValid, LifecycleActive, false},
 		{"half_open+valid+idle is selectable", BreakerHalfOpen, AuthValid, LifecycleIdle, true},
 		{"open breaker not selectable (auth still valid — orthogonal)", BreakerOpen, AuthValid, LifecycleIdle, false},
 		{"expired auth not selectable (breaker still closed — orthogonal)", BreakerClosed, AuthExpired, LifecycleIdle, false},

@@ -19,7 +19,7 @@ const modelDenylistTTL = 1 * time.Hour
 // Lock-order rule (auto-review M6): c.mu is the only mutex on Connection.
 // Methods that acquire c.mu MUST NOT call into stores or refresh code under
 // the lock — release c.mu before any I/O and reacquire afterward to publish
-// results. A custom go vet analyzer (Task 1.9) enforces this.
+// results. The lockorder_test.go AST-walking unit test enforces this.
 type Connection struct {
 	ID       string
 	Provider string
@@ -27,12 +27,13 @@ type Connection struct {
 	Priority int
 	AuthType string
 
-	mu    sync.RWMutex
-	state State
+	mu sync.RWMutex
 
-	// M2 three-facet connection-health model (cycle 20260520-m2-circuit-breaker,
-	// ADR-1). These land alongside the old `state` field during the strangler
-	// migration; `state` and the old State enum are removed in plan T6/T14.
+	// Three-facet connection-health model (cycle 20260520-m2-circuit-breaker,
+	// ADR-1) — the single source of truth. Breaker is transient health, Auth
+	// is credential validity, Lifecycle is the request lifecycle. They replace
+	// the old 8-value State enum (deleted in plan T14); State() derives the
+	// legacy value from these for the backward-compatible API surface.
 	breaker          BreakerState
 	auth             AuthState
 	lifecycle        LifecycleState
@@ -59,7 +60,6 @@ func NewConnection(id, provider, name string, priority int, authType string) *Co
 		Name:          name,
 		Priority:      priority,
 		AuthType:      authType,
-		state:         StateIdle,
 		breaker:       BreakerClosed,
 		auth:          AuthValid,
 		lifecycle:     LifecycleIdle,
@@ -68,11 +68,38 @@ func NewConnection(id, provider, name string, priority int, authType string) *Co
 	}
 }
 
-// State returns the current state (thread-safe).
+// State derives the legacy State enum value from the three facets. It is the
+// backward-compatible accessor for callers not yet migrated to Breaker() /
+// Auth() / Lifecycle() (and for the /api/connections legacy-state projection);
+// it is removed with the old enum in plan T14.
 func (c *Connection) State() State {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.state
+	return c.deriveStateLocked()
+}
+
+// deriveStateLocked maps the three facets onto the legacy State enum. The
+// caller holds c.mu. Precedence: disabled → auth → breaker → active → idle.
+// (StateRateLimited is never produced — a rate-limited connection derives to
+// StateCooldown, matching the old MarkRateLimited end state.)
+func (c *Connection) deriveStateLocked() State {
+	switch {
+	case c.lifecycle == LifecycleDisabled:
+		return StateDisabled
+	case c.auth == AuthRefreshing:
+		return StateRefreshing
+	case c.auth == AuthExpired:
+		return StateAuthExpired
+	case c.breaker == BreakerOpen || c.breaker == BreakerHalfOpen:
+		if c.failureKind == FailureRateLimit {
+			return StateCooldown
+		}
+		return StateErrored
+	case c.lifecycle == LifecycleActive:
+		return StateActive
+	default:
+		return StateIdle
+	}
 }
 
 // LastUsedAt returns when the connection was last used.
@@ -124,79 +151,40 @@ func (c *Connection) SetLastError(err error) {
 	c.lastError = err
 }
 
-// transitionLocked moves the connection to a new state if the transition is valid.
-// CALLER MUST HOLD c.mu (write lock). The trailing "Locked" suffix is the lock-
-// discipline convention used elsewhere in the codebase. Errors are
-// errors.Is(ErrTransitionRejected) so callers can distinguish a benign
-// state-machine race from a hard failure.
-func (c *Connection) transitionLocked(to State) error {
-	if !CanTransition(c.state, to) {
-		return &ErrInvalidTransition{From: c.state, To: to}
-	}
-	c.state = to
-	return nil
-}
-
 // IsAvailable reports whether this connection can serve a request for the
-// given model right now. A blank model matches any.
+// given model right now — a backward-compatible alias for Selectable, kept
+// for callers not yet migrated off the legacy surface (removed in plan T14).
 func (c *Connection) IsAvailable(model string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.isAvailableLocked(model)
+	return c.Selectable(model)
 }
 
-// isAvailableLocked is the lock-free inner check. Caller must hold at least RLock.
-func (c *Connection) isAvailableLocked(model string) bool {
-	now := time.Now()
-
-	switch c.state {
-	case StateIdle:
-		// Idle is always available, but check model lock.
-	case StateCooldown:
-		// Available only if the cooldown has expired.
-		if now.Before(c.cooldownUntil) {
-			return false
-		}
-	default:
-		// Active, RateLimited, AuthExpired, Refreshing, Errored, Disabled — not available.
-		return false
-	}
-
-	// Check model-scoped rate-limit lock.
-	if model != "" {
-		if expiry, locked := c.modelLocks[model]; locked && now.Before(expiry) {
-			return false
-		}
-	}
-
-	return true
-}
-
-// MarkUsed transitions from Idle to Active and updates usage counters.
+// MarkUsed transitions the lifecycle facet Idle→Active and updates the usage
+// counters. It rejects (errors.Is ErrTransitionRejected) if the connection is
+// not Idle — the same race-guard the old enum gave callers.
 func (c *Connection) MarkUsed() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateActive); err != nil {
-		return fmt.Errorf("MarkUsed: %w", err)
+	if !CanTransitionLifecycle(c.lifecycle, LifecycleActive) {
+		return rejectedTransition("MarkUsed", string(c.lifecycle), string(LifecycleActive))
 	}
+	c.lifecycle = LifecycleActive
 	c.lastUsedAt = time.Now()
 	c.consecutiveUses++
 	return nil
 }
 
-// MarkRateLimited transitions Active → RateLimited → Cooldown, sets a
-// model-scoped lock, and applies exponential backoff.
+// MarkRateLimited records a 429: it opens the breaker with failure kind
+// rate_limit, sets the given backoff level, applies a model-scoped lock, and
+// returns the connection to Idle. It is a transitional shim over the facet
+// model — the migrated request path calls OpenBreaker directly; this is
+// removed in plan T14. It rejects unless the connection is currently Active
+// (the old Active→RateLimited precondition).
 func (c *Connection) MarkRateLimited(model string, backoffLevel int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// Active → RateLimited
-	if err := c.transitionLocked(StateRateLimited); err != nil {
-		return fmt.Errorf("MarkRateLimited: %w", err)
+	if c.lifecycle != LifecycleActive {
+		return rejectedTransition("MarkRateLimited", string(c.lifecycle), string(LifecycleActive))
 	}
-
-	// Clamp backoff.
 	if backoffLevel < 0 {
 		backoffLevel = 0
 	}
@@ -204,90 +192,109 @@ func (c *Connection) MarkRateLimited(model string, backoffLevel int) error {
 		backoffLevel = MaxBackoffLevel
 	}
 	c.backoffLevel = backoffLevel
-
-	cooldown := CalculateCooldown(c.backoffLevel)
-	c.cooldownUntil = time.Now().Add(cooldown)
-
-	// Set model-scoped lock if a model was specified.
+	c.breaker = BreakerOpen
+	c.failureKind = FailureRateLimit
+	c.cooldownUntil = time.Now().Add(CalculateCooldown(c.backoffLevel))
 	if model != "" {
 		c.modelLocks[model] = c.cooldownUntil
 	}
-
-	// RateLimited → Cooldown (immediate)
-	if err := c.transitionLocked(StateCooldown); err != nil {
-		return fmt.Errorf("MarkRateLimited (cooldown): %w", err)
-	}
-
+	c.lifecycle = LifecycleIdle
+	c.halfOpenInFlight = false
 	return nil
 }
 
-// MarkAuthExpired transitions from Active to AuthExpired.
+// MarkErrored records a non-rate-limit upstream failure: it opens the breaker
+// with failure kind errored and returns the connection to Idle. A transitional
+// shim — the migrated request path calls OpenBreaker directly (removed T14).
+// It rejects unless the connection is currently Active.
+func (c *Connection) MarkErrored(err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lifecycle != LifecycleActive {
+		return rejectedTransition("MarkErrored", string(c.lifecycle), string(LifecycleActive))
+	}
+	c.lastError = err
+	c.breaker = BreakerOpen
+	c.failureKind = FailureErrored
+	c.cooldownUntil = time.Now().Add(CalculateCooldown(c.backoffLevel))
+	c.lifecycle = LifecycleIdle
+	c.halfOpenInFlight = false
+	return nil
+}
+
+// MarkAuthExpired moves the auth facet to AuthExpired (credential invalid) and
+// returns an Active connection to Idle. Auth is orthogonal to the breaker — a
+// connection can be AuthExpired with a healthy (CLOSED) breaker.
 func (c *Connection) MarkAuthExpired() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateAuthExpired); err != nil {
-		return fmt.Errorf("MarkAuthExpired: %w", err)
+	if !CanTransitionAuth(c.auth, AuthExpired) {
+		return rejectedTransition("MarkAuthExpired", string(c.auth), string(AuthExpired))
+	}
+	c.auth = AuthExpired
+	if c.lifecycle == LifecycleActive {
+		c.lifecycle = LifecycleIdle
 	}
 	return nil
 }
 
-// MarkRefreshing transitions from AuthExpired to Refreshing.
+// MarkRefreshing moves the auth facet AuthExpired→AuthRefreshing. It rejects
+// unless the credential is currently AuthExpired (the old precondition that
+// connection_subscription_test.go pins).
 func (c *Connection) MarkRefreshing() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateRefreshing); err != nil {
-		return fmt.Errorf("MarkRefreshing: %w", err)
+	if c.auth != AuthExpired {
+		return rejectedTransition("MarkRefreshing", string(c.auth), string(AuthRefreshing))
 	}
+	c.auth = AuthRefreshing
 	return nil
 }
 
-// MarkRefreshSuccess transitions from Refreshing to Active.
+// MarkRefreshSuccess moves the auth facet to AuthValid after a successful
+// credential refresh and resets backoff.
 func (c *Connection) MarkRefreshSuccess() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateActive); err != nil {
-		return fmt.Errorf("MarkRefreshSuccess: %w", err)
+	if !CanTransitionAuth(c.auth, AuthValid) {
+		return rejectedTransition("MarkRefreshSuccess", string(c.auth), string(AuthValid))
 	}
+	c.auth = AuthValid
 	c.backoffLevel = 0
 	c.lastError = nil
 	return nil
 }
 
-// MarkRefreshFailure transitions from Refreshing to Errored.
+// MarkRefreshFailure records a failed credential refresh: the auth facet
+// returns to AuthExpired — a credential problem, not a transient breaker fault
+// (spec §1.2) — and the refresh loop re-drives it on a later tick.
 func (c *Connection) MarkRefreshFailure(err error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	c.lastError = err
-	if terr := c.transitionLocked(StateErrored); terr != nil {
-		return fmt.Errorf("MarkRefreshFailure: %w", terr)
+	if !CanTransitionAuth(c.auth, AuthExpired) {
+		return rejectedTransition("MarkRefreshFailure", string(c.auth), string(AuthExpired))
 	}
+	c.auth = AuthExpired
 	return nil
 }
 
-// MarkErrored transitions from Active to Errored.
-func (c *Connection) MarkErrored(err error) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.lastError = err
-	if terr := c.transitionLocked(StateErrored); terr != nil {
-		return fmt.Errorf("MarkErrored: %w", terr)
-	}
-	return nil
-}
-
-// MarkSuccess transitions from Active back to Idle and resets backoff.
+// MarkSuccess returns an Active connection to Idle after a successful request:
+// it closes a HALF_OPEN breaker (the trial succeeded), resets backoff, and
+// garbage-collects expired model locks. It rejects if the connection is not
+// Active.
 func (c *Connection) MarkSuccess() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateIdle); err != nil {
-		return fmt.Errorf("MarkSuccess: %w", err)
+	if !CanTransitionLifecycle(c.lifecycle, LifecycleIdle) {
+		return rejectedTransition("MarkSuccess", string(c.lifecycle), string(LifecycleIdle))
 	}
+	c.lifecycle = LifecycleIdle
+	if c.breaker == BreakerHalfOpen {
+		c.breaker = BreakerClosed
+		c.failureKind = ""
+	}
+	c.halfOpenInFlight = false
 	c.backoffLevel = 0
 	c.lastError = nil
 	c.consecutiveUses = 0
@@ -299,47 +306,51 @@ func (c *Connection) MarkSuccess() error {
 			delete(c.modelLocks, m)
 		}
 	}
-
 	return nil
 }
 
-// ResetCooldown transitions from Cooldown (or Errored) back to Idle, clearing
-// backoff and cooldown timers. Used for manual retry.
+// ResetCooldown forces the breaker closed and clears the cooldown timers — the
+// operator's manual-retry path. It always succeeds.
 func (c *Connection) ResetCooldown() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateIdle); err != nil {
-		return fmt.Errorf("ResetCooldown: %w", err)
-	}
-	c.backoffLevel = 0
+	c.breaker = BreakerClosed
+	c.failureKind = ""
 	c.cooldownUntil = time.Time{}
+	c.backoffLevel = 0
 	c.lastError = nil
+	c.halfOpenInFlight = false
 	return nil
 }
 
-// Disable transitions any state to Disabled.
+// Disable moves the lifecycle facet to Disabled (an operator action).
 func (c *Connection) Disable() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateDisabled); err != nil {
-		return fmt.Errorf("Disable: %w", err)
+	if !CanTransitionLifecycle(c.lifecycle, LifecycleDisabled) {
+		return rejectedTransition("Disable", string(c.lifecycle), string(LifecycleDisabled))
 	}
+	c.lifecycle = LifecycleDisabled
 	return nil
 }
 
-// Enable transitions from Disabled back to Idle.
+// Enable re-enables a Disabled connection: the lifecycle returns to Idle and
+// the breaker is reset to a clean CLOSED state (the operator override clears
+// transient health). The auth facet is left as-is — a credential problem is
+// real, not operator-controlled.
 func (c *Connection) Enable() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.transitionLocked(StateIdle); err != nil {
-		return fmt.Errorf("Enable: %w", err)
+	if !CanTransitionLifecycle(c.lifecycle, LifecycleIdle) {
+		return rejectedTransition("Enable", string(c.lifecycle), string(LifecycleIdle))
 	}
-	c.backoffLevel = 0
+	c.lifecycle = LifecycleIdle
+	c.breaker = BreakerClosed
+	c.failureKind = ""
 	c.cooldownUntil = time.Time{}
+	c.backoffLevel = 0
 	c.lastError = nil
+	c.halfOpenInFlight = false
 	return nil
 }
 
@@ -456,7 +467,7 @@ func (c *Connection) ModelDenylistSnapshot() map[string]time.Time {
 // rate-limit locks — those whose expiry has not yet passed. Mutating the
 // returned map does NOT affect the connection.
 //
-// Filter semantics match isAvailableLocked at the call site: a lock is
+// Filter semantics match selectableLocked at the call site: a lock is
 // "active" when now.Before(expiry). Returns an empty (non-nil) map when no
 // locks are active. Cycle 20260516-connection-runtime-state.
 func (c *Connection) ModelLocksSnapshot() map[string]time.Time {
@@ -507,11 +518,14 @@ func (c *Connection) FailureKind() FailureKind {
 }
 
 // Selectable reports whether the Selector may hand this connection a request
-// for the given model. The rule (ADR-1 §Selectability): the breaker is CLOSED
-// or HALF_OPEN, the credential is valid, the connection is not operator-
-// disabled, and — for a non-empty model — there is no live model-scoped
-// rate-limit lock, no live post-403 denylist entry, and the subscription tier
-// permits the model. A blank model skips the per-model checks.
+// for the given model. The rule: the breaker is CLOSED or HALF_OPEN, the
+// credential is valid, the connection is idle (not in-flight and not
+// operator-disabled), and — for a non-empty model — there is no live
+// model-scoped rate-limit lock, no live post-403 denylist entry, and the
+// subscription tier permits the model. A blank model skips the per-model
+// checks. (ADR-1 §Selectability writes the lifecycle clause as "!= Disabled";
+// the old IsAvailable rejected Active too — one in-flight request per
+// connection — so the precise rule is "== Idle".)
 func (c *Connection) Selectable(model string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -527,7 +541,9 @@ func (c *Connection) selectableLocked(model string) bool {
 	if c.auth != AuthValid {
 		return false
 	}
-	if c.lifecycle == LifecycleDisabled {
+	if c.lifecycle != LifecycleIdle {
+		// Not selectable while a request is in flight (Active) or while the
+		// connection is operator-disabled.
 		return false
 	}
 	if model == "" {

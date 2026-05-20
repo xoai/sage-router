@@ -16,15 +16,15 @@ import (
 // loop tests. Tracks bump/reset counts so assertions can verify the
 // counter math.
 type fakeStore struct {
-	mu                sync.Mutex
-	creds             map[string]*auth.Credential
-	failures          map[string]int
-	bumpCalls         int
-	resetCalls        int
-	putCalls          int
-	putErr            error
-	getErr            error
-	bumpErr           error
+	mu         sync.Mutex
+	creds      map[string]*auth.Credential
+	failures   map[string]int
+	bumpCalls  int
+	resetCalls int
+	putCalls   int
+	putErr     error
+	getErr     error
+	bumpErr    error
 }
 
 func newFakeStore() *fakeStore {
@@ -223,8 +223,10 @@ func TestLoop_AuthExpiredHappyPath(t *testing.T) {
 
 	l.tick(context.Background())
 
-	// AuthExpired → Refreshing → Active.
-	if got, want := conn.State(), provider.StateActive; got != want {
+	// AuthExpired → Refreshing → AuthValid; a refreshed, idle connection
+	// derives to StateIdle (the facet model — the old enum reused "Active"
+	// for "refreshed and ready").
+	if got, want := conn.State(), provider.StateIdle; got != want {
 		t.Errorf("state = %v, want %v", got, want)
 	}
 	if store.resetCalls != 1 {
@@ -273,45 +275,32 @@ func TestLoop_TransientFailureDoesNotDisableUntilThreshold(t *testing.T) {
 		return []*provider.Connection{conn}
 	})
 
-	// First failure: AuthExpired → Refreshing → Errored. Not yet disabled.
+	// Under the facet model a failed refresh leaves the connection
+	// Auth=AuthExpired (it derives to StateAuthExpired) — NOT Errored — so the
+	// loop re-drives the same connection on its next tick automatically. No
+	// manual "move back to AuthExpired" between ticks is needed; that was an
+	// old-enum workaround for MarkRefreshFailure→Errored taking the connection
+	// out of the loop's AuthExpired processing set.
+
+	// First failure: AuthExpired → Refreshing → AuthExpired. Not yet disabled.
 	l.tick(context.Background())
-	if got, want := conn.State(), provider.StateErrored; got != want {
+	if got, want := conn.State(), provider.StateAuthExpired; got != want {
 		t.Errorf("after 1 failure: state = %v, want %v", got, want)
 	}
 	if store.failures["s1"] != 1 {
 		t.Errorf("after 1 failure: refresh_failures = %d, want 1", store.failures["s1"])
 	}
 
-	// Move back to AuthExpired manually to simulate a fresh upstream 401
-	// reaching the request path between sweeps.
-	if err := conn.ResetCooldown(); err != nil {
-		t.Fatalf("reset to idle: %v", err)
-	}
-	if err := conn.MarkUsed(); err != nil {
-		t.Fatalf("MarkUsed: %v", err)
-	}
-	if err := conn.MarkAuthExpired(); err != nil {
-		t.Fatalf("MarkAuthExpired: %v", err)
-	}
+	// Second failure — the loop re-drives the still-AuthExpired connection.
 	l.tick(context.Background())
-	// Now failures = 2. Still NOT disabled (threshold = 3).
-	if got, want := conn.State(), provider.StateErrored; got != want {
+	if got, want := conn.State(), provider.StateAuthExpired; got != want {
 		t.Errorf("after 2 failures: state = %v, want %v", got, want)
 	}
 	if store.failures["s1"] != 2 {
 		t.Errorf("after 2 failures: refresh_failures = %d, want 2", store.failures["s1"])
 	}
 
-	// Third failure → should Disable.
-	if err := conn.ResetCooldown(); err != nil {
-		t.Fatalf("reset to idle: %v", err)
-	}
-	if err := conn.MarkUsed(); err != nil {
-		t.Fatalf("MarkUsed: %v", err)
-	}
-	if err := conn.MarkAuthExpired(); err != nil {
-		t.Fatalf("MarkAuthExpired: %v", err)
-	}
+	// Third failure → threshold reached → auto-disable.
 	l.tick(context.Background())
 	if got, want := conn.State(), provider.StateDisabled; got != want {
 		t.Errorf("after 3 failures: state = %v, want %v (auto-disable)", got, want)

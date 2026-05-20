@@ -137,7 +137,20 @@ func main() {
 	if err == nil {
 		for i := range connections {
 			c := &connections[i]
-			providerSel.Register(provider.NewConnection(c.ID, c.Provider, c.Name, c.Priority, c.AuthType))
+			conn := provider.NewConnection(c.ID, c.Provider, c.Name, c.Priority, c.AuthType)
+			// Hydrate the Lifecycle facet from the persisted state: a
+			// connection an operator disabled must stay disabled across a
+			// restart. The breaker / transient-health facets are deliberately
+			// not persisted (they load CLOSED); only Disabled carries over.
+			// Without this, a persisted-disabled connection would load
+			// Idle/selectable (M2 spec §10).
+			if c.State == "disabled" {
+				if derr := conn.Disable(); derr != nil {
+					slog.Warn("hydrate disabled connection failed",
+						"conn_id", c.ID, "err", derr)
+				}
+			}
+			providerSel.Register(conn)
 		}
 	}
 
@@ -213,11 +226,11 @@ func main() {
 
 	// Create and start server
 	srv := server.New(server.Config{
-		Host:          *host,
-		Port:          *port,
-		DBPath:        *dbPath,
-		DashboardFS:   dashboardFS,
-		SetupToken:    setupToken,
+		Host:        *host,
+		Port:        *port,
+		DBPath:      *dbPath,
+		DashboardFS: dashboardFS,
+		SetupToken:  setupToken,
 	}, server.Dependencies{
 		Store:             db,
 		Catalog:           catalogW.Registry,
@@ -230,7 +243,7 @@ func main() {
 		// map removed from server.Dependencies; Variants is the sole
 		// dispatch source. The `executors` local var above is still
 		// used to wrap each entry in RetryExecutor + register into Variants.
-		Variants: variants,
+		Variants:          variants,
 		UsageTracker:      usageTracker,
 		Auth:              authMgr,
 		OpenAIAuth:        oauth.NewOpenAIAuth(),
