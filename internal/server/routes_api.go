@@ -148,6 +148,34 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 
 // ── Connection Routes ──
 
+// legacyRuntimeState derives the legacy connection-state string from the three
+// health facets, for the /api/connections `runtime_state` projection (spec §8
+// of cycle 20260520-m2-circuit-breaker). It mirrors the derivation that
+// provider.Connection.State() performs — including the breaker-open split
+// (failure kind rate_limit → "cooldown", anything else → "errored") — so the
+// dashboard's existing `runtime_state` consumer is byte-for-byte unchanged by
+// the facet migration. The dashboard's own move to render the breaker/auth/
+// lifecycle facet fields directly is a tracked post-M2 deferral.
+func legacyRuntimeState(breaker provider.BreakerState, authState provider.AuthState, lifecycle provider.LifecycleState, failure provider.FailureKind) string {
+	switch {
+	case lifecycle == provider.LifecycleDisabled:
+		return "disabled"
+	case authState == provider.AuthRefreshing:
+		return "refreshing"
+	case authState == provider.AuthExpired:
+		return "auth_expired"
+	case breaker == provider.BreakerOpen || breaker == provider.BreakerHalfOpen:
+		if failure == provider.FailureRateLimit {
+			return "cooldown"
+		}
+		return "errored"
+	case lifecycle == provider.LifecycleActive:
+		return "active"
+	default:
+		return "idle"
+	}
+}
+
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	provider := r.URL.Query().Get("provider")
 	conns, err := s.deps.Store.ListConnections(store.ConnectionFilter{Provider: provider})
@@ -168,26 +196,33 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	// the DB row's `state`. Without this projection, a connection appears
 	// "green" in UI while silently refusing specific models — see plan.md.
 	type safeConn struct {
-		ID              string               `json:"id"`
-		Provider        string               `json:"provider"`
-		Name            string               `json:"name"`
-		AuthType        string               `json:"auth_type"`
-		Priority        int                  `json:"priority"`
-		State           string               `json:"state"`
-		ExpiresAt       *time.Time           `json:"expires_at,omitempty"`
-		AccountID       string               `json:"account_id,omitempty"`
-		RefreshFailures int                  `json:"refresh_failures,omitempty"`
-		LastError       string               `json:"last_error,omitempty"`
+		ID              string     `json:"id"`
+		Provider        string     `json:"provider"`
+		Name            string     `json:"name"`
+		AuthType        string     `json:"auth_type"`
+		Priority        int        `json:"priority"`
+		State           string     `json:"state"`
+		ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+		AccountID       string     `json:"account_id,omitempty"`
+		RefreshFailures int        `json:"refresh_failures,omitempty"`
+		LastError       string     `json:"last_error,omitempty"`
 		// Selector runtime view (cycle 20260516-connection-runtime-state).
 		// Populated from provider.Connection when registered in the Selector;
 		// all four use omitempty so an unregistered connection (e.g., between
 		// handleCreateConnection insert and Selector.Register) renders as today.
-		RuntimeState  string               `json:"runtime_state,omitempty"`  // pc.State() — may differ from State
+		RuntimeState  string               `json:"runtime_state,omitempty"`  // legacy state derived from the facets — may differ from State
 		ModelDenylist map[string]time.Time `json:"model_denylist,omitempty"` // model → expiry (1h after 401/403)
 		ModelLocks    map[string]time.Time `json:"model_locks,omitempty"`    // model → expiry (per-429 cooldown)
 		CooldownUntil *time.Time           `json:"cooldown_until,omitempty"` // nil when not in cooldown
-		CreatedAt       time.Time            `json:"created_at"`
-		UpdatedAt       time.Time            `json:"updated_at"`
+		// Three-facet health view (cycle 20260520-m2-circuit-breaker, spec §8):
+		// breaker = transient-health circuit breaker; auth = credential
+		// validity; lifecycle = request lifecycle. omitempty — same contract as
+		// the runtime fields above (omitted for an unregistered connection).
+		Breaker   string    `json:"breaker,omitempty"`
+		Auth      string    `json:"auth,omitempty"`
+		Lifecycle string    `json:"lifecycle,omitempty"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
 	}
 	safe := make([]safeConn, 0, len(conns))
 	for _, c := range conns {
@@ -233,7 +268,16 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 					sc.LastError = err.Error()
 				}
 			}
-			sc.RuntimeState = string(pc.State())
+			// Read the three facets into locals so the derived runtime_state
+			// stays consistent with the breaker/auth/lifecycle fields shown
+			// alongside it in this same response (spec §8).
+			breaker := pc.Breaker()
+			authState := pc.Auth()
+			lifecycle := pc.Lifecycle()
+			sc.Breaker = string(breaker)
+			sc.Auth = string(authState)
+			sc.Lifecycle = string(lifecycle)
+			sc.RuntimeState = legacyRuntimeState(breaker, authState, lifecycle, pc.FailureKind())
 			if dn := pc.ModelDenylistSnapshot(); len(dn) > 0 {
 				sc.ModelDenylist = dn
 			}
@@ -1245,8 +1289,8 @@ type catalogModelView struct {
 	CacheWritePrice  float64 `json:"cache_write_price"`
 	ThinkingPrice    float64 `json:"thinking_price"`
 	PricingSource    string  `json:"pricing_source"`
-	UpdatedAt        string  `json:"updated_at,omitempty"`     // RFC3339; empty when unknown
-	DiscoveredAt     string  `json:"discovered_at,omitempty"`  // RFC3339; empty when unknown
+	UpdatedAt        string  `json:"updated_at,omitempty"`    // RFC3339; empty when unknown
+	DiscoveredAt     string  `json:"discovered_at,omitempty"` // RFC3339; empty when unknown
 }
 
 func modelToCatalogView(m catalog.Model) catalogModelView {
@@ -1772,8 +1816,8 @@ func (s *Server) handleGetRoutingSummary(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"summary":           summary,
-		"active_sessions":   affinityEntries,
+		"summary":              summary,
+		"active_sessions":      affinityEntries,
 		"active_conversations": bridgeActive,
 		"memory_usage_bytes": func() int64 {
 			if s.deps.ConversationStore != nil {
