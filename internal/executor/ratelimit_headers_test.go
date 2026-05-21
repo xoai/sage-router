@@ -115,3 +115,101 @@ func TestParseRateLimitReset(t *testing.T) {
 		})
 	}
 }
+
+// TestParseRateLimitReset_Remaining pins M3's remaining-quota extension to the
+// shared parser (spec §2): the *-remaining-* headers for generic / Anthropic /
+// OpenAI shapes, with a generic fallback. A missing or unparseable header
+// yields {Remaining: -1, RemainingKnown: false}, never an error. Zero is a
+// real value (window exhausted). The reset fields are exercised by
+// TestParseRateLimitReset above; this test asserts only the M3 fields.
+func TestParseRateLimitReset_Remaining(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name          string
+		provider      string
+		headers       map[string]string
+		wantRemaining int
+		wantKnown     bool
+	}{
+		{
+			name:          "generic X-RateLimit-Remaining",
+			provider:      "gemini",
+			headers:       map[string]string{"X-RateLimit-Remaining": "42"},
+			wantRemaining: 42,
+			wantKnown:     true,
+		},
+		{
+			name:          "anthropic remaining header",
+			provider:      "anthropic",
+			headers:       map[string]string{"anthropic-ratelimit-requests-remaining": "1000"},
+			wantRemaining: 1000,
+			wantKnown:     true,
+		},
+		{
+			name:          "openai remaining header",
+			provider:      "openai",
+			headers:       map[string]string{"x-ratelimit-remaining-requests": "7"},
+			wantRemaining: 7,
+			wantKnown:     true,
+		},
+		{
+			name:          "openrouter shares the openai remaining header",
+			provider:      "openrouter",
+			headers:       map[string]string{"x-ratelimit-remaining-requests": "500"},
+			wantRemaining: 500,
+			wantKnown:     true,
+		},
+		{
+			name:          "zero remaining is a real value (window exhausted)",
+			provider:      "openai",
+			headers:       map[string]string{"x-ratelimit-remaining-requests": "0"},
+			wantRemaining: 0,
+			wantKnown:     true,
+		},
+		{
+			name:          "provider-specific absent, generic header is the fallback",
+			provider:      "anthropic",
+			headers:       map[string]string{"X-RateLimit-Remaining": "13"},
+			wantRemaining: 13,
+			wantKnown:     true,
+		},
+		{
+			name:          "no remaining header => -1, not known",
+			provider:      "openai",
+			headers:       map[string]string{"x-ratelimit-reset-requests": "1m"},
+			wantRemaining: -1,
+			wantKnown:     false,
+		},
+		{
+			name:          "garbage value => -1, not known",
+			provider:      "openai",
+			headers:       map[string]string{"x-ratelimit-remaining-requests": "lots"},
+			wantRemaining: -1,
+			wantKnown:     false,
+		},
+		{
+			name:          "negative value rejected as garbage",
+			provider:      "gemini",
+			headers:       map[string]string{"X-RateLimit-Remaining": "-5"},
+			wantRemaining: -1,
+			wantKnown:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.Header{}
+			for k, v := range tt.headers {
+				h.Set(k, v)
+			}
+			got := ParseRateLimitReset(tt.provider, h, now)
+			if got.Remaining != tt.wantRemaining {
+				t.Errorf("Remaining = %d, want %d", got.Remaining, tt.wantRemaining)
+			}
+			if got.RemainingKnown != tt.wantKnown {
+				t.Errorf("RemainingKnown = %v, want %v", got.RemainingKnown, tt.wantKnown)
+			}
+		})
+	}
+}

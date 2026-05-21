@@ -8,15 +8,30 @@ import (
 
 // RateLimitInfo is the parsed rate-limit signal from an upstream response.
 // M2 (cycle 20260520-m2-circuit-breaker) populates Reset — the cooldown the
-// circuit breaker honors — and Known. M3's quota tracker extends this struct
-// with the remaining-quota fields for the QuotaWindow, keeping
-// ParseRateLimitReset's contract additive (no signature churn for M3).
+// circuit breaker honors — and Known. M3 (cycle 20260521-m3-quota-tracking)
+// added the remaining-quota fields the QuotaWindow consumes; the extension is
+// additive — ParseRateLimitReset's signature is unchanged.
 type RateLimitInfo struct {
-	Reset time.Duration // time until the rate limit resets; 0 when unknown
-	Known bool          // true when a recognized rate-limit header was present
+	Reset          time.Duration // (M2) time until the rate limit resets; 0 when unknown
+	Known          bool          // (M2) true when a recognized reset header was present
+	Remaining      int           // (M3) requests left in the window; -1 when not reported
+	RemainingKnown bool          // (M3) true when a recognized *-remaining-* header was parsed
 }
 
-// ParseRateLimitReset extracts the retry delay from an upstream response's
+// ParseRateLimitReset parses an upstream response's rate-limit headers into a
+// RateLimitInfo: the reset delay the circuit breaker honors (Reset/Known — M2)
+// and the remaining-request count the QuotaWindow consumes (Remaining/
+// RemainingKnown — M3). The two are parsed independently from separate
+// headers; neither ever errors — an absent or unparseable header degrades to
+// the unknown defaults. now is the reference for absolute-timestamp header
+// values; production callers pass time.Now().
+func ParseRateLimitReset(provider string, h http.Header, now time.Time) RateLimitInfo {
+	info := parseResetHeaders(provider, h, now)
+	info.Remaining, info.RemainingKnown = parseRemainingHeaders(provider, h)
+	return info
+}
+
+// parseResetHeaders extracts the retry delay from an upstream response's
 // headers. It checks, in priority order:
 //
 //  1. the generic Retry-After header (RFC 7231 — delta-seconds or HTTP-date),
@@ -27,9 +42,9 @@ type RateLimitInfo struct {
 // An unrecognized or absent header yields {Reset: 0, Known: false} — never an
 // error; the breaker then falls back to its computed per-kind cooldown. A
 // recognized header whose reset time has already passed yields
-// {Reset: 0, Known: true}. now is the reference for absolute-timestamp header
-// values; production callers pass time.Now().
-func ParseRateLimitReset(provider string, h http.Header, now time.Time) RateLimitInfo {
+// {Reset: 0, Known: true}. It populates only Reset and Known — the caller
+// (ParseRateLimitReset) populates the Remaining fields.
+func parseResetHeaders(provider string, h http.Header, now time.Time) RateLimitInfo {
 	// 1. Generic Retry-After — RFC 7231: delta-seconds or an HTTP-date.
 	if v := h.Get("Retry-After"); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil {
@@ -121,4 +136,45 @@ func longestDurationHeader(h http.Header, keys ...string) (time.Duration, bool) 
 		}
 	}
 	return longest, found
+}
+
+// remainingHeaders maps a provider to its "remaining requests" rate-limit
+// header. A provider not listed — and any listed provider whose header is
+// absent or unparseable — falls back to the generic X-RateLimit-Remaining.
+var remainingHeaders = map[string]string{
+	"anthropic":  "anthropic-ratelimit-requests-remaining",
+	"openai":     "x-ratelimit-remaining-requests",
+	"openrouter": "x-ratelimit-remaining-requests",
+}
+
+// parseRemainingHeaders extracts the remaining-request count from an upstream
+// response — the provider-specific header first, then the generic
+// X-RateLimit-Remaining fallback. Returns (-1, false) when no recognized
+// header is present or its value does not parse to a non-negative integer;
+// never an error. Zero is a real value (the window is exhausted) and is
+// returned as (0, true).
+func parseRemainingHeaders(provider string, h http.Header) (remaining int, known bool) {
+	if name, ok := remainingHeaders[provider]; ok {
+		if n, ok := parseNonNegInt(h.Get(name)); ok {
+			return n, true
+		}
+	}
+	if n, ok := parseNonNegInt(h.Get("X-RateLimit-Remaining")); ok {
+		return n, true
+	}
+	return -1, false
+}
+
+// parseNonNegInt parses v as a non-negative integer. An empty, non-numeric, or
+// negative value yields ok=false — a remaining-request count is never
+// negative, so a negative value is treated as garbage.
+func parseNonNegInt(v string) (int, bool) {
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
