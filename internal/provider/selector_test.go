@@ -10,7 +10,7 @@ import (
 
 func TestSelectEmptySelector(t *testing.T) {
 	s := NewSelector()
-	_, err := s.Select("openai", "gpt-4", nil)
+	_, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 	if !errors.Is(err, ErrNoConnections) {
 		t.Fatalf("expected ErrNoConnections, got %v", err)
 	}
@@ -21,7 +21,7 @@ func TestSelectSingleConnection(t *testing.T) {
 	c := NewConnection("c1", "openai", "conn-1", 1, "api_key")
 	s.Register(c)
 
-	res, err := s.Select("openai", "gpt-4", nil)
+	res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestSelectPriorityOrdering(t *testing.T) {
 	s.Register(c5)
 	s.Register(c1)
 
-	res, err := s.Select("openai", "gpt-4", nil)
+	res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestSelectExclusion(t *testing.T) {
 	s.Register(c1)
 	s.Register(c2)
 
-	res, err := s.Select("openai", "gpt-4", []string{"c1"})
+	res, err := s.Select("openai", "gpt-4", []string{"c1"}, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestSelectAllExcluded(t *testing.T) {
 	c1 := NewConnection("c1", "openai", "conn-1", 1, "api_key")
 	s.Register(c1)
 
-	_, err := s.Select("openai", "gpt-4", []string{"c1"})
+	_, err := s.Select("openai", "gpt-4", []string{"c1"}, SelectDefault)
 	if !errors.Is(err, ErrAllUnavailable) {
 		t.Fatalf("expected ErrAllUnavailable, got %v", err)
 	}
@@ -95,7 +95,7 @@ func TestSelectRateLimitedSkipped(t *testing.T) {
 		t.Fatalf("c1 OpenBreaker: %v", err)
 	}
 
-	res, err := s.Select("openai", "gpt-4", nil)
+	res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestSelectAllRateLimited(t *testing.T) {
 		t.Fatalf("c2 OpenBreaker: %v", err)
 	}
 
-	res, err := s.Select("openai", "gpt-4", nil)
+	res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 	if !errors.Is(err, ErrAllUnavailable) {
 		t.Fatalf("expected ErrAllUnavailable, got %v", err)
 	}
@@ -176,7 +176,7 @@ func TestRemove(t *testing.T) {
 		t.Error("c1 should have been removed")
 	}
 
-	res, err := s.Select("openai", "gpt-4", nil)
+	res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select after remove: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestSelectWrongProvider(t *testing.T) {
 	c := NewConnection("c1", "openai", "conn-1", 1, "api_key")
 	s.Register(c)
 
-	_, err := s.Select("anthropic", "claude-3", nil)
+	_, err := s.Select("anthropic", "claude-3", nil, SelectDefault)
 	if !errors.Is(err, ErrNoConnections) {
 		t.Fatalf("expected ErrNoConnections for wrong provider, got %v", err)
 	}
@@ -238,7 +238,7 @@ func TestSelectorPriorityOrdering(t *testing.T) {
 	s.Register(c3)
 	s.Register(c1)
 
-	res, err := s.Select("openai", "", nil)
+	res, err := s.Select("openai", "", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestSelectorExclusion(t *testing.T) {
 	s.Register(c3)
 
 	// Exclude the two best-priority connections.
-	res, err := s.Select("openai", "", []string{"c1", "c2"})
+	res, err := s.Select("openai", "", []string{"c1", "c2"}, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestSelectorAllRateLimited(t *testing.T) {
 		t.Fatalf("c2 OpenBreaker: %v", err)
 	}
 
-	res, err := s.Select("openai", "gpt-4", nil)
+	res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 	if !errors.Is(err, ErrAllUnavailable) {
 		t.Fatalf("expected ErrAllUnavailable, got %v", err)
 	}
@@ -340,7 +340,7 @@ func TestSelectorRoundRobin(t *testing.T) {
 		t.Fatalf("cA MarkUsed: %v", err)
 	}
 
-	res, err := s.Select("openai", "", nil)
+	res, err := s.Select("openai", "", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select while cA Active: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestSelectorRoundRobin(t *testing.T) {
 		t.Fatalf("cB MarkUsed: %v", err)
 	}
 
-	res2, err := s.Select("openai", "", nil)
+	res2, err := s.Select("openai", "", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select while cB Active: %v", err)
 	}
@@ -383,7 +383,7 @@ func TestSelectorRoundRobin(t *testing.T) {
 	if err := cA.MarkUsed(); err != nil {
 		t.Fatalf("cA MarkUsed 2: %v", err)
 	}
-	res3, err := s.Select("openai", "", nil)
+	res3, err := s.Select("openai", "", nil, SelectDefault)
 	if err != nil {
 		t.Fatalf("Select with cA Active: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestSelectorRoundRobin(t *testing.T) {
 	if err := cB.MarkUsed(); err != nil {
 		t.Fatalf("cB MarkUsed 2: %v", err)
 	}
-	_, err = s.Select("openai", "", nil)
+	_, err = s.Select("openai", "", nil, SelectDefault)
 	if !errors.Is(err, ErrAllUnavailable) {
 		t.Fatalf("expected ErrAllUnavailable when both Active, got %v", err)
 	}
@@ -405,7 +405,7 @@ func TestSelectorRoundRobin(t *testing.T) {
 func TestSelectorNoConnections(t *testing.T) {
 	s := NewSelector()
 
-	_, err := s.Select("unknown-provider", "model", nil)
+	_, err := s.Select("unknown-provider", "model", nil, SelectDefault)
 	if !errors.Is(err, ErrNoConnections) {
 		t.Fatalf("expected ErrNoConnections, got %v", err)
 	}
@@ -414,7 +414,7 @@ func TestSelectorNoConnections(t *testing.T) {
 	c := NewConnection("c1", "openai", "conn-1", 1, "api_key")
 	s.Register(c)
 
-	_, err = s.Select("anthropic", "claude-3", nil)
+	_, err = s.Select("anthropic", "claude-3", nil, SelectDefault)
 	if !errors.Is(err, ErrNoConnections) {
 		t.Fatalf("expected ErrNoConnections for unregistered provider, got %v", err)
 	}
@@ -484,7 +484,7 @@ func TestSelect_HalfOpenSingleTrialRaceSafe(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			res, err := s.Select("openai", "gpt-4", nil)
+			res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
 			if err == nil && res != nil && res.Connection != nil {
 				atomic.AddInt32(&winners, 1)
 			}
@@ -494,5 +494,43 @@ func TestSelect_HalfOpenSingleTrialRaceSafe(t *testing.T) {
 
 	if got := atomic.LoadInt32(&winners); got != 1 {
 		t.Errorf("HALF_OPEN single-trial gate: %d goroutines won the pick, want exactly 1", got)
+	}
+}
+
+// TestSelect_StrategyParameter (M3 T4 — the regression gate) pins that the new
+// SelectStrategy parameter dispatches without disturbing selection: every
+// strategy value routes through Select and returns a valid connection.
+// SelectDefault must reproduce today's user-priority ordering exactly; the
+// SelectP2C / SelectResetAware arms are placeholders here (T5/T6 fill them) so
+// this test only asserts they dispatch — it does not pin their order.
+func TestSelect_StrategyParameter(t *testing.T) {
+	newSelector := func() *Selector {
+		s := NewSelector()
+		// Register out of priority order to prove the sort, not insertion.
+		s.Register(NewConnection("c3", "openai", "conn-3", 3, "api_key"))
+		s.Register(NewConnection("c1", "openai", "conn-1", 1, "api_key"))
+		s.Register(NewConnection("c2", "openai", "conn-2", 2, "api_key"))
+		return s
+	}
+
+	for _, strategy := range []SelectStrategy{SelectDefault, SelectP2C, SelectResetAware} {
+		s := newSelector()
+		res, err := s.Select("openai", "gpt-4", nil, strategy)
+		if err != nil {
+			t.Fatalf("strategy %d: Select: %v", strategy, err)
+		}
+		if res.Connection == nil {
+			t.Fatalf("strategy %d: Select returned nil connection", strategy)
+		}
+	}
+
+	// SelectDefault is the regression baseline — lowest user priority wins.
+	s := newSelector()
+	res, err := s.Select("openai", "gpt-4", nil, SelectDefault)
+	if err != nil {
+		t.Fatalf("SelectDefault: %v", err)
+	}
+	if res.Connection.ID != "c1" {
+		t.Errorf("SelectDefault: expected c1 (priority 1), got %s", res.Connection.ID)
 	}
 }

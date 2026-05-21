@@ -1021,7 +1021,7 @@ func newMockNetErrExecutor(providerID string, err error) *mockExecutor {
 func pickExecuteConn(t *testing.T, srv *Server, db store.Store, providerID, name string) *ConnectionInfo {
 	t.Helper()
 	addConnection(t, srv, db, providerID, name, "apikey")
-	conn, _, err := srv.selectConnection(providerID, "test-model", nil)
+	conn, _, err := srv.selectConnection(providerID, "test-model", nil, provider.SelectDefault)
 	if err != nil || conn == nil {
 		t.Fatalf("pickExecuteConn: selectConnection failed: %v", err)
 	}
@@ -1168,7 +1168,7 @@ func TestExecuteRequest_InnerLoopCtxCancel(t *testing.T) {
 	// Two connections so the inner loop has somewhere to advance to.
 	addConnection(t, srv, db, "openai", "primary", "apikey")
 	addConnection(t, srv, db, "openai", "secondary", "apikey")
-	conn, _, err := srv.selectConnection("openai", "gpt-4o", nil)
+	conn, _, err := srv.selectConnection("openai", "gpt-4o", nil, provider.SelectDefault)
 	if err != nil || conn == nil {
 		t.Fatalf("setup: selectConnection failed: %v", err)
 	}

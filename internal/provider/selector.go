@@ -15,6 +15,22 @@ var (
 	ErrAllUnavailable = errors.New("all connections unavailable")
 )
 
+// SelectStrategy chooses how Select orders the candidate connections before
+// the HALF_OPEN claim-walk. The filter chain and the claim-walk are identical
+// for every strategy — only the candidate ordering differs (M3 spec §4.3).
+type SelectStrategy int
+
+const (
+	// SelectDefault is today's ordering: a healthy (CLOSED) breaker before a
+	// probing (HALF_OPEN) one, then user priority ascending, then consecutive
+	// uses ascending (round-robin spread).
+	SelectDefault SelectStrategy = iota
+	// SelectP2C is power-of-two-choices over an LRU/recency signal (M3 §5).
+	SelectP2C
+	// SelectResetAware orders by soonest quota-window reset (M3 §5).
+	SelectResetAware
+)
+
 // SelectResult carries the outcome of a selection attempt.
 type SelectResult struct {
 	// Connection is the chosen connection, or nil if none are available.
@@ -98,9 +114,11 @@ func (s *Selector) removeLocked(id string) {
 //  2. Filter to Selectable connections — breaker CLOSED or HALF_OPEN, auth
 //     valid, idle, and the model not rate-limit-locked, not denylisted, and
 //     permitted by the subscription tier.
-//  3. Sort candidates: CLOSED before HALF_OPEN (healthy before probing), then
-//     user priority ascending, then consecutive uses ascending (spread).
-//  4. Walk the sorted candidates and return the first whose HALF_OPEN trial
+//  3. Order candidates per strategy (orderCandidates). SelectDefault: CLOSED
+//     before HALF_OPEN (healthy before probing), then user priority ascending,
+//     then consecutive uses ascending (spread). SelectP2C / SelectResetAware
+//     apply their own ordering (M3 §5).
+//  4. Walk the ordered candidates and return the first whose HALF_OPEN trial
 //     slot can be claimed — a CLOSED connection always claims without
 //     consuming a slot; a HALF_OPEN connection only if it wins the atomic
 //     compare-and-set (ADR-1 §HALF_OPEN gate). The caller MUST pair the
@@ -108,7 +126,7 @@ func (s *Selector) removeLocked(id string) {
 //
 // If no candidate is available, the returned SelectResult reports whether
 // every connection is rate-limit-cooling-down, and the earliest retry time.
-func (s *Selector) Select(provider, model string, excludeIDs []string) (*SelectResult, error) {
+func (s *Selector) Select(provider, model string, excludeIDs []string, strategy SelectStrategy) (*SelectResult, error) {
 	s.mu.RLock()
 	conns, ok := s.conns[provider]
 	if !ok || len(conns) == 0 {
@@ -157,18 +175,9 @@ func (s *Selector) Select(provider, model string, excludeIDs []string) (*SelectR
 		}, ErrAllUnavailable
 	}
 
-	// Healthy (CLOSED) candidates before probing (HALF_OPEN) ones, then user
-	// priority ascending, then consecutive uses ascending (spread traffic).
-	sort.SliceStable(candidates, func(i, j int) bool {
-		ri, rj := selectionRank(candidates[i]), selectionRank(candidates[j])
-		if ri != rj {
-			return ri < rj
-		}
-		if candidates[i].Priority != candidates[j].Priority {
-			return candidates[i].Priority < candidates[j].Priority
-		}
-		return candidates[i].ConsecutiveUses() < candidates[j].ConsecutiveUses()
-	})
+	// Order the candidates per the requested strategy. The claim-walk below
+	// then takes the first claimable one.
+	orderCandidates(candidates, strategy)
 
 	// Claim-the-winner. A CLOSED candidate claims without consuming a slot; a
 	// HALF_OPEN candidate claims only if it wins the compare-and-set — a loser
@@ -195,6 +204,42 @@ func selectionRank(c *Connection) int {
 		return 0
 	}
 	return 1 // HALF_OPEN
+}
+
+// orderCandidates arranges candidates in place into the order the requested
+// strategy prefers. Select's claim-walk then takes the first claimable one.
+//
+// SelectP2C and SelectResetAware are placeholders until M3 T5/T6 — they
+// deliberately fall through to the SelectDefault ordering for now, so the
+// strategy parameter is fully plumbed before the new orderings land.
+func orderCandidates(candidates []*Connection, strategy SelectStrategy) {
+	switch strategy {
+	case SelectP2C:
+		// T5 fills this arm with power-of-two-choices ordering.
+		sort.SliceStable(candidates, defaultLess(candidates))
+	case SelectResetAware:
+		// T6 fills this arm with soonest-reset ordering.
+		sort.SliceStable(candidates, defaultLess(candidates))
+	default:
+		sort.SliceStable(candidates, defaultLess(candidates))
+	}
+}
+
+// defaultLess is the SelectDefault candidate comparator: a healthy (CLOSED)
+// breaker before a probing (HALF_OPEN) one, then user priority ascending,
+// then consecutive uses ascending (round-robin spread). It is the regression
+// baseline — this ordering must match the pre-M3 selector exactly.
+func defaultLess(candidates []*Connection) func(i, j int) bool {
+	return func(i, j int) bool {
+		ri, rj := selectionRank(candidates[i]), selectionRank(candidates[j])
+		if ri != rj {
+			return ri < rj
+		}
+		if candidates[i].Priority != candidates[j].Priority {
+			return candidates[i].Priority < candidates[j].Priority
+		}
+		return candidates[i].ConsecutiveUses() < candidates[j].ConsecutiveUses()
+	}
 }
 
 // AllConnections returns all connections registered for a provider.

@@ -165,7 +165,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Select connection
-	conn, retryAfter, err := s.selectConnection(providerID, resolvedModel, nil)
+	conn, retryAfter, err := s.selectConnection(providerID, resolvedModel, nil, provider.SelectDefault)
 	if err != nil {
 		if retryAfter > 0 {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
@@ -405,7 +405,7 @@ func (s *Server) executeRequest(
 				pc.SetLastError(preErr)
 			}
 			excludeIDs = append(excludeIDs, currentConn.ID)
-			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
+			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, provider.SelectDefault)
 			if nextErr != nil {
 				reqCtx.servedConnID = currentConn.ID
 				return nil, preErr
@@ -443,7 +443,7 @@ func (s *Server) executeRequest(
 			slog.Error("upstream error", "provider", providerID, "connection", currentConn.ID, "error", execErr)
 			s.markConnectionResult(currentConn.ID, model, 0, nil, execErr, 0)
 			excludeIDs = append(excludeIDs, currentConn.ID)
-			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
+			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, provider.SelectDefault)
 			if nextErr != nil {
 				reqCtx.servedConnID = currentConn.ID
 				return nil, execErr // exhausted — caller decides (M2 may advance to next combo member)
@@ -485,7 +485,7 @@ func (s *Server) executeRequest(
 			// Retryable status → try next connection (connection-level fallback).
 			if executor.IsFallbackEligible(statusCode) {
 				excludeIDs = append(excludeIDs, currentConn.ID)
-				nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs)
+				nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, provider.SelectDefault)
 				if nextErr == nil {
 					slog.Info("falling back on error",
 						"provider", providerID, "from", currentConn.ID, "to", nextConn.ID,
@@ -892,7 +892,7 @@ func (s *Server) handleComboRequest(
 		// guard above already skips such members before reaching this call,
 		// so this is defense-in-depth.
 		providerID, model, _, _ := s.resolveModel(r.Context(), modelStr, body, "")
-		conn, _, err := s.selectConnection(providerID, model, nil)
+		conn, _, err := s.selectConnection(providerID, model, nil, provider.SelectDefault)
 		if err != nil {
 			slog.Info("combo skip", "model", modelStr, "error", err)
 			continue
@@ -1397,8 +1397,9 @@ func (s *Server) buildSmartCandidates(ctx context.Context, strategy routing.Stra
 }
 
 // selectConnection picks a connection and marks it Active. Returns retryAfterSec > 0
-// when all connections are rate-limited.
-func (s *Server) selectConnection(providerID, model string, excludeIDs []string) (*ConnectionInfo, int, error) {
+// when all connections are rate-limited. strategy chooses the candidate
+// ordering (SelectDefault for every non-auto:p2c/reset-aware request).
+func (s *Server) selectConnection(providerID, model string, excludeIDs []string, strategy provider.SelectStrategy) (*ConnectionInfo, int, error) {
 	// Cycle 20260517-provider-auth-variants M5.5 (Q9 + m4 fold):
 	// auto_detect recovery branch REMOVED — auth_type=auto_detect rows
 	// are converted to auth_type=subscription at create time
@@ -1407,7 +1408,7 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 	// recoverAutoDetectConnections + resolveAutoDetectCredentials are
 	// likewise deleted below.
 
-	result, err := s.deps.ProviderSelector.Select(providerID, model, excludeIDs)
+	result, err := s.deps.ProviderSelector.Select(providerID, model, excludeIDs, strategy)
 	if err != nil {
 		var retryAfter int
 		if result != nil && result.AllRateLimited && !result.EarliestRetry.IsZero() {
@@ -1436,7 +1437,7 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 		if excludeIDs == nil {
 			excludeIDs = []string{}
 		}
-		return s.selectConnection(providerID, model, append(excludeIDs, conn.ID))
+		return s.selectConnection(providerID, model, append(excludeIDs, conn.ID), strategy)
 	}
 
 	// Look up stored credentials

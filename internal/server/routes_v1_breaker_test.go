@@ -125,7 +125,7 @@ func selectClaimedHalfOpenConn(t *testing.T, srv *Server, db store.Store, provid
 	// Force HALF_OPEN so Select consumes the single trial slot when it picks
 	// this connection — the state a request path must release on exit.
 	pc.SetFacetsForTest(provider.BreakerHalfOpen, provider.AuthValid, provider.LifecycleIdle)
-	conn, _, err := srv.selectConnection(providerID, model, nil)
+	conn, _, err := srv.selectConnection(providerID, model, nil, provider.SelectDefault)
 	if err != nil || conn == nil {
 		t.Fatalf("selectConnection: %v", err)
 	}
