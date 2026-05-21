@@ -19,6 +19,14 @@ const (
 	// sortByStrategy case is a stable-sort no-op that preserves that order.
 	// Cycle 20260516-routing-strategy-ux.
 	StrategyUserOrder Strategy = "user-order"
+	// StrategyP2C and StrategyResetAware are connection-selection strategies
+	// (cycle 20260521-m3-quota-tracking, ADR-3). They carry NO model-ranking
+	// opinion — sortByStrategy routes both through its default arm
+	// (tier-ascending only) — and instead drive provider.Selector candidate
+	// ordering via server.connStrategyFor. Selectable as auto:p2c /
+	// auto:reset-aware.
+	StrategyP2C        Strategy = "p2c"
+	StrategyResetAware Strategy = "reset-aware"
 )
 
 // ModelCandidate represents a model available for routing.
@@ -73,7 +81,8 @@ func ParseAutoModel(model string) (Strategy, bool) {
 	if strings.HasPrefix(model, "auto:") {
 		s := Strategy(strings.TrimPrefix(model, "auto:"))
 		switch s {
-		case StrategyFast, StrategyCheap, StrategyBest, StrategyBalanced, StrategyUserOrder:
+		case StrategyFast, StrategyCheap, StrategyBest, StrategyBalanced, StrategyUserOrder,
+			StrategyP2C, StrategyResetAware:
 			return s, true
 		}
 		// Unknown strategy, default to balanced

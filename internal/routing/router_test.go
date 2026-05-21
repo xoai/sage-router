@@ -27,6 +27,8 @@ func TestParseAutoModel(t *testing.T) {
 		{"auto:best", StrategyBest, true},
 		{"auto:balanced", StrategyBalanced, true},
 		{"auto:user-order", StrategyUserOrder, true}, // AC-F1 (cycle 20260516-routing-strategy-ux)
+		{"auto:p2c", StrategyP2C, true},              // M3 T7 — connection-selection strategy
+		{"auto:reset-aware", StrategyResetAware, true},
 		{"auto:unknown", StrategyBalanced, true},
 		{"gpt-4o", "", false},
 		{"anthropic/claude-sonnet-4-6", "", false},
@@ -40,6 +42,45 @@ func TestParseAutoModel(t *testing.T) {
 		if ok && s != tt.strategy {
 			t.Errorf("ParseAutoModel(%q) strategy = %q, want %q", tt.input, s, tt.strategy)
 		}
+	}
+}
+
+// TestSortByStrategy_P2CResetAware (M3 T7 — AC8) pins that the two new
+// connection-selection strategies carry NO model-ranking opinion: sortByStrategy
+// routes auto:p2c and auto:reset-aware through its default arm (tier-ascending
+// only), distinct from StrategyBalanced which adds an InputPrice tiebreak.
+func TestSortByStrategy_P2CResetAware(t *testing.T) {
+	// An unrecognized strategy hits the switch's `default` arm — the same arm
+	// p2c / reset-aware must fall into.
+	defaultArm := sortByStrategy(Strategy("__unrecognized__"), testCandidates)
+
+	for _, strategy := range []Strategy{StrategyP2C, StrategyResetAware} {
+		got := sortByStrategy(strategy, testCandidates)
+		if len(got) != len(defaultArm) {
+			t.Fatalf("%s: got %d candidates, want %d", strategy, len(got), len(defaultArm))
+		}
+		for i := range got {
+			if got[i].Provider != defaultArm[i].Provider || got[i].Model != defaultArm[i].Model {
+				t.Errorf("%s: position %d = %s/%s, want %s/%s (default-arm order)",
+					strategy, i, got[i].Provider, got[i].Model,
+					defaultArm[i].Provider, defaultArm[i].Model)
+			}
+		}
+	}
+
+	// Confirm the default arm is tier-only, NOT StrategyBalanced: the tier-1
+	// pair (sonnet 3.00, gpt-4o 2.50) stays in input order under the default
+	// arm but balanced reorders it by InputPrice — so the two must diverge.
+	balanced := sortByStrategy(StrategyBalanced, testCandidates)
+	diverged := false
+	for i := range defaultArm {
+		if defaultArm[i].Model != balanced[i].Model {
+			diverged = true
+			break
+		}
+	}
+	if !diverged {
+		t.Error("default arm matched StrategyBalanced — expected tier-only vs tier+price divergence")
 	}
 }
 

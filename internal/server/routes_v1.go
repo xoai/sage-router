@@ -126,7 +126,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Resolve provider and model. allowedModels passed for StrategyUserOrder
 	// (cycle 20260516-routing-strategy-ux M3 C1 fold) — empty string when
 	// authenticatedKey is nil (unauth path) silently no-ops the pre-sort.
-	providerID, resolvedModel, isCombo, comboModels := s.resolveModel(r.Context(), model, body, safeAllowedModels(authenticatedKey))
+	providerID, resolvedModel, isCombo, comboModels, connStrategy := s.resolveModel(r.Context(), model, body, safeAllowedModels(authenticatedKey))
 
 	// ACL check — enforce allowed models (§34)
 	if authenticatedKey != nil && authenticatedKey.AllowedModels != "*" {
@@ -160,12 +160,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if authenticatedKey != nil {
 			comboKeyID = authenticatedKey.ID
 		}
-		s.handleComboRequest(w, r, body, sourceFormat, comboModels, stream, requestID, startTime, comboKeyID)
+		s.handleComboRequest(w, r, body, sourceFormat, comboModels, stream, requestID, startTime, comboKeyID, connStrategy)
 		return
 	}
 
-	// Select connection
-	conn, retryAfter, err := s.selectConnection(providerID, resolvedModel, nil, provider.SelectDefault)
+	// Select connection. connStrategy is SelectDefault on this direct
+	// (non-auto) path — an auto:* request resolves isCombo=true and is served
+	// by handleComboRequest above; the strategy is threaded here for
+	// consistency (cycle 20260521-m3-quota-tracking spec §4.2).
+	conn, retryAfter, err := s.selectConnection(providerID, resolvedModel, nil, connStrategy)
 	if err != nil {
 		if retryAfter > 0 {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
@@ -186,6 +189,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		firstMsg:    extractFirstUserMsg(body),
 		requestBody: body,
 		apiKeyID:    apiKeyID,
+		strategy:    connStrategy,
 	}
 	result, err := s.executeRequest(r.Context(), r, body, sourceFormat, providerID, resolvedModel, stream, conn, nil, requestID, startTime, reqCtx)
 	if err != nil {
@@ -201,6 +205,7 @@ type requestContext struct {
 	requestBody  []byte // raw request body (for conversation store)
 	apiKeyID     string // authenticated API key ID (for usage tracking)
 	servedConnID string // SET by executeRequest as the inner connection-level fallback loop progresses; READ by forwardResult for routing-log/usage-track connection attribution. Reflects the connection that actually served (or last-attempted) the request — distinct from the caller's original conn passed in, which may have been excluded mid-loop. Cycle 20260516-routing-strategy-ux M1 α refactor.
+	strategy     provider.SelectStrategy // connection-selection strategy for this request (cycle 20260521-m3-quota-tracking); read by executeRequest's connection-level fallback loop. Zero value is SelectDefault — the safe default for the nil-reqCtx fallback.
 }
 
 // executeRequest sends a request upstream and returns the executor.Result so the
@@ -405,7 +410,7 @@ func (s *Server) executeRequest(
 				pc.SetLastError(preErr)
 			}
 			excludeIDs = append(excludeIDs, currentConn.ID)
-			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, provider.SelectDefault)
+			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, reqCtx.strategy)
 			if nextErr != nil {
 				reqCtx.servedConnID = currentConn.ID
 				return nil, preErr
@@ -443,7 +448,7 @@ func (s *Server) executeRequest(
 			slog.Error("upstream error", "provider", providerID, "connection", currentConn.ID, "error", execErr)
 			s.markConnectionResult(currentConn.ID, model, 0, nil, execErr, 0)
 			excludeIDs = append(excludeIDs, currentConn.ID)
-			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, provider.SelectDefault)
+			nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, reqCtx.strategy)
 			if nextErr != nil {
 				reqCtx.servedConnID = currentConn.ID
 				return nil, execErr // exhausted — caller decides (M2 may advance to next combo member)
@@ -485,7 +490,7 @@ func (s *Server) executeRequest(
 			// Retryable status → try next connection (connection-level fallback).
 			if executor.IsFallbackEligible(statusCode) {
 				excludeIDs = append(excludeIDs, currentConn.ID)
-				nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, provider.SelectDefault)
+				nextConn, _, nextErr := s.selectConnection(providerID, model, excludeIDs, reqCtx.strategy)
 				if nextErr == nil {
 					slog.Info("falling back on error",
 						"provider", providerID, "from", currentConn.ID, "to", nextConn.ID,
@@ -858,11 +863,13 @@ func (s *Server) handleComboRequest(
 	requestID string,
 	startTime time.Time,
 	apiKeyID string,
+	connStrategy provider.SelectStrategy,
 ) {
 	reqCtx := &requestContext{
 		firstMsg:    extractFirstUserMsg(body),
 		requestBody: body,
 		apiKeyID:    apiKeyID,
+		strategy:    connStrategy,
 	}
 
 	// Track last 5xx status across walk iterations for the "all exhausted" return
@@ -891,8 +898,13 @@ func (s *Server) handleComboRequest(
 		// gets allowedModels="" and silently no-ops. The M2.4 auto:* recursion
 		// guard above already skips such members before reaching this call,
 		// so this is defense-in-depth.
-		providerID, model, _, _ := s.resolveModel(r.Context(), modelStr, body, "")
-		conn, _, err := s.selectConnection(providerID, model, nil, provider.SelectDefault)
+		// The 5th return (the member's own connStrategy) is discarded: combo
+		// members are plain provider/model (the auto:* recursion guard above
+		// skips auto members), so it is always SelectDefault. The request-level
+		// strategy — reqCtx.strategy, set from the top-level connStrategy — is
+		// what applies (cycle 20260521-m3-quota-tracking spec §4.2).
+		providerID, model, _, _, _ := s.resolveModel(r.Context(), modelStr, body, "")
+		conn, _, err := s.selectConnection(providerID, model, nil, reqCtx.strategy)
 		if err != nil {
 			slog.Info("combo skip", "model", modelStr, "error", err)
 			continue
@@ -1100,12 +1112,33 @@ func sortByAllowedModelsOrder(candidates []routing.ModelCandidate, allowedModels
 	return candidates
 }
 
+// connStrategyFor maps a routing.Strategy to the provider.SelectStrategy that
+// orders connection candidates. Only the two connection-selection strategies
+// (cycle 20260521-m3-quota-tracking) carry a non-default mapping; every other
+// routing strategy — and any unrecognized value — selects connections by the
+// default order.
+func connStrategyFor(strategy routing.Strategy) provider.SelectStrategy {
+	switch strategy {
+	case routing.StrategyP2C:
+		return provider.SelectP2C
+	case routing.StrategyResetAware:
+		return provider.SelectResetAware
+	default:
+		return provider.SelectDefault
+	}
+}
+
 // resolveModel resolves a request's `model` field into a (provider, model) pair
 // or a combo's member list. The allowedModels parameter (added by cycle
 // 20260516-routing-strategy-ux C1 fold) carries the API key's allowed_models
 // comma-string used by StrategyUserOrder to pre-sort smart-route candidates by
 // user position before Route() runs.
-func (s *Server) resolveModel(ctx context.Context, model string, body []byte, allowedModels string) (provider, resolvedModel string, isCombo bool, comboModels []string) {
+//
+// connStrategy (cycle 20260521-m3-quota-tracking) is the connection-selection
+// strategy the request resolved to: SelectP2C / SelectResetAware for an
+// auto:p2c / auto:reset-aware smart route, SelectDefault for every other path
+// (plain model, alias, combo, the other five smart-route strategies).
+func (s *Server) resolveModel(ctx context.Context, model string, body []byte, allowedModels string) (providerID, resolvedModel string, isCombo bool, comboModels []string, connStrategy provider.SelectStrategy) {
 	// Check smart routing (auto[:strategy])
 	if strategy, isAuto := routing.ParseAutoModel(model); isAuto && s.deps.SmartRouter != nil {
 		candidates := s.buildSmartCandidates(ctx, strategy)
@@ -1156,7 +1189,7 @@ func (s *Server) resolveModel(ctx context.Context, model string, body []byte, al
 					Status:         "ok",
 				})
 
-				return "", "", true, models
+				return "", "", true, models, connStrategyFor(strategy)
 			}
 		}
 	}
@@ -1164,7 +1197,7 @@ func (s *Server) resolveModel(ctx context.Context, model string, body []byte, al
 	// Check combo
 	combo, err := s.deps.Store.GetComboByName(model)
 	if err == nil && combo != nil {
-		return "", "", true, combo.Models
+		return "", "", true, combo.Models, provider.SelectDefault
 	}
 
 	// Check alias
@@ -1175,11 +1208,11 @@ func (s *Server) resolveModel(ctx context.Context, model string, body []byte, al
 
 	// Parse provider/model format
 	if parts := strings.SplitN(model, "/", 2); len(parts) == 2 {
-		return parts[0], parts[1], false, nil
+		return parts[0], parts[1], false, nil, provider.SelectDefault
 	}
 
 	// Try to find provider by model name
-	return guessProvider(model), model, false, nil
+	return guessProvider(model), model, false, nil, provider.SelectDefault
 }
 
 // pickSampleConnByProvider (Models Discovery M3.4a, NM-r3-6 fix)
