@@ -46,6 +46,13 @@ type Connection struct {
 	backoffLevel    int
 	lastError       error
 
+	// quotaWindow is the best-effort per-connection rate-limit-quota view
+	// (cycle 20260521-m3-quota-tracking). Populated from provider rate-limit
+	// response headers; consumed by the reset-aware routing strategy. NOT a
+	// health facet — it does not affect Selectable. In-memory only: loads the
+	// zero value (Known=false) on restart. See quota.go.
+	quotaWindow QuotaWindow
+
 	// Subscription-auth additions, ALL guarded by c.mu.
 	cred          *auth.Credential     // decrypted token cache; nil until loaded
 	modelDenylist map[string]time.Time // model → blocked-until after a model-rejection 403
