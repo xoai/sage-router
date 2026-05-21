@@ -468,6 +468,11 @@ func (s *Server) executeRequest(
 			// compute for every 4xx/5xx; only the 429 branch consumes it.
 			rl := executor.ParseRateLimitReset(providerID, result.Headers, time.Now())
 			s.markConnectionResult(currentConn.ID, model, statusCode, respBody, nil, rl.Reset)
+			// M3: refresh the connection's QuotaWindow from this response's
+			// rate-limit headers — a separate parse from the breaker's rl above
+			// (the accepted two-parse on the error path; spec §3). Covers every
+			// 4xx/5xx, including an intermediate one the fallback loop walks past.
+			s.applyQuotaWindow(currentConn.ID, providerID, result.Headers)
 
 			// Models Discovery M2.7 — on-404 ad-hoc refresh (AC16).
 			// Upstream "model not found" usually means the catalog is stale.
@@ -514,6 +519,9 @@ func (s *Server) executeRequest(
 		// HTTP connection, delivering only what was already buffered.
 		// markConnectionResult-success happens post-forward in forwardResult
 		// (matches pre-refactor :399 semantics).
+		// M3: refresh the connection's QuotaWindow from the response headers —
+		// the hot path's single parse (spec §3).
+		s.applyQuotaWindow(currentConn.ID, providerID, result.Headers)
 		result.Body = &cancelOnClose{ReadCloser: result.Body, cancel: cancel}
 		reqCtx.servedConnID = currentConn.ID
 		return result, nil
@@ -1481,6 +1489,29 @@ func (s *Server) selectConnection(providerID, model string, excludeIDs []string)
 		ID:          conn.ID,
 		Credentials: creds,
 	}, 0, nil
+}
+
+// applyQuotaWindow parses an upstream response's rate-limit headers and stores
+// the resulting best-effort QuotaWindow on the connection (M3, spec §3). It is
+// invoked once per response that carries headers, from executeRequest's two
+// dispositions — the success return and the 4xx/5xx branch. Best-effort: a
+// connection no longer registered, or a response with no recognized rate-limit
+// header, simply yields Known=false — it never blocks selection or errors.
+func (s *Server) applyQuotaWindow(connID, providerID string, h http.Header) {
+	pc := s.deps.ProviderSelector.ConnectionByID(connID)
+	if pc == nil {
+		return
+	}
+	now := time.Now()
+	info := executor.ParseRateLimitReset(providerID, h, now)
+	qw := provider.QuotaWindow{
+		Remaining: info.Remaining,
+		Known:     info.Known || info.RemainingKnown,
+	}
+	if info.Known && info.Reset > 0 {
+		qw.ResetAt = now.Add(info.Reset)
+	}
+	pc.SetQuotaWindow(qw)
 }
 
 // markConnectionResult transitions the connection state based on the upstream
