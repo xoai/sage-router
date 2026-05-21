@@ -2,6 +2,7 @@ package provider
 
 import (
 	"errors"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -54,6 +55,12 @@ type Selector struct {
 	mu    sync.RWMutex
 	conns map[string][]*Connection // provider → connections
 	byID  map[string]*Connection   // connection ID → connection
+
+	// rng is the SelectP2C sampling source — a local instance (not the
+	// math/rand package global) so tests can seed it deterministically.
+	// rngMu guards it: *rand.Rand is not safe for concurrent use.
+	rngMu sync.Mutex
+	rng   *rand.Rand
 }
 
 // NewSelector creates an empty Selector.
@@ -61,7 +68,16 @@ func NewSelector() *Selector {
 	return &Selector{
 		conns: make(map[string][]*Connection),
 		byID:  make(map[string]*Connection),
+		rng:   rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+}
+
+// seedRNGForTest reseeds the SelectP2C sampling source so distribution tests
+// are deterministic. Test-only.
+func (s *Selector) seedRNGForTest(seed int64) {
+	s.rngMu.Lock()
+	defer s.rngMu.Unlock()
+	s.rng = rand.New(rand.NewSource(seed))
 }
 
 // Register adds a connection to the selector. If a connection with the same ID
@@ -177,7 +193,7 @@ func (s *Selector) Select(provider, model string, excludeIDs []string, strategy 
 
 	// Order the candidates per the requested strategy. The claim-walk below
 	// then takes the first claimable one.
-	orderCandidates(candidates, strategy)
+	s.orderCandidates(candidates, strategy)
 
 	// Claim-the-winner. A CLOSED candidate claims without consuming a slot; a
 	// HALF_OPEN candidate claims only if it wins the compare-and-set — a loser
@@ -209,20 +225,66 @@ func selectionRank(c *Connection) int {
 // orderCandidates arranges candidates in place into the order the requested
 // strategy prefers. Select's claim-walk then takes the first claimable one.
 //
-// SelectP2C and SelectResetAware are placeholders until M3 T5/T6 — they
-// deliberately fall through to the SelectDefault ordering for now, so the
-// strategy parameter is fully plumbed before the new orderings land.
-func orderCandidates(candidates []*Connection, strategy SelectStrategy) {
+// SelectResetAware is a placeholder until M3 T6 — it falls through to the
+// SelectDefault ordering for now.
+func (s *Selector) orderCandidates(candidates []*Connection, strategy SelectStrategy) {
 	switch strategy {
 	case SelectP2C:
-		// T5 fills this arm with power-of-two-choices ordering.
-		sort.SliceStable(candidates, defaultLess(candidates))
+		s.p2cOrder(candidates)
 	case SelectResetAware:
 		// T6 fills this arm with soonest-reset ordering.
 		sort.SliceStable(candidates, defaultLess(candidates))
 	default:
 		sort.SliceStable(candidates, defaultLess(candidates))
 	}
+}
+
+// p2cOrder applies the power-of-two-choices ordering (M3 spec §5). It samples
+// two distinct candidates uniformly at random and lifts them to the front —
+// the less-recently-used of the two (older LastUsedAt) first, the other
+// second — with the remaining candidates behind them in SelectDefault order.
+//
+// The load signal is LastUsedAt: every selectable candidate is Idle, so there
+// is no live in-flight load to sample; p2c is honestly power-of-two-choices
+// over an LRU/recency proxy, kept for its herd-avoidance property — random-2
+// sampling stops every concurrent request stampeding the single coldest
+// connection. A never-used connection has a zero LastUsedAt and sorts as
+// least-recently-used (correct: maximally cold). With <=1 candidate there is
+// nothing to sample, so it degrades to SelectDefault.
+func (s *Selector) p2cOrder(candidates []*Connection) {
+	// SelectDefault baseline first — this fixes the order of "the rest".
+	sort.SliceStable(candidates, defaultLess(candidates))
+	n := len(candidates)
+	if n <= 1 {
+		return
+	}
+
+	// Sample two distinct indices uniformly: pick j from the n-1 indices that
+	// are not i by drawing in [0,n-1) and skipping past i.
+	s.rngMu.Lock()
+	i := s.rng.Intn(n)
+	j := s.rng.Intn(n - 1)
+	s.rngMu.Unlock()
+	if j >= i {
+		j++
+	}
+
+	// Less-recently-used (older LastUsedAt) of the two picks goes first.
+	a, b := candidates[i], candidates[j]
+	if b.LastUsedAt().Before(a.LastUsedAt()) {
+		a, b = b, a
+	}
+
+	// Rebuild: a, b, then every other candidate in its existing
+	// (SelectDefault) order.
+	rest := make([]*Connection, 0, n-2)
+	for k, c := range candidates {
+		if k != i && k != j {
+			rest = append(rest, c)
+		}
+	}
+	candidates[0], candidates[1] = a, b
+	copy(candidates[2:], rest)
 }
 
 // defaultLess is the SelectDefault candidate comparator: a healthy (CLOSED)

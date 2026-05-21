@@ -534,3 +534,75 @@ func TestSelect_StrategyParameter(t *testing.T) {
 		t.Errorf("SelectDefault: expected c1 (priority 1), got %s", res.Connection.ID)
 	}
 }
+
+// TestSelect_P2C (M3 T5 — AC6) pins the power-of-two-choices ordering: traffic
+// spreads across equal candidates, the less-recently-used of the two sampled
+// picks is ordered first, and <=1 candidate degrades to SelectDefault.
+func TestSelect_P2C(t *testing.T) {
+	t.Run("spreads traffic across equal candidates", func(t *testing.T) {
+		s := NewSelector()
+		// Three equal candidates, all never-used (zero LastUsedAt).
+		s.Register(NewConnection("c1", "openai", "conn-1", 1, "api_key"))
+		s.Register(NewConnection("c2", "openai", "conn-2", 1, "api_key"))
+		s.Register(NewConnection("c3", "openai", "conn-3", 1, "api_key"))
+		s.seedRNGForTest(42)
+
+		counts := map[string]int{}
+		const iters = 300
+		for i := 0; i < iters; i++ {
+			res, err := s.Select("openai", "gpt-4", nil, SelectP2C)
+			if err != nil {
+				t.Fatalf("iter %d: Select: %v", i, err)
+			}
+			counts[res.Connection.ID]++
+		}
+		if len(counts) < 2 {
+			t.Fatalf("p2c sent all traffic to %v — expected a spread", counts)
+		}
+		for _, id := range []string{"c1", "c2", "c3"} {
+			if counts[id] == 0 {
+				t.Errorf("p2c never selected %s — counts=%v", id, counts)
+			}
+		}
+	})
+
+	t.Run("prefers less-recently-used of the two picks", func(t *testing.T) {
+		s := NewSelector()
+		// `older` is never used (zero LastUsedAt); `newer` is touched so its
+		// LastUsedAt is recent, then returned to Idle so it stays selectable.
+		s.Register(NewConnection("older", "openai", "conn-older", 1, "api_key"))
+		newer := NewConnection("newer", "openai", "conn-newer", 1, "api_key")
+		s.Register(newer)
+		if err := newer.MarkUsed(); err != nil {
+			t.Fatalf("newer MarkUsed: %v", err)
+		}
+		if err := newer.MarkSuccess(); err != nil {
+			t.Fatalf("newer MarkSuccess: %v", err)
+		}
+		s.seedRNGForTest(1)
+
+		// With exactly two candidates p2c samples both every time; the older
+		// LastUsedAt must be ordered first regardless of the RNG draw.
+		for i := 0; i < 30; i++ {
+			res, err := s.Select("openai", "gpt-4", nil, SelectP2C)
+			if err != nil {
+				t.Fatalf("iter %d: Select: %v", i, err)
+			}
+			if res.Connection.ID != "older" {
+				t.Fatalf("iter %d: p2c picked %s, want older (least-recently-used)", i, res.Connection.ID)
+			}
+		}
+	})
+
+	t.Run("single candidate degrades to SelectDefault", func(t *testing.T) {
+		s := NewSelector()
+		s.Register(NewConnection("only", "openai", "conn-only", 1, "api_key"))
+		res, err := s.Select("openai", "gpt-4", nil, SelectP2C)
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		if res.Connection == nil || res.Connection.ID != "only" {
+			t.Fatalf("p2c with one candidate: got %v, want only", res.Connection)
+		}
+	})
+}
