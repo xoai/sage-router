@@ -224,19 +224,40 @@ func selectionRank(c *Connection) int {
 
 // orderCandidates arranges candidates in place into the order the requested
 // strategy prefers. Select's claim-walk then takes the first claimable one.
-//
-// SelectResetAware is a placeholder until M3 T6 — it falls through to the
-// SelectDefault ordering for now.
 func (s *Selector) orderCandidates(candidates []*Connection, strategy SelectStrategy) {
 	switch strategy {
 	case SelectP2C:
 		s.p2cOrder(candidates)
 	case SelectResetAware:
-		// T6 fills this arm with soonest-reset ordering.
-		sort.SliceStable(candidates, defaultLess(candidates))
+		resetAwareOrder(candidates)
 	default:
 		sort.SliceStable(candidates, defaultLess(candidates))
 	}
+}
+
+// resetAwareOrder orders candidates by soonest quota-window reset (M3 spec §5).
+// A candidate with a known, earlier QuotaWindow().ResetAt sorts ahead of one
+// with a later reset. A zero ResetAt — no reset header reported, or no quota
+// window at all — sorts last. Among zero-ResetAt candidates, and on an exact
+// ResetAt tie, ordering falls back to the SelectDefault comparator. So when no
+// provider reports reset headers (every ResetAt zero) reset-aware degrades
+// cleanly to SelectDefault — documented behavior, not a bug.
+func resetAwareOrder(candidates []*Connection) {
+	def := defaultLess(candidates)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ri := candidates[i].QuotaWindow().ResetAt
+		rj := candidates[j].QuotaWindow().ResetAt
+		zi, zj := ri.IsZero(), rj.IsZero()
+		if zi != zj {
+			// The candidate with a known reset sorts before the zero one.
+			return zj
+		}
+		if !zi && !ri.Equal(rj) {
+			return ri.Before(rj)
+		}
+		// Both zero, or a known-but-equal ResetAt tie → SelectDefault fallback.
+		return def(i, j)
+	})
 }
 
 // p2cOrder applies the power-of-two-choices ordering (M3 spec §5). It samples

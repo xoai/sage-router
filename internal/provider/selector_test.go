@@ -606,3 +606,71 @@ func TestSelect_P2C(t *testing.T) {
 		}
 	})
 }
+
+// TestSelect_ResetAware (M3 T6 — AC7) pins the reset-aware ordering:
+// candidates order by soonest QuotaWindow().ResetAt, a zero ResetAt sorts
+// last, and the all-unknown case is identical to SelectDefault.
+func TestSelect_ResetAware(t *testing.T) {
+	now := time.Now()
+
+	t.Run("orders by soonest reset", func(t *testing.T) {
+		s := NewSelector()
+		// Register in non-reset order to prove the sort, not insertion. Lowest
+		// user priority (c-late) would win under SelectDefault — reset-aware
+		// must override that with the soonest ResetAt.
+		cLate := NewConnection("c-late", "openai", "conn-late", 1, "api_key")
+		cSoon := NewConnection("c-soon", "openai", "conn-soon", 5, "api_key")
+		cMid := NewConnection("c-mid", "openai", "conn-mid", 3, "api_key")
+		s.Register(cLate)
+		s.Register(cSoon)
+		s.Register(cMid)
+		cLate.SetQuotaWindow(QuotaWindow{ResetAt: now.Add(30 * time.Second), Known: true})
+		cSoon.SetQuotaWindow(QuotaWindow{ResetAt: now.Add(2 * time.Second), Known: true})
+		cMid.SetQuotaWindow(QuotaWindow{ResetAt: now.Add(15 * time.Second), Known: true})
+
+		res, err := s.Select("openai", "gpt-4", nil, SelectResetAware)
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		if res.Connection.ID != "c-soon" {
+			t.Errorf("reset-aware: expected c-soon (soonest ResetAt), got %s", res.Connection.ID)
+		}
+	})
+
+	t.Run("zero ResetAt sorts last with default fallback", func(t *testing.T) {
+		s := NewSelector()
+		// cKnown reports a reset window; cUnknown reports nothing (zero
+		// ResetAt) and has the better user priority. reset-aware must still
+		// prefer cKnown — a zero ResetAt sorts last.
+		cKnown := NewConnection("c-known", "openai", "conn-known", 9, "api_key")
+		cUnknown := NewConnection("c-unknown", "openai", "conn-unknown", 1, "api_key")
+		s.Register(cUnknown)
+		s.Register(cKnown)
+		cKnown.SetQuotaWindow(QuotaWindow{ResetAt: now.Add(10 * time.Second), Known: true})
+
+		res, err := s.Select("openai", "gpt-4", nil, SelectResetAware)
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		if res.Connection.ID != "c-known" {
+			t.Errorf("reset-aware: expected c-known (zero-ResetAt c-unknown sorts last), got %s", res.Connection.ID)
+		}
+	})
+
+	t.Run("all-unknown equals SelectDefault", func(t *testing.T) {
+		s := NewSelector()
+		// No QuotaWindow set anywhere → every ResetAt is zero. reset-aware must
+		// degrade to SelectDefault: the lowest user priority wins.
+		s.Register(NewConnection("c3", "openai", "conn-3", 3, "api_key"))
+		s.Register(NewConnection("c1", "openai", "conn-1", 1, "api_key"))
+		s.Register(NewConnection("c2", "openai", "conn-2", 2, "api_key"))
+
+		res, err := s.Select("openai", "gpt-4", nil, SelectResetAware)
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		if res.Connection.ID != "c1" {
+			t.Errorf("reset-aware all-unknown: expected c1 (SelectDefault order), got %s", res.Connection.ID)
+		}
+	})
+}
