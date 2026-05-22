@@ -72,14 +72,6 @@ func NewSelector() *Selector {
 	}
 }
 
-// seedRNGForTest reseeds the SelectP2C sampling source so distribution tests
-// are deterministic. Test-only.
-func (s *Selector) seedRNGForTest(seed int64) {
-	s.rngMu.Lock()
-	defer s.rngMu.Unlock()
-	s.rng = rand.New(rand.NewSource(seed))
-}
-
 // Register adds a connection to the selector. If a connection with the same ID
 // already exists it is replaced.
 func (s *Selector) Register(conn *Connection) {
