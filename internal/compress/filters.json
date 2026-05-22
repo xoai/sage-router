@@ -1,0 +1,23 @@
+[
+  {
+    "name": "strip ANSI escape sequences",
+    "kind": "ansi-strip",
+    "pattern": "\\x1b\\[[0-9;]*[A-Za-z]"
+  },
+  {
+    "name": "collapse repeated lines",
+    "kind": "collapse-repeats",
+    "min_run": 3
+  },
+  {
+    "name": "short-circuit progress-bar noise",
+    "kind": "noise-shortcircuit",
+    "pattern": "(?m)^[ \\t]*\\[=*>? *\\] *[0-9]+%.*$",
+    "replacement": "[progress]"
+  },
+  {
+    "name": "truncate oversized blocks",
+    "kind": "truncate-safe",
+    "max_bytes": 16384
+  }
+]
