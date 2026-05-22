@@ -189,7 +189,10 @@ type APIKey struct {
 	AllowedModels   string    `json:"allowed_models"`
 	RateLimitRPM    int       `json:"rate_limit_rpm"`
 	RoutingStrategy string    `json:"routing_strategy"`
-	CreatedAt       time.Time `json:"created_at"`
+	// CompressionEnabled opts this key into tool-output compression (M4,
+	// cycle 20260522-m4-compression). Off by default.
+	CompressionEnabled bool      `json:"compression_enabled"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // UsageEntry records a single proxied request for billing and analytics.

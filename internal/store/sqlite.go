@@ -530,14 +530,14 @@ func (s *sqliteStore) ListAliases() (map[string]string, error) {
 // API Keys
 // ---------------------------------------------------------------------------
 
-const apiKeyCols = `id, name, key_hash, prefix, budget_monthly, budget_hard_limit, allowed_models, rate_limit_rpm, routing_strategy, created_at`
+const apiKeyCols = `id, name, key_hash, prefix, budget_monthly, budget_hard_limit, allowed_models, rate_limit_rpm, routing_strategy, compression_enabled, created_at`
 
 func scanAPIKey(row interface{ Scan(dest ...any) error }) (*APIKey, error) {
 	var k APIKey
 	var createdAt string
 	if err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix,
 		&k.BudgetMonthly, &k.BudgetHardLimit, &k.AllowedModels,
-		&k.RateLimitRPM, &k.RoutingStrategy, &createdAt); err != nil {
+		&k.RateLimitRPM, &k.RoutingStrategy, &k.CompressionEnabled, &createdAt); err != nil {
 		return nil, err
 	}
 	k.CreatedAt = parseTime(createdAt)
@@ -610,9 +610,9 @@ func (s *sqliteStore) CreateAPIKey(k *APIKey) error {
 		k.AllowedModels = "*"
 	}
 	_, err := s.db.Exec(
-		"INSERT INTO api_keys (id, name, key_hash, prefix, budget_monthly, budget_hard_limit, allowed_models, rate_limit_rpm, routing_strategy, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO api_keys (id, name, key_hash, prefix, budget_monthly, budget_hard_limit, allowed_models, rate_limit_rpm, routing_strategy, compression_enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
 		k.ID, k.Name, k.KeyHash, k.Prefix, k.BudgetMonthly, k.BudgetHardLimit,
-		k.AllowedModels, k.RateLimitRPM, k.RoutingStrategy, now,
+		k.AllowedModels, k.RateLimitRPM, k.RoutingStrategy, k.CompressionEnabled, now,
 	)
 	if err != nil {
 		return fmt.Errorf("create api key: %w", err)
@@ -628,6 +628,7 @@ func (s *sqliteStore) UpdateAPIKey(id string, updates map[string]any) error {
 	allowed := map[string]bool{
 		"name": true, "budget_monthly": true, "budget_hard_limit": true,
 		"allowed_models": true, "rate_limit_rpm": true, "routing_strategy": true,
+		"compression_enabled": true,
 	}
 	var setClauses []string
 	var params []any
