@@ -2,7 +2,7 @@ VERSION := $(shell git describe --tags --always 2>/dev/null || echo "dev")
 LDFLAGS := -s -w -X main.version=$(VERSION)
 BINARY := sage-router
 
-.PHONY: build test lint release clean dashboard dev grep-no-static-config grep-no-secrets
+.PHONY: build test lint release clean dashboard dev grep-no-static-config grep-no-secrets check-no-artifacts
 
 build: dashboard
 	go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/sage-router
@@ -13,7 +13,7 @@ dev:
 test:
 	go test ./... -race -cover -count=1
 
-lint: grep-no-static-config grep-no-secrets
+lint: grep-no-static-config grep-no-secrets check-no-artifacts
 	golangci-lint run ./...
 
 # AC7 — Models Discovery M1.13. After M1 ships, the only readers of
@@ -69,6 +69,33 @@ grep-no-secrets:
 		exit 1; \
 	fi; \
 	echo "OK: no provider-token patterns found in test output"
+
+# Tier 3 hygiene (cycle 20260522-tier3-hygiene, OmniRoute analysis §10 #10).
+# Build artifacts must never be committed. bin/, dist/, and *.exe are
+# gitignored, but a `git add -f` or a .gitignore regression could still
+# slip one in — this gate is the belt to the .gitignore's suspenders: it
+# scans the tracked tree (`git ls-files`) and fails on any committed build
+# artifact. Deny pattern:
+#   *.{exe,dll,so,dylib,a,o,test}     compiled-binary / object extensions
+#   bin/* , dist/*                    build-output directories
+#   sage-router , sage-router-<arch>  the canonical binary name — the
+#                                     extensionless ELF `go build -o
+#                                     sage-router` produces. The suffix
+#                                     class has no `.`, so the tracked
+#                                     sage-router-logo.svg /
+#                                     sage-router-dashboard-screenshot.png
+#                                     repo assets do NOT match.
+check-no-artifacts:
+	@hits=$$(git ls-files | grep -E '\.(exe|dll|so|dylib|a|o|test)$$|^bin/|^dist/|(^|/)sage-router(-[A-Za-z0-9_-]+)?$$' || true); \
+	if [ -n "$$hits" ]; then \
+		echo "artifact-hygiene violation: build artifacts found in the tracked tree."; \
+		echo "Compiled binaries / build outputs must never be committed —"; \
+		echo "they belong in bin/ or dist/ (both gitignored)."; \
+		echo "Tracked artifacts:"; \
+		echo "$$hits"; \
+		exit 1; \
+	fi; \
+	echo "OK: no build artifacts in the tracked tree"
 
 dashboard:
 	@if [ -d "web/dashboard/node_modules" ]; then \
