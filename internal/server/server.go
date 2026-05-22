@@ -42,29 +42,29 @@ type Config struct {
 
 // Dependencies holds all injected dependencies.
 type Dependencies struct {
-	Store              store.Store
-	Catalog            catalog.Registry         // runtime model + pricing catalog (Models Discovery M1)
-	CatalogStore       catalog.Store            // raw catalog Store, for SetProviderMeta + on-create discovery (Models Discovery M2)
-	Discovery          *catalog.DiscoveryRunner // model-discovery dispatcher (Models Discovery M2)
-	TranslateRegistry  *translate.Registry
-	ProviderSelector   *provider.Selector
-	ProviderRegistry   *provider.Registry
+	Store             store.Store
+	Catalog           catalog.Registry         // runtime model + pricing catalog (Models Discovery M1)
+	CatalogStore      catalog.Store            // raw catalog Store, for SetProviderMeta + on-create discovery (Models Discovery M2)
+	Discovery         *catalog.DiscoveryRunner // model-discovery dispatcher (Models Discovery M2)
+	TranslateRegistry *translate.Registry
+	ProviderSelector  *provider.Selector
+	ProviderRegistry  *provider.Registry
 	// Cycle 20260517-provider-auth-variants M5.6: legacy provider-keyed
 	// Executors map REMOVED. All upstream dispatch now goes through
 	// Variants.Get(provider, auth_type), which carries the wildcard
 	// fallback `(provider, "")` for providers that don't yet split
 	// per-auth-type (gemini, github-copilot, openrouter, ollama, default).
-	Variants *executor.Variants
-	UsageTracker       *usage.Tracker
-	Auth               *auth.Manager
-	OpenAIAuth         *oauth.OpenAIAuth // legacy device-code; returns 410 after M2 deprecation
-	OAuthBridge        *oauth.Bridge     // new PKCE bridge for OpenAI + Anthropic subscription auth
-	AuthStore          *auth.AuthStore   // wraps store.Store with subscription-auth Get/Put + refresh-failure counter
-	SmartRouter        *routing.SmartRouter
-	ConversationStore  *routing.ConversationStore
-	BypassFilter       *bypass.Filter
-	HealthChecker      *provider.HealthChecker
-	RateLimiter        *ratelimit.Limiter
+	Variants          *executor.Variants
+	UsageTracker      *usage.Tracker
+	Auth              *auth.Manager
+	OpenAIAuth        *oauth.OpenAIAuth // legacy device-code; returns 410 after M2 deprecation
+	OAuthBridge       *oauth.Bridge     // new PKCE bridge for OpenAI + Anthropic subscription auth
+	AuthStore         *auth.AuthStore   // wraps store.Store with subscription-auth Get/Put + refresh-failure counter
+	SmartRouter       *routing.SmartRouter
+	ConversationStore *routing.ConversationStore
+	BypassFilter      *bypass.Filter
+	HealthChecker     *provider.HealthChecker
+	RateLimiter       *ratelimit.Limiter
 	// Compressor is the M4 tool-output compression subsystem (cycle
 	// 20260522-m4-compression). Nil when the tokenizer or filter catalog
 	// failed to load — compression is then disabled and the server runs

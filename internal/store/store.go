@@ -126,7 +126,7 @@ type Connection struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 	// ExchangedToken field removed in cycle 20260517-provider-auth-variants
 	// M2.6.3. Column drop via migration 013 in M2.6.4.
-	APIKey string `json:"api_key,omitempty"`
+	APIKey          string          `json:"api_key,omitempty"`
 	Priority        int             `json:"priority"`
 	State           string          `json:"state"`
 	ExpiresAt       *time.Time      `json:"expires_at,omitempty"`
@@ -145,9 +145,9 @@ type ConnectionFilter struct {
 
 // Combo is a named group of models that can be referenced as a single target.
 type Combo struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Models    []string `json:"models"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Models    []string  `json:"models"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -180,15 +180,15 @@ type APIKeyPage struct {
 
 // APIKey represents a hashed API key for authenticating requests to sage-router.
 type APIKey struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	KeyHash         string    `json:"-"`
-	Prefix          string    `json:"prefix"`
-	BudgetMonthly   float64   `json:"budget_monthly"`
-	BudgetHardLimit bool      `json:"budget_hard_limit"`
-	AllowedModels   string    `json:"allowed_models"`
-	RateLimitRPM    int       `json:"rate_limit_rpm"`
-	RoutingStrategy string    `json:"routing_strategy"`
+	ID              string  `json:"id"`
+	Name            string  `json:"name"`
+	KeyHash         string  `json:"-"`
+	Prefix          string  `json:"prefix"`
+	BudgetMonthly   float64 `json:"budget_monthly"`
+	BudgetHardLimit bool    `json:"budget_hard_limit"`
+	AllowedModels   string  `json:"allowed_models"`
+	RateLimitRPM    int     `json:"rate_limit_rpm"`
+	RoutingStrategy string  `json:"routing_strategy"`
 	// CompressionEnabled opts this key into tool-output compression (M4,
 	// cycle 20260522-m4-compression). Off by default.
 	CompressionEnabled bool      `json:"compression_enabled"`
@@ -197,24 +197,24 @@ type APIKey struct {
 
 // UsageEntry records a single proxied request for billing and analytics.
 type UsageEntry struct {
-	ID               string        `json:"id"`
-	RequestID        string        `json:"request_id"`
-	Provider         string        `json:"provider"`
-	Model            string        `json:"model"`
-	ConnectionID     string        `json:"connection_id"`
-	APIKeyID         string        `json:"api_key_id"`
-	InputTokens      int           `json:"input_tokens"`
-	OutputTokens     int           `json:"output_tokens"`
-	TotalTokens      int           `json:"total_tokens"`
-	CacheReadTokens  int           `json:"cache_read_tokens"`
-	CacheWriteTokens int           `json:"cache_write_tokens"`
+	ID               string `json:"id"`
+	RequestID        string `json:"request_id"`
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	ConnectionID     string `json:"connection_id"`
+	APIKeyID         string `json:"api_key_id"`
+	InputTokens      int    `json:"input_tokens"`
+	OutputTokens     int    `json:"output_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
+	CacheReadTokens  int    `json:"cache_read_tokens"`
+	CacheWriteTokens int    `json:"cache_write_tokens"`
 	// TokensBefore / TokensAfter — the M4 dual-sourced compression-savings
 	// measurement (cycle 20260522-m4-compression). TokensBefore is the
 	// tokenizer estimate of the request before compression; TokensAfter is
 	// the provider-actual input count. Both 0 when compression did not run.
-	TokensBefore int           `json:"tokens_before"`
-	TokensAfter  int           `json:"tokens_after"`
-	Cost         float64       `json:"cost"`
+	TokensBefore int     `json:"tokens_before"`
+	TokensAfter  int     `json:"tokens_after"`
+	Cost         float64 `json:"cost"`
 	// CostSource records who pays for this request. "apikey" means the
 	// user pays per-token via their API key — Cost reflects actual spend.
 	// "subscription" means the user paid a flat subscription fee — Cost is
@@ -229,10 +229,10 @@ type UsageEntry struct {
 	// persisted (no usage_log column). Mirrors the query-time semantic
 	// of UsageSummary.SubscriptionSavings at routes_api.go:843-861.
 	// Initiative 20260515-cost-savings-display.
-	EstimatedAPICost float64 `json:"estimated_api_cost"`
-	Latency    time.Duration `json:"latency"`
-	Status     string        `json:"status"`
-	CreatedAt  time.Time     `json:"created_at"`
+	EstimatedAPICost float64       `json:"estimated_api_cost"`
+	Latency          time.Duration `json:"latency"`
+	Status           string        `json:"status"`
+	CreatedAt        time.Time     `json:"created_at"`
 }
 
 // UsageFilter controls which usage entries are returned or summarised.
@@ -299,21 +299,21 @@ type ProviderSummary struct {
 
 // RoutingEntry records a single routing decision for analytics.
 type RoutingEntry struct {
-	ID              string    `json:"id"`
-	RequestID       string    `json:"request_id"`
-	Strategy        string    `json:"strategy"`
-	Provider        string    `json:"provider"`
-	Model           string    `json:"model"`
-	RoutingReason   string    `json:"routing_reason"`
-	AffinityHit     bool      `json:"affinity_hit"`
-	AffinityBreak   bool      `json:"affinity_break"`
-	BridgeInjected  bool      `json:"bridge_injected"`
-	Constraints     string    `json:"constraints"`
-	CandidateCount  int       `json:"candidates"`
-	FilteredCount   int       `json:"filtered"`
-	LatencyMs       int       `json:"latency_ms"`
-	Status          string    `json:"status"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID             string    `json:"id"`
+	RequestID      string    `json:"request_id"`
+	Strategy       string    `json:"strategy"`
+	Provider       string    `json:"provider"`
+	Model          string    `json:"model"`
+	RoutingReason  string    `json:"routing_reason"`
+	AffinityHit    bool      `json:"affinity_hit"`
+	AffinityBreak  bool      `json:"affinity_break"`
+	BridgeInjected bool      `json:"bridge_injected"`
+	Constraints    string    `json:"constraints"`
+	CandidateCount int       `json:"candidates"`
+	FilteredCount  int       `json:"filtered"`
+	LatencyMs      int       `json:"latency_ms"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // RoutingSummary is aggregated routing analytics.

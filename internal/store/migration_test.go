@@ -347,7 +347,7 @@ func TestMigration010_CatalogPricingSchema(t *testing.T) {
 // last_discovered_at, last_discovery_error, backoff_step,
 // next_discovery_after.
 // Defaults (AC2c): discovery_enabled=0 (fail-closed),
-// subscription_discoverable=0, last_discovery_error='',
+// subscription_discoverable=0, last_discovery_error=”,
 // backoff_step=0, last_discovered_at and next_discovery_after NULL.
 // PK: (provider).
 func TestMigration011_CatalogProviderMetaSchema(t *testing.T) {
@@ -711,6 +711,7 @@ func TestMigration013_DropsExchangedTokenColumn(t *testing.T) {
 //  2. Insert a connection via the production CreateConnection path
 //     (the new connCols list, no exchanged_token).
 //  3. Verify GetConnection returns it intact.
+//
 // The harder case (a DB file that started on schema 012 and migrates
 // forward to 013 in-place) is exercised at deployment time; here we pin
 // the equivalence between "row inserted post-013" and "row that survived

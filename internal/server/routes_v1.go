@@ -205,13 +205,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // requestContext carries metadata through the request lifecycle for post-response hooks.
 type requestContext struct {
-	firstMsg     string // first user message (session key)
-	requestBody  []byte // raw request body (for conversation store)
-	apiKeyID     string // authenticated API key ID (for usage tracking)
-	servedConnID string // SET by executeRequest as the inner connection-level fallback loop progresses; READ by forwardResult for routing-log/usage-track connection attribution. Reflects the connection that actually served (or last-attempted) the request — distinct from the caller's original conn passed in, which may have been excluded mid-loop. Cycle 20260516-routing-strategy-ux M1 α refactor.
-	strategy     provider.SelectStrategy // connection-selection strategy for this request (cycle 20260521-m3-quota-tracking); read by executeRequest's connection-level fallback loop. Zero value is SelectDefault — the safe default for the nil-reqCtx fallback.
-	tokensBefore int // M4: tokenizer estimate of the request BEFORE compression. SET by executeRequest's Compress block (cycle 20260522-m4-compression T8); READ by trackUsage. 0 when compression did not run.
-	compressionEnabled bool // M4: this request's API key opted into tool-output compression; READ by executeRequest's Compress block.
+	firstMsg           string                  // first user message (session key)
+	requestBody        []byte                  // raw request body (for conversation store)
+	apiKeyID           string                  // authenticated API key ID (for usage tracking)
+	servedConnID       string                  // SET by executeRequest as the inner connection-level fallback loop progresses; READ by forwardResult for routing-log/usage-track connection attribution. Reflects the connection that actually served (or last-attempted) the request — distinct from the caller's original conn passed in, which may have been excluded mid-loop. Cycle 20260516-routing-strategy-ux M1 α refactor.
+	strategy           provider.SelectStrategy // connection-selection strategy for this request (cycle 20260521-m3-quota-tracking); read by executeRequest's connection-level fallback loop. Zero value is SelectDefault — the safe default for the nil-reqCtx fallback.
+	tokensBefore       int                     // M4: tokenizer estimate of the request BEFORE compression. SET by executeRequest's Compress block (cycle 20260522-m4-compression T8); READ by trackUsage. 0 when compression did not run.
+	compressionEnabled bool                    // M4: this request's API key opted into tool-output compression; READ by executeRequest's Compress block.
 }
 
 // executeRequest sends a request upstream and returns the executor.Result so the
@@ -1018,9 +1018,9 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 	// Build model list from active connections
 	type modelEntry struct {
-		ID       string `json:"id"`
-		Object   string `json:"object"`
-		Created  int64  `json:"created"`
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
 		OwnedBy string `json:"owned_by"`
 	}
 
@@ -1043,9 +1043,9 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			}
 			seen[fullID] = true
 			models = append(models, modelEntry{
-				ID:       fullID,
-				Object:   "model",
-				Created:  time.Now().Unix(),
+				ID:      fullID,
+				Object:  "model",
+				Created: time.Now().Unix(),
 				OwnedBy: conn.Provider,
 			})
 		}
@@ -1055,9 +1055,9 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	combos, _ := s.deps.Store.ListCombos()
 	for _, combo := range combos {
 		models = append(models, modelEntry{
-			ID:       combo.Name,
-			Object:   "model",
-			Created:  combo.CreatedAt.Unix(),
+			ID:      combo.Name,
+			Object:  "model",
+			Created: combo.CreatedAt.Unix(),
 			OwnedBy: "sage-router",
 		})
 	}
@@ -1067,9 +1067,9 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	for alias := range aliases {
 		if !seen[alias] {
 			models = append(models, modelEntry{
-				ID:       alias,
-				Object:   "model",
-				Created:  time.Now().Unix(),
+				ID:      alias,
+				Object:  "model",
+				Created: time.Now().Unix(),
 				OwnedBy: "sage-router",
 			})
 		}
@@ -1994,7 +1994,9 @@ func extractBypassReq(body []byte, model string) *bypass.Req {
 			req.SystemText = sysStr
 		} else {
 			// Array of blocks
-			var blocks []struct{ Text string `json:"text"` }
+			var blocks []struct {
+				Text string `json:"text"`
+			}
 			if json.Unmarshal(probe.System, &blocks) == nil {
 				for _, b := range blocks {
 					req.SystemText += b.Text + " "
@@ -2265,9 +2267,9 @@ func (s *Server) resolveVariantExec(providerID string, conn *ConnectionInfo) exe
 
 func claudeResponseToOpenAI(body []byte, model string) ([]byte, error) {
 	var claude struct {
-		ID         string `json:"id"`
-		Model      string `json:"model"`
-		Content    []struct {
+		ID      string `json:"id"`
+		Model   string `json:"model"`
+		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`

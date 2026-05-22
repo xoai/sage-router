@@ -46,7 +46,7 @@ func buildConnectionFilter(f ConnectionFilter) whereClause {
 // 20260516-keys-management-redesign.
 //
 // Routing semantics: "default" sentinel maps to empty-string storage
-// (the default-routing-strategy keys carry routing_strategy=''). Non-
+// (the default-routing-strategy keys carry routing_strategy=”). Non-
 // empty values match the storage value exactly.
 //
 // Search uses LOWER(name) LIKE LOWER(?) so case-insensitive matching
