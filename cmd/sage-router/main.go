@@ -19,6 +19,7 @@ import (
 	"sage-router/internal/auth/refresh"
 	"sage-router/internal/bypass"
 	"sage-router/internal/catalog"
+	"sage-router/internal/compress"
 	"sage-router/internal/config"
 	"sage-router/internal/executor"
 	"sage-router/internal/provider"
@@ -192,6 +193,16 @@ func main() {
 	// Initialize usage tracker
 	usageTracker := usage.NewTracker(db)
 
+	// M4 — the tool-output compression subsystem. Fail-closed: if the
+	// tokenizer or filter catalog fails to load, log and wire a nil
+	// Compressor; compression is then disabled and the server runs
+	// normally (cycle 20260522-m4-compression).
+	compressor, err := compress.NewCompressor()
+	if err != nil {
+		slog.Warn("compression disabled — subsystem failed to load", "error", err)
+		compressor = nil
+	}
+
 	// Setup dashboard filesystem
 	var dashboardFS fs.FS
 	sub, err := fs.Sub(web.DashboardFS, "dashboard/dist")
@@ -239,6 +250,7 @@ func main() {
 		BypassFilter:      bypass.NewFilter(),
 		HealthChecker:     provider.NewHealthChecker(providerSel, 60*time.Second),
 		RateLimiter:       ratelimit.New(),
+		Compressor:        compressor,
 	})
 
 	// OAuthBridge — needs the server back-reference to create Connection

@@ -17,6 +17,7 @@ import (
 	"sage-router/internal/auth/oauth"
 	"sage-router/internal/bypass"
 	"sage-router/internal/catalog"
+	"sage-router/internal/compress"
 	"sage-router/internal/executor"
 	"sage-router/internal/provider"
 	"sage-router/internal/ratelimit"
@@ -64,6 +65,11 @@ type Dependencies struct {
 	BypassFilter       *bypass.Filter
 	HealthChecker      *provider.HealthChecker
 	RateLimiter        *ratelimit.Limiter
+	// Compressor is the M4 tool-output compression subsystem (cycle
+	// 20260522-m4-compression). Nil when the tokenizer or filter catalog
+	// failed to load — compression is then disabled and the server runs
+	// normally (fail-closed). executeRequest null-checks it.
+	Compressor *compress.Compressor
 }
 
 // Server is the main HTTP server for sage-router.

@@ -155,12 +155,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// M4 — does this request's API key opt into tool-output compression?
+	compressionEnabled := authenticatedKey != nil && authenticatedKey.CompressionEnabled
+
 	if isCombo {
 		var comboKeyID string
 		if authenticatedKey != nil {
 			comboKeyID = authenticatedKey.ID
 		}
-		s.handleComboRequest(w, r, body, sourceFormat, comboModels, stream, requestID, startTime, comboKeyID, connStrategy)
+		s.handleComboRequest(w, r, body, sourceFormat, comboModels, stream, requestID, startTime, comboKeyID, connStrategy, compressionEnabled)
 		return
 	}
 
@@ -186,10 +189,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Execute with fallback (M1 α refactor — value-returning; cycle 20260516-routing-strategy-ux).
 	// Internal connection-level fallback handled in executeRequest's inner loop.
 	reqCtx := &requestContext{
-		firstMsg:    extractFirstUserMsg(body),
-		requestBody: body,
-		apiKeyID:    apiKeyID,
-		strategy:    connStrategy,
+		firstMsg:           extractFirstUserMsg(body),
+		requestBody:        body,
+		apiKeyID:           apiKeyID,
+		strategy:           connStrategy,
+		compressionEnabled: compressionEnabled,
 	}
 	result, err := s.executeRequest(r.Context(), r, body, sourceFormat, providerID, resolvedModel, stream, conn, nil, requestID, startTime, reqCtx)
 	if err != nil {
@@ -207,6 +211,7 @@ type requestContext struct {
 	servedConnID string // SET by executeRequest as the inner connection-level fallback loop progresses; READ by forwardResult for routing-log/usage-track connection attribution. Reflects the connection that actually served (or last-attempted) the request — distinct from the caller's original conn passed in, which may have been excluded mid-loop. Cycle 20260516-routing-strategy-ux M1 α refactor.
 	strategy     provider.SelectStrategy // connection-selection strategy for this request (cycle 20260521-m3-quota-tracking); read by executeRequest's connection-level fallback loop. Zero value is SelectDefault — the safe default for the nil-reqCtx fallback.
 	tokensBefore int // M4: tokenizer estimate of the request BEFORE compression. SET by executeRequest's Compress block (cycle 20260522-m4-compression T8); READ by trackUsage. 0 when compression did not run.
+	compressionEnabled bool // M4: this request's API key opted into tool-output compression; READ by executeRequest's Compress block.
 }
 
 // executeRequest sends a request upstream and returns the executor.Result so the
@@ -264,6 +269,30 @@ func (s *Server) executeRequest(
 		// tools (HTTP 200); the AC-T4 premise was wrong-path. Translation
 		// errors now bubble up to a generic 500.
 		return nil, fmt.Errorf("translation error: %w", err)
+	}
+
+	// Stage [Compress] (M4, cycle 20260522-m4-compression): shrink
+	// low-signal tool-result content before the cache-hint stage. Opt-in
+	// per API key, tool-result-only, gated on the request being large
+	// relative to the model's context window. It mutates only TypeToolResult
+	// content — disjoint from the cache-hint region (system blocks) by
+	// construction — and re-serializes via FromCanonical, the cache-hint
+	// idiom. A nil Compressor (subsystem failed to load) skips the stage.
+	if s.deps.Compressor != nil && canonReq != nil && reqCtx.compressionEnabled {
+		ctxWindow := 0
+		if s.deps.Catalog != nil {
+			if m, ok := s.deps.Catalog.Lookup(providerID, model); ok {
+				ctxWindow = m.ContextWindow
+			}
+		}
+		if cr := s.deps.Compressor.Compress(canonReq, ctxWindow); cr.Compressed {
+			reqCtx.tokensBefore = cr.TokensBefore
+			if tgt, ok := s.deps.TranslateRegistry.Get(targetFormat); ok {
+				if rewritten, err := tgt.FromCanonical(canonReq, translateOptsFor(variantExec, model, providerID, stream)); err == nil {
+					targetBody = rewritten
+				}
+			}
+		}
 	}
 
 	// Stage ⑤b: Inject cache hints (cost optimization). Pass the chosen
@@ -865,12 +894,14 @@ func (s *Server) handleComboRequest(
 	startTime time.Time,
 	apiKeyID string,
 	connStrategy provider.SelectStrategy,
+	compressionEnabled bool,
 ) {
 	reqCtx := &requestContext{
-		firstMsg:    extractFirstUserMsg(body),
-		requestBody: body,
-		apiKeyID:    apiKeyID,
-		strategy:    connStrategy,
+		firstMsg:           extractFirstUserMsg(body),
+		requestBody:        body,
+		apiKeyID:           apiKeyID,
+		strategy:           connStrategy,
+		compressionEnabled: compressionEnabled,
 	}
 
 	// Track last 5xx status across walk iterations for the "all exhausted" return
