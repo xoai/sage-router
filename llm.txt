@@ -1,0 +1,48 @@
+# sage-router
+
+> A single-binary, multi-provider AI gateway: one OpenAI-compatible
+> endpoint in front of OpenAI, Anthropic, and Gemini — with hub-and-spoke
+> format translation, smart model routing, and circuit-breaker resilience.
+
+## What it is
+
+sage-router is a self-hosted reverse proxy for LLM APIs. A client speaks one
+wire format (OpenAI, Claude, or Gemini); sage-router translates through a
+provider-agnostic canonical representation, routes the request to a healthy
+upstream connection, and translates the response back. It adds smart routing
+(`auto:*` strategies), per-connection circuit breaking, subscription and
+API-key auth, prompt-cache hinting, and opt-in tool-output compression.
+
+It is an *instrument*, not a platform — one static binary, no external
+services, a fast default request path.
+
+## Stack
+
+- **Go** — a single static binary, zero cgo.
+- **SQLite** via `modernc.org/sqlite` (pure Go) — connections, API keys,
+  combos, aliases, usage log, and the model catalog.
+- **Preact** dashboard, built with Vite and embedded into the binary.
+
+## API surface
+
+Proxy endpoints (OpenAI-compatible):
+
+- `POST /v1/chat/completions` — accepts OpenAI, Claude, or Gemini request shapes
+- `POST /v1/messages` — Claude (Anthropic) format
+- `POST /v1/responses` — OpenAI Responses API
+
+Management API (consumed by the dashboard): `GET/POST/PATCH/DELETE /api/*` —
+connections, API keys, combos, aliases, usage, the model catalog, settings.
+
+## Repository layout
+
+- `cmd/sage-router/` — the entrypoint and bootstrap wiring.
+- `internal/` — the implementation packages: server, translate, provider,
+  executor, routing, store, auth, catalog, cost, compress, usage.
+- `pkg/canonical/` — the provider-agnostic request/response IR.
+- `web/dashboard/` — the Preact dashboard SPA.
+
+## More
+
+- `AGENTS.md` — build / test / lint commands and repository conventions.
+- `CLAUDE.md` — the full contributor and workflow guide.
