@@ -761,12 +761,13 @@ func (s *sqliteStore) RecordUsage(entry *UsageEntry) error {
 		costSource = "apikey"
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO usage_log (id, request_id, provider, model, connection_id, api_key_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, cost, latency_ms, status, created_at, cost_source)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO usage_log (id, request_id, provider, model, connection_id, api_key_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, cost, latency_ms, status, created_at, cost_source, tokens_before, tokens_after)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		entry.ID, entry.RequestID, entry.Provider, entry.Model, entry.ConnectionID,
 		entry.APIKeyID, entry.InputTokens, entry.OutputTokens, entry.TotalTokens,
 		entry.CacheReadTokens, entry.CacheWriteTokens,
 		entry.Cost, entry.Latency.Milliseconds(), entry.Status, now, costSource,
+		entry.TokensBefore, entry.TokensAfter,
 	)
 	if err != nil {
 		return fmt.Errorf("record usage: %w", err)
@@ -902,6 +903,7 @@ func scanUsageEntry(row interface{ Scan(dest ...any) error }) (*UsageEntry, erro
 		&e.APIKeyID, &e.InputTokens, &e.OutputTokens, &e.TotalTokens,
 		&e.CacheReadTokens, &e.CacheWriteTokens,
 		&e.Cost, &latencyMs, &e.Status, &createdAt, &e.CostSource,
+		&e.TokensBefore, &e.TokensAfter,
 	)
 	if err != nil {
 		return nil, err
@@ -957,7 +959,8 @@ func (s *sqliteStore) ListUsageInRange(ctx context.Context, from, to time.Time, 
 	q := `SELECT id, request_id, provider, model, connection_id, api_key_id,
 		input_tokens, output_tokens, total_tokens,
 		cache_read_tokens, cache_write_tokens,
-		cost, latency_ms, status, created_at, cost_source
+		cost, latency_ms, status, created_at, cost_source,
+		tokens_before, tokens_after
 		FROM usage_log
 		WHERE created_at >= ? AND created_at < ?`
 	// Use timeStr — the SAME format RecordUsage writes — so SQLite's

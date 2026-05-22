@@ -27,6 +27,13 @@ type Entry struct {
 	CacheReadTokens  int
 	CacheWriteTokens int
 
+	// Compression measurement (M4, cycle 20260522-m4-compression):
+	// TokensBefore is the tokenizer estimate of the request before
+	// compression; TokensAfter the provider-actual input count. Both 0
+	// when compression did not run.
+	TokensBefore int
+	TokensAfter  int
+
 	// Routing telemetry (populated for auto-routed requests)
 	Strategy      string // "fast", "cheap", "best", "balanced", "manual"
 	RoutingReason string // "session_affinity", "strategy_sort", "manual"
@@ -141,6 +148,8 @@ func (t *Tracker) writeEntry(entry *Entry) {
 		TotalTokens:      entry.TotalTokens,
 		CacheReadTokens:  entry.CacheReadTokens,
 		CacheWriteTokens: entry.CacheWriteTokens,
+		TokensBefore:     entry.TokensBefore,
+		TokensAfter:      entry.TokensAfter,
 		Cost:             entry.Cost,
 		CostSource:       entry.CostSource,
 		Latency:          entry.Latency,

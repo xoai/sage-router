@@ -206,6 +206,7 @@ type requestContext struct {
 	apiKeyID     string // authenticated API key ID (for usage tracking)
 	servedConnID string // SET by executeRequest as the inner connection-level fallback loop progresses; READ by forwardResult for routing-log/usage-track connection attribution. Reflects the connection that actually served (or last-attempted) the request — distinct from the caller's original conn passed in, which may have been excluded mid-loop. Cycle 20260516-routing-strategy-ux M1 α refactor.
 	strategy     provider.SelectStrategy // connection-selection strategy for this request (cycle 20260521-m3-quota-tracking); read by executeRequest's connection-level fallback loop. Zero value is SelectDefault — the safe default for the nil-reqCtx fallback.
+	tokensBefore int // M4: tokenizer estimate of the request BEFORE compression. SET by executeRequest's Compress block (cycle 20260522-m4-compression T8); READ by trackUsage. 0 when compression did not run.
 }
 
 // executeRequest sends a request upstream and returns the executor.Result so the
@@ -741,7 +742,7 @@ func (s *Server) streamResponse(
 		if flusher != nil {
 			flusher.Flush()
 		}
-		s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, totalUsage, startTime, "error")
+		s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, totalUsage, startTime, "error", reqCtx.tokensBefore)
 		return
 	}
 
@@ -752,7 +753,7 @@ func (s *Server) streamResponse(
 	}
 
 	// Track usage
-	s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, totalUsage, startTime, "success")
+	s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, totalUsage, startTime, "success", reqCtx.tokensBefore)
 
 	// Post-response hooks: session affinity, conversation store, bridge lifecycle
 	s.postRequestHook(reqCtx, providerID, model, totalUsage)
@@ -785,7 +786,7 @@ func (s *Server) forwardResponse(
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(result.StatusCode)
 		w.Write(respBody)
-		s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, usageData, startTime, "success")
+		s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, usageData, startTime, "success", reqCtx.tokensBefore)
 		s.postRequestHook(reqCtx, providerID, model, usageData)
 		return
 	}
@@ -802,7 +803,7 @@ func (s *Server) forwardResponse(
 	w.Header().Set("X-Request-ID", requestID)
 	w.WriteHeader(http.StatusOK)
 	w.Write(clientBody)
-	s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, usageData, startTime, "success")
+	s.trackUsage(requestID, providerID, model, connectionID, reqCtx.apiKeyID, usageData, startTime, "success", reqCtx.tokensBefore)
 	s.postRequestHook(reqCtx, providerID, model, usageData)
 }
 
@@ -1662,7 +1663,7 @@ func isModelRejection(body []byte) bool {
 	return modelRejectionPattern.Match(body)
 }
 
-func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID string, u *canonical.Usage, startTime time.Time, status string) {
+func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID string, u *canonical.Usage, startTime time.Time, status string, tokensBefore int) {
 	if s.deps.UsageTracker == nil {
 		return
 	}
@@ -1709,6 +1710,15 @@ func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID s
 		}
 	}
 
+	// tokens_after — the provider's actual input-token count of the
+	// (compressed) request. Recorded only when compression ran (tokensBefore
+	// > 0), so an uncompressed request leaves both measurement terms 0 — the
+	// dual-sourced savings figure (M4 §6).
+	tokensAfter := 0
+	if tokensBefore > 0 {
+		tokensAfter = inputTokens
+	}
+
 	entry := &usage.Entry{
 		RequestID:        requestID,
 		Provider:         provider,
@@ -1720,6 +1730,8 @@ func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID s
 		TotalTokens:      totalTokens,
 		CacheReadTokens:  cacheReadTokens,
 		CacheWriteTokens: cacheWriteTokens,
+		TokensBefore:     tokensBefore,
+		TokensAfter:      tokensAfter,
 		Cost:             cost,
 		CostSource:       costSource,
 		Latency:          time.Since(startTime),

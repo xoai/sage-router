@@ -208,7 +208,13 @@ type UsageEntry struct {
 	TotalTokens      int           `json:"total_tokens"`
 	CacheReadTokens  int           `json:"cache_read_tokens"`
 	CacheWriteTokens int           `json:"cache_write_tokens"`
-	Cost             float64       `json:"cost"`
+	// TokensBefore / TokensAfter — the M4 dual-sourced compression-savings
+	// measurement (cycle 20260522-m4-compression). TokensBefore is the
+	// tokenizer estimate of the request before compression; TokensAfter is
+	// the provider-actual input count. Both 0 when compression did not run.
+	TokensBefore int           `json:"tokens_before"`
+	TokensAfter  int           `json:"tokens_after"`
+	Cost         float64       `json:"cost"`
 	// CostSource records who pays for this request. "apikey" means the
 	// user pays per-token via their API key — Cost reflects actual spend.
 	// "subscription" means the user paid a flat subscription fee — Cost is
