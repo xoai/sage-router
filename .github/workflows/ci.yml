@@ -23,6 +23,8 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+      - name: Artifact-hygiene gate
+        run: make check-no-artifacts
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
