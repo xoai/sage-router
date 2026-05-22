@@ -10,6 +10,7 @@ import (
 
 	"sage-router/internal/compress"
 	"sage-router/internal/executor"
+	"sage-router/internal/store"
 	"sage-router/pkg/canonical"
 )
 
@@ -104,5 +105,84 @@ func TestExecuteRequest_CompressionWiring(t *testing.T) {
 	}
 	if rc2.tokensBefore != 0 {
 		t.Errorf("compression disabled: reqCtx.tokensBefore = %d, want 0 (AC9 negative case)", rc2.tokensBefore)
+	}
+}
+
+// makeCompressionKey creates a real API key (hash in the store, plaintext
+// returned) with the given compression_enabled flag.
+func makeCompressionKey(t *testing.T, srv *Server, db store.Store, name string, enabled bool) string {
+	t.Helper()
+	plain, hash, prefix, err := srv.deps.Auth.GenerateAPIKey()
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	if err := db.CreateAPIKey(&store.APIKey{
+		ID: "key-" + name, Name: name, KeyHash: hash, Prefix: prefix,
+		AllowedModels: "*", CompressionEnabled: enabled,
+	}); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	return plain
+}
+
+// TestE2E_CompressionByKeyFlag (M4 T11 — AC8 e2e half) drives a real HTTP
+// request through handleChatCompletions and proves the per-key
+// compression_enabled flag — read from the authenticated API key — actually
+// drives tool-output compression end-to-end: an enabled key's tool-result is
+// compressed upstream, a non-enabled key's identical request is not.
+func TestE2E_CompressionByKeyFlag(t *testing.T) {
+	var captured string
+	exec := &mockExecutor{
+		providerID: "openai",
+		handler: func(req *executor.ExecuteRequest) (*executor.Result, error) {
+			captured = string(req.Body)
+			return &executor.Result{
+				StatusCode: 200,
+				Headers:    http.Header{"Content-Type": {"application/json"}},
+				Body: io.NopCloser(strings.NewReader(
+					`{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)),
+				Latency: time.Millisecond,
+			}, nil
+		},
+	}
+	srv, db := setupTestServer(t, map[string]executor.Executor{
+		"openai":  exec,
+		"default": &sentinelExecutor{t: t, providerID: "default"},
+	})
+	cmp, err := compress.NewCompressor()
+	if err != nil {
+		t.Fatalf("NewCompressor: %v", err)
+	}
+	srv.deps.Compressor = cmp
+	addConnection(t, srv, db, "openai", "primary", "apikey")
+
+	onKey := makeCompressionKey(t, srv, db, "on", true)
+	offKey := makeCompressionKey(t, srv, db, "off", false)
+
+	noisy := "\x1b[31mERROR\x1b[0m\n" + strings.Repeat("dup line\n", 30)
+	reqBody := map[string]any{
+		"model": "openai/gpt-4o",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "run it"},
+			map[string]any{"role": "tool", "tool_call_id": "t1", "content": noisy},
+		},
+	}
+
+	// compression_enabled key → the tool-result is compressed upstream.
+	w := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", reqBody, onKey)
+	if w.Code != 200 {
+		t.Fatalf("enabled-key request: got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(captured, "u001b") {
+		t.Errorf("compression_enabled key: ANSI escapes survived upstream — the key flag did not drive compression\nbody: %s", captured)
+	}
+
+	// non-enabled key, identical request → the tool-result is untouched.
+	w2 := doRequestWithKey(t, srv, "POST", "/v1/chat/completions", reqBody, offKey)
+	if w2.Code != 200 {
+		t.Fatalf("non-enabled-key request: got %d: %s", w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(captured, "u001b") {
+		t.Errorf("non-enabled key: the tool-result should have reached upstream uncompressed\nbody: %s", captured)
 	}
 }
