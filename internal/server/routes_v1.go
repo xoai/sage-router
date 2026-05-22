@@ -1750,6 +1750,17 @@ func (s *Server) trackUsage(requestID, provider, model, connectionID, apiKeyID s
 		tokensAfter = inputTokens
 	}
 
+	// M4 §6 — per-request structured savings log, each term honestly
+	// sourced (tokenizer estimate vs. provider-actual). Emitted only when
+	// compression actually ran.
+	if tokensBefore > 0 {
+		slog.Info("compression savings",
+			"request_id", requestID,
+			"tokens_before", tokensBefore, "tokens_before_source", "tokenizer",
+			"tokens_after", tokensAfter, "tokens_after_source", "provider",
+		)
+	}
+
 	entry := &usage.Entry{
 		RequestID:        requestID,
 		Provider:         provider,

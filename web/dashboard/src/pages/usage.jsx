@@ -108,6 +108,10 @@ function loadUsage() {
         outputTokens: r.output_tokens || 0,
         cacheReadTokens: r.cache_read_tokens || 0,
         cacheWriteTokens: r.cache_write_tokens || 0,
+        // M4 compression measurement — savedTokens is shown only when
+        // tokensBefore > 0 (i.e. compression actually ran on this request).
+        tokensBefore: r.tokens_before || 0,
+        savedTokens: Math.max(0, (r.tokens_before || 0) - (r.tokens_after || 0)),
         cost: r.cost || 0,
         cost_source: r.cost_source || 'apikey',
         input_tokens: r.input_tokens || 0,
@@ -464,6 +468,9 @@ export function UsagePage() {
               <SortHeader field="inputTokens" align="right">Input</SortHeader>
               <SortHeader field="outputTokens" align="right">Output</SortHeader>
               <SortHeader field="cacheReadTokens" align="right">Cached</SortHeader>
+              <SortHeader field="savedTokens" align="right">
+                <span title="Tool-output compression savings. The before-count is a tokenizer estimate; the after-count is provider-actual.">≈ Saved</span>
+              </SortHeader>
               <SortHeader field="cost" align="right">Cost</SortHeader>
               <SortHeader field="latency" align="right">Latency</SortHeader>
             </tr>
@@ -479,13 +486,16 @@ export function UsagePage() {
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right', color: r.cacheReadTokens > 0 ? 'var(--status-green)' : 'var(--text-tertiary)' }}>
                   {r.cacheReadTokens > 0 ? formatTokens(r.cacheReadTokens) : '—'}
                 </td>
+                <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right', color: r.tokensBefore > 0 ? 'var(--status-green)' : 'var(--text-tertiary)' }}>
+                  {r.tokensBefore > 0 ? '≈ ' + formatTokens(r.savedTokens) : '—'}
+                </td>
                 <td style={{ padding: '10px 16px', textAlign: 'right' }}><CostCell row={r} /></td>
                 <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'right' }}>{r.latency}</td>
               </tr>
             ))}
             {sorted.length === 0 && (
               <tr>
-                <td colSpan={8} style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
+                <td colSpan={9} style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
                   No usage data yet. Connect a tool and make some requests.
                 </td>
               </tr>
