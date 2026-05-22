@@ -50,6 +50,7 @@ export function KeyCreateWizard({ onClose, onCreated }) {
   const rateLimitRPM = useSignal('');
   const allowedModels = useSignal('*');
   const routingStrategy = useSignal('');
+  const compressionEnabled = useSignal(false);
 
   // Validation
   const nameError = useSignal('');
@@ -91,7 +92,8 @@ export function KeyCreateWizard({ onClose, onCreated }) {
       || budgetHardLimit.value
       || rateLimitRPM.value !== ''
       || allowedModels.value !== '*'
-      || routingStrategy.value !== '';
+      || routingStrategy.value !== ''
+      || compressionEnabled.value;
   }
 
   function handleClose() {
@@ -154,6 +156,7 @@ export function KeyCreateWizard({ onClose, onCreated }) {
       allowed_models: allowedModels.value || '*',
       rate_limit_rpm: rateLimitRPM.value === '' ? 0 : Number(rateLimitRPM.value),
       routing_strategy: routingStrategy.value,
+      compression_enabled: compressionEnabled.value,
     }).then(res => {
       creating.value = false;
       if (!res?.key) {
@@ -407,6 +410,22 @@ export function KeyCreateWizard({ onClose, onCreated }) {
                   Overrides the system-wide default for requests using <code>auto</code>.
                 </div>
               </div>
+
+              <label style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                fontSize: 13,
+                color: 'var(--text-primary)',
+                cursor: 'pointer',
+              }}>
+                <input
+                  type="checkbox"
+                  checked={compressionEnabled.value}
+                  onChange={e => { compressionEnabled.value = e.target.checked; }}
+                />
+                <span>Compress tool output — shrink large tool results (for coding agents)</span>
+              </label>
             </>
           )}
 

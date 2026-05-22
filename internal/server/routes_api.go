@@ -893,12 +893,13 @@ func parseIntQueryParam(r *http.Request, w http.ResponseWriter, name string, def
 
 func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name            string  `json:"name"`
-		BudgetMonthly   float64 `json:"budget_monthly"`
-		BudgetHardLimit bool    `json:"budget_hard_limit"`
-		AllowedModels   string  `json:"allowed_models"`
-		RateLimitRPM    int     `json:"rate_limit_rpm"`
-		RoutingStrategy string  `json:"routing_strategy"`
+		Name               string  `json:"name"`
+		BudgetMonthly      float64 `json:"budget_monthly"`
+		BudgetHardLimit    bool    `json:"budget_hard_limit"`
+		AllowedModels      string  `json:"allowed_models"`
+		RateLimitRPM       int     `json:"rate_limit_rpm"`
+		RoutingStrategy    string  `json:"routing_strategy"`
+		CompressionEnabled bool    `json:"compression_enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -916,16 +917,17 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := &store.APIKey{
-		ID:              generateRequestID(),
-		Name:            req.Name,
-		KeyHash:         keyHash,
-		Prefix:          prefix,
-		BudgetMonthly:   req.BudgetMonthly,
-		BudgetHardLimit: req.BudgetHardLimit,
-		AllowedModels:   req.AllowedModels,
-		RateLimitRPM:    req.RateLimitRPM,
-		RoutingStrategy: req.RoutingStrategy,
-		CreatedAt:       time.Now(),
+		ID:                 generateRequestID(),
+		Name:               req.Name,
+		KeyHash:            keyHash,
+		Prefix:             prefix,
+		BudgetMonthly:      req.BudgetMonthly,
+		BudgetHardLimit:    req.BudgetHardLimit,
+		AllowedModels:      req.AllowedModels,
+		RateLimitRPM:       req.RateLimitRPM,
+		RoutingStrategy:    req.RoutingStrategy,
+		CompressionEnabled: req.CompressionEnabled,
+		CreatedAt:          time.Now(),
 	}
 
 	if err := s.deps.Store.CreateAPIKey(key); err != nil {

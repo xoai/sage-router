@@ -32,6 +32,7 @@ export function KeyEditModal({ keyRow, onClose, onSaved }) {
   const rateLimitRPM = useSignal(String(keyRow.rate_limit_rpm ?? 0));
   const allowedModels = useSignal(keyRow.allowed_models || '*');
   const routingStrategy = useSignal(keyRow.routing_strategy || '');
+  const compressionEnabled = useSignal(keyRow.compression_enabled ?? false);
   const saving = useSignal(false);
   const dirtyConfirm = useSignal(false);
 
@@ -80,7 +81,8 @@ export function KeyEditModal({ keyRow, onClose, onSaved }) {
       || budgetHardLimit.value !== (keyRow.budget_hard_limit ?? false)
       || (Number(rateLimitRPM.value) || 0) !== (Number(keyRow.rate_limit_rpm) || 0)
       || canonicalizeModels(allowedModels.value) !== canonicalizeModels(keyRow.allowed_models || '*')
-      || routingStrategy.value !== (keyRow.routing_strategy || '');
+      || routingStrategy.value !== (keyRow.routing_strategy || '')
+      || compressionEnabled.value !== (keyRow.compression_enabled ?? false);
   }
 
   // 3-branch close state machine (per cycle 20260516-edit-modal-close-confirm,
@@ -113,6 +115,7 @@ export function KeyEditModal({ keyRow, onClose, onSaved }) {
       rate_limit_rpm: Number(rateLimitRPM.value) || 0,
       allowed_models: allowedModels.value || '*',
       routing_strategy: routingStrategy.value,
+      compression_enabled: compressionEnabled.value,
     }).then(() => {
       saving.value = false;
       addToast('Key updated', 'success');
@@ -214,6 +217,23 @@ export function KeyEditModal({ keyRow, onClose, onSaved }) {
             onChange={e => { budgetHardLimit.value = e.target.checked; }}
           />
           <span>Hard limit — block requests after cap is reached</span>
+        </label>
+
+        <label style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          fontSize: 13,
+          color: 'var(--text-primary)',
+          cursor: 'pointer',
+          marginBottom: 'var(--space-md)',
+        }}>
+          <input
+            type="checkbox"
+            checked={compressionEnabled.value}
+            onChange={e => { compressionEnabled.value = e.target.checked; }}
+          />
+          <span>Compress tool output — shrink large tool results (for coding agents)</span>
         </label>
 
         <div style={{ marginBottom: 'var(--space-md)' }}>
