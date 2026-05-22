@@ -1,6 +1,8 @@
 package compress
 
 import (
+	"encoding/json"
+
 	"sage-router/internal/compress/tokenizer"
 	"sage-router/pkg/canonical"
 )
@@ -70,6 +72,15 @@ func (c *Compressor) Compress(req *canonical.Request, contextWindow int) Result 
 		for ci := range req.Messages[mi].Content {
 			ct := &req.Messages[mi].Content[ci]
 			if ct.Type != canonical.TypeToolResult {
+				continue
+			}
+			// A tool-result that is itself a structured JSON document is
+			// left untouched: the line-oriented filters (collapse-repeats,
+			// truncate-safe) would corrupt it (ADR §"filter catalog" — no
+			// structured-output corruption). The compression target is
+			// unstructured log spam — test output, build logs, file dumps —
+			// not structured payloads.
+			if json.Valid([]byte(ct.Text)) {
 				continue
 			}
 			if out := c.cat.Apply(ct.Text); out != ct.Text {

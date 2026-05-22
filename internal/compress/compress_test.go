@@ -1,6 +1,7 @@
 package compress
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -112,6 +113,32 @@ func TestCompress_Deterministic(t *testing.T) {
 	c.Compress(b, 0)
 	if a.Messages[0].Content[0].Text != b.Messages[0].Content[0].Text {
 		t.Error("Compress is not deterministic")
+	}
+}
+
+// AC3 — a tool-result that is a JSON document is left byte-identical:
+// the line-oriented filters would corrupt it, so Compress skips JSON blocks.
+func TestCompress_JSONToolResultUntouched(t *testing.T) {
+	c := mustCompressor(t)
+	// A pretty-printed JSON array with 3+ identical adjacent lines —
+	// collapse-repeats would otherwise fold them and inject a bare marker
+	// line, corrupting the structure (the Gate-3 finding).
+	jsonResult := "{\n  \"items\": [\n    1,\n    1,\n    1,\n    1\n  ],\n  \"status\": \"ok\"\n}"
+	if !json.Valid([]byte(jsonResult)) {
+		t.Fatal("test premise: the fixture must be valid JSON")
+	}
+	req := &canonical.Request{Messages: []canonical.Message{
+		{Role: canonical.RoleTool, Content: []canonical.Content{
+			{Type: canonical.TypeToolResult, ToolCallID: "t1", Text: jsonResult},
+		}},
+	}}
+	c.Compress(req, 0)
+	got := req.Messages[0].Content[0].Text
+	if got != jsonResult {
+		t.Errorf("Compress corrupted a JSON tool-result:\n in:  %q\n out: %q", jsonResult, got)
+	}
+	if !json.Valid([]byte(got)) {
+		t.Error("Compress produced invalid JSON from a JSON tool-result")
 	}
 }
 

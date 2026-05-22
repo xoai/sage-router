@@ -286,10 +286,14 @@ func (s *Server) executeRequest(
 			}
 		}
 		if cr := s.deps.Compressor.Compress(canonReq, ctxWindow); cr.Compressed {
-			reqCtx.tokensBefore = cr.TokensBefore
 			if tgt, ok := s.deps.TranslateRegistry.Get(targetFormat); ok {
 				if rewritten, err := tgt.FromCanonical(canonReq, translateOptsFor(variantExec, model, providerID, stream)); err == nil {
 					targetBody = rewritten
+					// Record tokensBefore ONLY once the compressed body has
+					// actually replaced targetBody — otherwise a FromCanonical
+					// failure would send the uncompressed body upstream while
+					// the usage row falsely claims a saving (Gate-3 m-3).
+					reqCtx.tokensBefore = cr.TokensBefore
 				}
 			}
 		}

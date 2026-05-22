@@ -137,6 +137,26 @@ func TestCount_SumsSingleTokenChunks(t *testing.T) {
 	}
 }
 
+// TestCount_KnownMultiTokenCounts pins multi-token merge correctness against
+// published o200k_base counts — an independent reference, not this
+// implementation. "hello world" pre-tokenizes to "hello"+" world" (2 tokens);
+// "123456789" pre-tokenizes to "123"+"456"+"789" (the \p{N}{1,3} rule — 3
+// tokens). A merge regression that over- or under-merges would fail here.
+func TestCount_KnownMultiTokenCounts(t *testing.T) {
+	tk := mustLoad(t)
+	for _, c := range []struct {
+		s    string
+		want int
+	}{
+		{"hello world", 2},
+		{"123456789", 3},
+	} {
+		if got := tk.Count(c.s); got != c.want {
+			t.Errorf("Count(%q) = %d, want %d (published o200k_base)", c.s, got, c.want)
+		}
+	}
+}
+
 func TestCount_Deterministic(t *testing.T) {
 	tk := mustLoad(t)
 	s := "The quick brown fox jumps over the lazy dog. 12345! \t\n  done."
