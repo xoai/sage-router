@@ -18,8 +18,9 @@ for the full Sage workflow and process rules see `CLAUDE.md`.
 
 - `make lint` — runs `golangci-lint run ./...` plus the repository's hygiene
   gates: `grep-no-static-config`, `grep-no-secrets`, and `check-no-artifacts`
-  (no tracked build artifacts). `golangci-lint` must be installed locally;
-  CI invokes the gates directly, not `make lint`.
+  (no tracked build artifacts). `golangci-lint` must be installed locally.
+  CI does not run `make lint`; it invokes `check-no-artifacts` directly in
+  the build job.
 
 ## Project layout
 
